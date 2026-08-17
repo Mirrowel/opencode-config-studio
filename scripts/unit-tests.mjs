@@ -20,6 +20,8 @@ const { fuzzyScore, rankOptions } = await import(dist("search"))
 const { loadSettings, saveSettings, settingsPath, moduleEnabled, setModuleEnabled, setModuleOption, moduleOption, DEFAULT_HIDDEN_SECTIONS } = await import(dist("settings"))
 const { applyOpsToData, getAtPath } = await import(dist("jsonc"))
 const { isStandaloneAgentVariantsSpec, findStandaloneAgentVariants, removeStandaloneHits } = await import(dist("standalone"))
+const cache = await import(dist("providercache"))
+const { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } = await import(dist("migration"))
 
 function assert(condition, message) {
   if (!condition) throw new Error(`assert failed: ${message}`)
@@ -647,6 +649,94 @@ function section(name) {
   assert(commented.includes("keep a"), "trailing comment of a surviving element must survive")
   assert(commented.includes("header"), "unrelated comment must survive")
   assert(parseJsonc(commented).errors.length === 0, "commented deletion must stay parseable")
+}
+
+// ---------------------------------------------------------------------------
+// providercache
+// ---------------------------------------------------------------------------
+
+{
+  section("providercache: key + hit/miss + TTL")
+  const keyA = cache.providerCacheKey({ merged: { a: 1 }, winner: new Map(), contributors: new Map() })
+  const keyB = cache.providerCacheKey({ merged: { a: 2 }, winner: new Map(), contributors: new Map() })
+  assert(keyA !== keyB, "different config content must produce different keys")
+  assert(cache.getCachedProviders(keyA) === undefined, "empty cache must miss")
+
+  const snapshot = { providers: [{ id: "zai" }], defaults: { zai: "glm-5.2" }, source: "provider-list" }
+  cache.setCachedProviders(keyA, snapshot, 1000)
+  assert(cache.getCachedProviders(keyA, 2000)?.providers.length === 1, "same key within TTL must hit")
+  assert(cache.getCachedProviders(keyB, 2000) === undefined, "different key must miss")
+  assert(cache.getCachedProviders(keyA, 1000 + 5 * 60 * 1000 + 1) === undefined, "expired cache must miss")
+  cache.setCachedProviders(keyB, snapshot, 1000)
+  assert(cache.getCachedProviders(keyB, 2000) !== undefined, "latest key wins")
+  cache.clearProviderCache()
+  assert(cache.getCachedProviders(keyB, 2000) === undefined, "cleared cache must miss")
+}
+
+{
+  section("providercache: outside-change detection")
+  const bases = new Map([["/cfg/opencode.json", '{\n  "model": "a/b"\n}\n']])
+  const unchanged = cache.detectOutsideChanges(bases, () => '{\n  "model": "a/b"\n}\n')
+  assert(unchanged.length === 0, "identical content must not report changes")
+  const changed = cache.detectOutsideChanges(bases, () => '{\n  "model": "a/c"\n}\n')
+  assert(changed.length === 1 && changed[0].path === "/cfg/opencode.json", "changed content must report")
+  assert(changed[0].diffLines.some((line) => line.includes("+")), `diff should show added lines: ${JSON.stringify(changed[0].diffLines)}`)
+  assert(changed[0].diffLines.some((line) => line.includes("-")), "diff should show removed lines")
+  const missing = cache.detectOutsideChanges(bases, () => undefined)
+  assert(missing.length === 1 && missing[0].diffLines[0].includes("no longer"), "unreadable file must report")
+}
+
+// ---------------------------------------------------------------------------
+// migration: sidecar parent fields -> config ops
+// ---------------------------------------------------------------------------
+
+{
+  section("migration: preset resolution + template materialization")
+  const sidecar = {
+    $schema: "https://opencode.ai/config.json",
+    agents: {
+      general: {
+        parent: {
+          model: "light", // preset reference -> must resolve to concrete model
+          prompt: "You are {parent}.", // template token -> materialized
+          temperature: 0.3, // passthrough
+          prompt_prepend: "keep me", // NOT migrated (stays sidecar)
+        },
+        variants: {},
+      },
+    },
+    models: {
+      light: { model: "zai/glm-5.2", temperature: 0.1 },
+    },
+    routing: { prompt_markers: false },
+  }
+  const savable = savableParentFields(sidecar, "general")
+  assert(JSON.stringify(savable) === JSON.stringify(["model", "temperature", "prompt"]), `savable fields wrong: ${JSON.stringify(savable)}`)
+
+  const plan = buildMigrationPlan(sidecar, "general")
+  assert(plan, "plan must build")
+  const modelOp = plan.ops.find((op) => op.path.join(".") === "agent.general.model")
+  assert(modelOp && modelOp.value === "zai/glm-5.2", `preset must resolve to concrete model: ${JSON.stringify(modelOp)}`)
+  const promptOp = plan.ops.find((op) => op.path.join(".") === "agent.general.prompt")
+  assert(promptOp && promptOp.value === "You are general.", `template must materialize: ${JSON.stringify(promptOp)}`)
+  const tempOp = plan.ops.find((op) => op.path.join(".") === "agent.general.temperature")
+  assert(tempOp && tempOp.value === 0.3, "plain values pass through")
+  assert(!plan.ops.some((op) => op.path.includes("prompt_prepend")), "prepend fields must not migrate")
+  assert(JSON.stringify(plan.sidecarRemovals) === JSON.stringify(["model", "temperature", "prompt"]), `removals wrong: ${JSON.stringify(plan.sidecarRemovals)}`)
+  assert(plan.notes.some((note) => note.includes("materialized")), "template materialization must be noted")
+}
+
+{
+  section("migration: nothing savable + unknown preset kept raw")
+  const empty = { agents: { general: { parent: { prompt_append: "x" }, variants: {} } }, models: {}, routing: { prompt_markers: false } }
+  assert(savableParentFields(empty, "general").length === 0, "append-only parent has nothing savable")
+  assert(buildMigrationPlan(empty, "general") === undefined, "no plan for nothing savable")
+
+  const broken = { agents: { general: { parent: { model: "nonexistent-preset" }, variants: {} } }, models: {}, routing: { prompt_markers: false } }
+  const plan = buildMigrationPlan(broken, "general")
+  assert(plan, "plan builds for unknown preset")
+  const modelOp = plan.ops.find((op) => op.path.join(".") === "agent.general.model")
+  assert(modelOp && modelOp.value === "nonexistent-preset", "unresolvable preset keeps raw value")
 }
 
 console.log("all unit tests passed")

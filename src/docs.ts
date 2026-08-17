@@ -296,6 +296,42 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "Good place for provider-specific keys an agent should always send.",
     ],
   },
+  "agent.prompt": {
+    id: "agent.prompt",
+    title: "agent.<name>.prompt",
+    summary: "System prompt for the agent (replaces the built-in one).",
+    lines: [
+      "Agents can also be defined as markdown files (.opencode/agent/*.md); the config value wins when both exist.",
+      "Editing the prompt applies after Save & exit (config reload); no OpenCode restart needed.",
+    ],
+  },
+  "agent.description": {
+    id: "agent.description",
+    title: "agent.<name>.description",
+    summary: "Description shown in the task list and agent pickers.",
+    lines: [
+      "The main model reads this to decide when to pick the agent - clear descriptions improve selection.",
+      "RESTART REQUIRED: OpenCode caches the task list at startup; the new description appears after restart.",
+    ],
+  },
+  "agent.color": {
+    id: "agent.color",
+    title: "agent.<name>.color",
+    summary: "Hex color (#RRGGBB) or theme color for the agent in lists.",
+    lines: [
+      "Theme colors: primary, secondary, accent, success, warning, error, info.",
+      "RESTART REQUIRED: cached UI metadata updates only after restart.",
+    ],
+  },
+  "agent.disable": {
+    id: "agent.disable",
+    title: "agent.<name>.disable",
+    summary: "Fully disables the agent: hidden from task list and selection.",
+    lines: [
+      "True disable written to opencode.json; removes the agent everywhere (variants included).",
+      "Agent Variants parent-patch disable (sidecar) is a softer variant-machinery switch; see the Variants submenu.",
+    ],
+  },
 
   "concept.precedence": {
     id: "concept.precedence",

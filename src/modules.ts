@@ -28,6 +28,12 @@ export type ModuleContext = {
   settings: StudioSettings
   /** Reload studio state after direct file writes (rare; modules normally stage). */
   refresh: () => Promise<void>
+  /**
+   * Stage config-file edits through the studio's unified queue (target-file
+   * picker, shadow guard, Review diff, Save & exit). Returns false when the
+   * user aborts or staging failed.
+   */
+  stageConfigEdits: (ops: import("./jsonc.js").EditOp[], reason: string) => Promise<boolean>
 }
 
 export type ModuleOption = {

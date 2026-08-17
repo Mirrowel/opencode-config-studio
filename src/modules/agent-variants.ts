@@ -42,6 +42,10 @@ import {
   type WizardSettings,
 } from "@mirrowel/opencode-agent-variants/wizard"
 import { registerModule, type ModuleContext, type StudioModule } from "../modules.js"
+import { buildMigrationPlan, savableParentFields } from "../migration.js"
+
+/** Parent-patch fields that stay in the sidecar (config hosts the rest). */
+const SIDECAR_PARENT_FIELDS = new Set(["prompt_prepend", "prompt_append", "description_prepend", "description_append"])
 
 let draft: SidecarConfig | undefined
 let wizardSettings: WizardSettings | undefined
@@ -86,10 +90,17 @@ async function variantsSubmenu(ctx: ModuleContext, agent: string): Promise<void>
     const variants = Object.entries(entry?.variants ?? {})
     const options = [
       {
-        title: `Parent: ${parentDisabled ? "disabled" : "enabled"} - toggle`,
+        title: `Full disable: ${parentDisabled ? "currently sidecar-disabled" : "off"} - write to config`,
+        value: "__config_disable__",
+        description: "agent.<name>.disable = true in opencode.json",
+        help: "Writes a full disable to the OpenCode config: the agent (and all its variants) disappear everywhere. RESTART REQUIRED after Save & exit.",
+        danger: true,
+      },
+      {
+        title: `Parent patches: ${parentDisabled ? "disabled" : "active"} - toggle sidecar`,
         value: "__parent_toggle__",
-        description: parentDisabled ? "No variants of this agent are active" : "All variants active",
-        help: "Disabling the parent disables every variant of this agent in the task list. Takes effect after restart.",
+        description: parentDisabled ? "no parent patches applied" : "parent patches applied to variants",
+        help: "Disables only the sidecar parent patches. NOTE: agent-variants currently also hides the variants when the parent patch entry is disabled (parent-only disable is not implemented yet) - recommended: full disable until it is.",
       },
       {
         title: "Add variant",
@@ -114,6 +125,21 @@ async function variantsSubmenu(ctx: ModuleContext, agent: string): Promise<void>
     ]
     const picked = await ctxPick(ctx, { title: `${agent} - Agent Variants`, options })
     if (!picked || picked === "__back__") return
+    if (picked === "__config_disable__") {
+      // Full disable lives in opencode.json: stage through the studio queue.
+      const agentEntry = (ctx.state.merge.merged as Record<string, unknown>)["agent"] as Record<string, unknown> | undefined
+      const currentlyDisabled = (agentEntry?.[agent] as Record<string, unknown> | undefined)?.["disable"] === true
+      const staged = await ctx.stageConfigEdits(
+        currentlyDisabled
+          ? [{ op: "delete", path: ["agent", agent, "disable"] }]
+          : [{ op: "set", path: ["agent", agent, "disable"], value: true }],
+        `${currentlyDisabled ? "enable" : "full-disable"} agent ${agent} (config)`,
+      )
+      if (staged) {
+        settingsOf().restartReasons.push(`${agent}: full ${currentlyDisabled ? "enable" : "disable"} (config) requires restart.`)
+      }
+      continue
+    }
     if (picked === "__parent_toggle__") {
       assign(await toggleEntryFor(avApi(ctx.api), config, settingsOf(), { agent }))
       continue
@@ -275,6 +301,56 @@ async function ownMenuSubmenu(ctx: ModuleContext): Promise<void> {
   }
 }
 
+/** Interactive migration: stages config ops + sidecar removals together. */
+async function runMigration(ctx: ModuleContext, agent: string): Promise<void> {
+  const config = ensureDraft()
+  const plan = buildMigrationPlan(config, agent)
+  if (!plan) {
+    await ctxPick(ctx, { title: "Nothing to migrate", options: [{ title: "< Back", value: "__back__" }] })
+    return
+  }
+  const confirmed = await showConfirmViaPick(ctx, {
+    title: `Migrate parent fields of "${agent}"?`,
+    lines: [
+      "These sidecar parent patches move into opencode.json and disappear from the sidecar:",
+      ...plan.ops.map((op) => `  - ${op.op === "set" ? "set" : "delete"} ${formatPath(op.path)}`),
+      "",
+      ...(plan.notes.length > 0 ? ["Notes:", ...plan.notes.map((note) => `  * ${note}`), ""] : []),
+      "Both halves are staged; Save & exit writes them together.",
+    ],
+  })
+  if (!confirmed) return
+  const staged = await ctx.stageConfigEdits(plan.ops, `migrate AV parent fields of ${agent} to config`)
+  if (!staged) return
+  const next = structuredClone(ensureDraft())
+  const entry = next.agents[agent]
+  if (entry) {
+    const parent = entry.parent as Record<string, unknown>
+    for (const key of plan.sidecarRemovals) delete parent[key]
+    if (Object.keys(parent).length === 0) delete next.agents[agent]
+  }
+  assign(next)
+  settingsOf().restartReasons.push(`${agent}: parent field migration changes the sidecar; restart after save.`)
+  ctx.api.ui.toast({ variant: "info", title: "Migration staged", message: `${plan.sidecarRemovals.length} field(s) -> config; sidecar cleanup staged. Finish with Save & exit.` })
+}
+
+async function showConfirmViaPick(ctx: ModuleContext, props: { title: string; lines: string[] }): Promise<boolean> {
+  const picked = await ctxPick(ctx, {
+    title: props.title,
+    options: [
+      { title: "Confirm", value: "__yes__", description: props.lines[0] ?? "" },
+      { title: "< Cancel", value: "__no__" },
+    ],
+  })
+  return picked === "__yes__"
+}
+
+function formatPath(path: (string | number)[]): string {
+  return path
+    .map((segment, index) => (typeof segment === "number" ? `[${segment}]` : index === 0 ? String(segment) : `.${segment}`))
+    .join("")
+}
+
 const agentVariantsModule: StudioModule = {
   id: "agent-variants",
   title: "Agent Variants",
@@ -315,24 +391,35 @@ const agentVariantsModule: StudioModule = {
     const config = ensureDraft()
     const entry = config.agents[agent]
     const parentOverrides = Object.keys(entry?.parent ?? {}).length
-    return [
-      {
-        title: variantPickerTitle(agent),
-        description: entry && Object.keys(entry.variants).length > 0 ? `${Object.keys(entry.variants).length} variant(s)` : "none yet",
-        help: "Agent Variants: variants are full copies of this agent with overridden fields (model, prompt, ...), selectable in the task tool.",
-        run: async (context) => {
-          await variantsSubmenu(context, agent)
-        },
+    const savable = savableParentFields(config, agent)
+    const entries = []
+    entries.push({
+      title: variantPickerTitle(agent),
+      description: entry && Object.keys(entry.variants).length > 0 ? `${Object.keys(entry.variants).length} variant(s)` : "none yet",
+      help: "Agent Variants: variants are full copies of this agent with overridden fields (model, prompt, ...), selectable in the task tool.",
+      run: async (context: ModuleContext) => {
+        await variantsSubmenu(context, agent)
       },
-      {
-        title: `AV parent fields${parentOverrides > 0 ? ` (${parentOverrides})` : ""}`,
-        description: "Propagate model/prompt/params to all variants",
-        help: "Agent Variants: parent fields override the agent's config for every variant of this agent, with per-field propagation.",
-        run: async (context) => {
-          assign(await editParentFields(avApi(context.api), ensureDraft(), agent, settingsOf()))
+    })
+    if (savable.length > 0) {
+      entries.push({
+        title: `Migrate AV parent fields to config (${savable.length})`,
+        description: `${savable.join(", ")} - move to opencode.json`,
+        help: "Moves config-savable parent patches (model, variant, temperature, top_p, prompt, description, options, color) into opencode.json and removes them from the sidecar. Model preset references resolve to concrete models; template tokens are materialized. Stages both halves - review before Save & exit.",
+        run: async (context: ModuleContext) => {
+          await runMigration(context, agent)
         },
+      })
+    }
+    entries.push({
+      title: `AV parent patches${parentOverrides > 0 ? ` (${parentOverrides})` : ""}`,
+      description: "Prepend/append prompt & description patches",
+      help: "Agent Variants parent patches that stay sidecar-only: relative prompt/description prepend+append (config cannot express them).",
+      run: async (context: ModuleContext) => {
+        assign(await editParentFields(avApi(context.api), ensureDraft(), agent, settingsOf(), SIDECAR_PARENT_FIELDS))
       },
-    ]
+    })
+    return entries
   },
   diagnosticsSections: async (ctx) => {
     const config = ensureDraft()
@@ -347,6 +434,14 @@ const agentVariantsModule: StudioModule = {
     const errors = diagnostics.filter((item) => item.level === "error").length
     const warnings = diagnostics.filter((item) => item.level === "warning").length
     const infos = diagnostics.filter((item) => item.level === "info").length
+    const migrateHints: string[] = []
+    for (const [agent, entry] of Object.entries(config.agents)) {
+      if (entry.disable === true) continue
+      const savable = savableParentFields(config, agent)
+      if (savable.length > 0) {
+        migrateHints.push(`agent "${agent}" keeps ${savable.join(", ")} in the sidecar - consider "Migrate AV parent fields to config" on its agent page (sidecar values shadow config at assembly time).`)
+      }
+    }
     return [
       {
         title: "Agent Variants",
@@ -357,6 +452,7 @@ const agentVariantsModule: StudioModule = {
           `debug mode: ${config.debug ? "enabled" : "disabled"}`,
           `prompt route markers: ${config.routing.prompt_markers ? "enabled" : "disabled"}`,
           `summary: ${errors} error(s), ${warnings} warning(s), ${infos} info`,
+          ...(migrateHints.length > 0 ? ["", "Migrate to config:", ...migrateHints.map((hint) => `  ${hint}`)] : []),
           "",
           ...(diagnostics.length === 0 ? ["No diagnostics."] : diagnostics.map((item) => `${item.level.toUpperCase()}: ${item.message}`)),
         ],

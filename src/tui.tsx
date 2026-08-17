@@ -34,8 +34,11 @@ import {
 } from "./catalog.js"
 import { runCapture, diffBodies, type CaptureRunResult } from "./sink.js"
 import { ensureTuiRegistration, ourRootDir } from "./selfwire.js"
+import { agentMode as avAgentMode, showFieldList as avShowFieldList, type FieldListOption as AVFieldListOption, type FieldListChoice as AVFieldListChoice } from "@mirrowel/opencode-agent-variants/wizard"
 import { FIELD_DOCS } from "./docs.js"
 import { rankOptions } from "./search.js"
+import { providerCacheKey, getCachedProviders, setCachedProviders, providerCacheState, detectOutsideChanges, type OutsideChange } from "./providercache.js"
+import { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } from "./migration.js"
 import { DEFAULT_HIDDEN_SECTIONS, loadSettings, saveSettings, settingsPath, type StudioSettings } from "./settings.js"
 import { enabledModules, moduleUsesOwnMenu, getModules, type ModuleContext } from "./modules.js"
 import { agentVariantsModuleId, setModulePickImplementation } from "./modules/agent-variants.js"
@@ -956,10 +959,20 @@ async function refreshStudio(api: TuiPluginApi, previous?: StudioState): Promise
     file.data = applyOpsToData(file.data, change.ops)
   }
   const merge = mergeWithProvenance(files)
-  const [providerResult, modelsDevResult] = await Promise.all([
-    fetchProviders(api),
-    fetchModelsDev(studioDataDir(api)),
-  ])
+  // Provider catalog cache: identical merged config => reuse the catalog
+  // instead of round-tripping client.provider.list() on every open. Saves
+  // change file content => new hash => immediate refetch.
+  const cacheKey = providerCacheKey(merge)
+  const modelsDevPromise = fetchModelsDev(studioDataDir(api))
+  let providerResult: { providers: RuntimeProviderLike[]; defaults: Record<string, string>; source: StudioState["providersSource"] }
+  const cached = getCachedProviders<RuntimeProviderLike>(cacheKey)
+  if (cached) {
+    providerResult = cached
+  } else {
+    providerResult = await fetchProviders(api)
+    setCachedProviders(cacheKey, providerResult)
+  }
+  const modelsDevResult = await modelsDevPromise
   return {
     files,
     merge,
@@ -1096,6 +1109,8 @@ async function resolveTargetFile(write: WriteContext, pointer: JSONPath, suggest
 }
 
 let stagedChangeCounter = 0
+/** Content of each staged file when its FIRST op was queued (outside-change guard). */
+const stagedBases = new Map<string, string>()
 
 /**
  * Stages edits instead of writing them (agent-variants save model): ops are
@@ -1111,6 +1126,13 @@ async function applyEdits(
   const pointer = ops[0]?.path ?? []
   const target = await resolveTargetFile(write, pointer, reason)
   if (!target) return false
+  if (!stagedBases.has(target)) {
+    try {
+      stagedBases.set(target, existsSync(target) ? readFileSync(target, "utf8") : "")
+    } catch {
+      stagedBases.set(target, "")
+    }
+  }
   write.state.pending.push({ id: ++stagedChangeCounter, targetPath: target, ops, reason })
   const updated = await refreshStudio(write.api, write.state)
   Object.assign(write.state, updated)
@@ -1135,10 +1157,54 @@ async function saveStagedChanges(api: TuiPluginApi, state: StudioState): Promise
   for (const [targetPath, entry] of byPath) {
     const result = editConfigFile(targetPath, entry.ops, { stateDir: studioDataDir(api), reason: entry.reasons.join("; ") })
     if (!result.ok) return { saved, failed: { change: state.pending.find((change) => change.targetPath === targetPath)!, error: result.error ?? "unknown error" } }
+    stagedBases.delete(targetPath)
     saved++
   }
   state.pending = []
   return { saved }
+}
+
+/**
+ * Save-time outside-change guard: re-reads each staged target file and warns
+ * when it changed on disk after staging (another editor, another tool).
+ */
+async function confirmOutsideChanges(api: TuiPluginApi, state: StudioState): Promise<boolean> {
+  const relevant = new Map<string, string>()
+  for (const [path, base] of stagedBases) {
+    if (state.pending.some((change) => change.targetPath === path)) relevant.set(path, base)
+  }
+  if (relevant.size === 0) return true
+  const changes: OutsideChange[] = detectOutsideChanges(relevant, (path) => {
+    try {
+      return existsSync(path) ? readFileSync(path, "utf8") : undefined
+    } catch {
+      return undefined
+    }
+  })
+  if (changes.length === 0) return true
+  const sections = changes.map((change) => ({
+    title: change.path,
+    lines: change.diffLines,
+  }))
+  const proceed = await showConfirm(api.ui, {
+    title: "Outside changes detected",
+    message: [
+      "Some staged files changed on disk after you staged the edits:",
+      ...changes.map((change) => `  - ${change.path}`),
+      "",
+      "Staged edits are applied to the CURRENT disk content, so they may land differently than the diff preview suggested.",
+      "Review the outside changes, then decide.",
+    ].join("\n"),
+    confirmLabel: "Save anyway",
+  })
+  if (!proceed) return false
+  await showPagedInfo(api, { title: "Outside changes (disk vs staged base)", sections })
+  const really = await showConfirm(api.ui, {
+    title: "Save with outside changes?",
+    message: "The staged edits will be applied on top of the outside changes shown above.",
+    confirmLabel: "Save anyway",
+  })
+  return really
 }
 
 // ---------------------------------------------------------------------------
@@ -1368,6 +1434,8 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
         })
         if (!discard) return mainMenu(api, state)
         state.pending = []
+    stagedBases.clear()
+    configRestartReasons.length = 0
         for (const module of enabledModuleList()) module.discard?.()
       }
       return
@@ -1473,6 +1541,7 @@ function moduleContext(api: TuiPluginApi, state: StudioState): ModuleContext {
       const updated = await refreshStudio(api, state)
       Object.assign(state, updated)
     },
+    stageConfigEdits: async (ops, reason) => applyEdits({ api, state }, ops, reason),
   }
 }
 
@@ -1595,6 +1664,8 @@ async function reviewChangesScreen(api: TuiPluginApi, state: StudioState): Promi
     const confirmed = await showConfirm(api.ui, { title: "Discard all staged changes?", message: "Nothing has been written to disk. Drop all staged edits (including module changes)?" })
     if (!confirmed) return reviewChangesScreen(api, state)
     state.pending = []
+    stagedBases.clear()
+    configRestartReasons.length = 0
     for (const module of enabledModuleList()) module.discard?.()
     const updated = await refreshStudio(api, state)
     Object.assign(state, updated)
@@ -1643,6 +1714,9 @@ async function stagedChangeDetail(api: TuiPluginApi, state: StudioState, change:
   })
   if (action === "discard") {
     state.pending = state.pending.filter((item) => item.id !== change.id)
+    for (const [path] of stagedBases) {
+      if (!state.pending.some((item) => item.targetPath === path)) stagedBases.delete(path)
+    }
     const updated = await refreshStudio(api, state)
     Object.assign(state, updated)
     api.ui.toast({ variant: "info", title: "Staged change discarded", message: change.reason })
@@ -1664,6 +1738,8 @@ async function saveAndExit(api: TuiPluginApi, state: StudioState): Promise<void>
     confirmLabel: "Save & reload",
   })
   if (!confirmed) return mainMenu(api, state)
+  const noOutsideConflicts = await confirmOutsideChanges(api, state)
+  if (!noOutsideConflicts) return mainMenu(api, state)
   const result = await saveStagedChanges(api, state)
   if (result.failed) {
     await showAlert(api.ui, {
@@ -1677,7 +1753,7 @@ async function saveAndExit(api: TuiPluginApi, state: StudioState): Promise<void>
     })
     return mainMenu(api, state)
   }
-  const restartReasons: string[] = []
+  const restartReasons: string[] = [...configRestartReasons]
   for (const { module } of moduleSummaries) {
     try {
       const moduleResult = await module.save?.(moduleContext(api, state))
@@ -1686,6 +1762,7 @@ async function saveAndExit(api: TuiPluginApi, state: StudioState): Promise<void>
       restartReasons.push(`${module.title}: save failed - ${error instanceof Error ? error.message : String(error)}`)
     }
   }
+  configRestartReasons.length = 0
   const uniqueReasons = [...new Set(restartReasons)]
   api.ui.toast({ variant: uniqueReasons.length > 0 ? "warning" : "success", title: "Config saved", message: uniqueReasons.length > 0 ? "Restart OpenCode to apply task-list/UI changes." : "All changes written." })
   // Summary dialog BEFORE the config reload: dispose reloads plugins and
@@ -2557,121 +2634,243 @@ function agentHelpText(state: StudioState, name: string, entry: Record<string, u
   ].join("\n")
 }
 
+// Config-savable agent fields edited AV-style (FieldList): values stage into
+// opencode.json through the unified queue.
+const AGENT_CONFIG_FIELDS: Array<{ key: string; label: string; type: "model" | "variant" | "number" | "string" | "json" | "color"; doc: string; restart?: boolean }> = [
+  { key: "model", label: "Model", type: "model", doc: "agent.model" },
+  { key: "variant", label: "Model variant", type: "variant", doc: "agent.variant" },
+  { key: "temperature", label: "Temperature", type: "number", doc: "agent.temperature" },
+  { key: "top_p", label: "Top P", type: "number", doc: "agent.top_p" },
+  { key: "prompt", label: "Prompt", type: "string", doc: "agent.prompt" },
+  { key: "options", label: "Options", type: "json", doc: "agent.options" },
+  { key: "description", label: "Description", type: "string", doc: "agent.description", restart: true },
+  { key: "color", label: "Color", type: "color", doc: "agent.color", restart: true },
+]
+const THEME_COLOR_NAMES = ["primary", "secondary", "accent", "success", "warning", "error", "info"]
+
+/** Restart reasons collected from config edits (shown red in save summary). */
+const configRestartReasons: string[] = []
+
+function agentConfigValue(state: StudioState, agent: string, key: string): unknown {
+  return getAtPath(state.merge.merged, ["agent", agent, key])
+}
+
+function fieldRowDescription(value: unknown, state: StudioState, pointer: JSONPath): string {
+  const { winner } = provenanceAt(state.merge, pointer)
+  const source = winner ? fileLabel(state, winner) : "OpenCode default"
+  if (value === undefined) return `(not set - ${source})`
+  const text = typeof value === "string" ? value : prettyJSON(value)
+  return `${truncate(text, 46)} (${source})`
+}
+
+/** AV-style field list for one agent (probe-aware for the menu-tree smoke). */
+async function avFieldList(api: TuiPluginApi, props: { title: string; options: AVFieldListOption[]; current?: string }): Promise<AVFieldListChoice | undefined> {
+  if (menuProbe?.onMenu) {
+    const selection = menuProbe.onMenu(props.title, props.options.map((option) => ({ title: option.title, value: option.value, description: option.description } as WizardSelectOption<unknown>)))
+    if (selection === undefined || selection === null) return undefined
+    return { action: "select", value: selection as string }
+  }
+  return avShowFieldList(avApiForWizard(api), props)
+}
+
+/** Wizard API boundary cast (type copies may differ across package installs). */
+function avApiForWizard(api: TuiPluginApi): Parameters<typeof avAgentMode>[0] {
+  return api as unknown as Parameters<typeof avAgentMode>[0]
+}
+
 async function agentDetail(api: TuiPluginApi, state: StudioState, agent: string): Promise<void> {
   const write: WriteContext = { api, state }
-  const options: WizardSelectOption<string>[] = [
-    {
-      title: "Model",
-      value: "model",
-      description: String(getIn(safeStateConfig(api), ["agent", agent, "model"]) ?? "(session model)"),
-      help: docText("agent.model", [provenanceLine(state, ["agent", agent, "model"])]),
-    },
-    {
-      title: "Model variant",
-      value: "variant",
-      description: String(getIn(safeStateConfig(api), ["agent", agent, "variant"]) ?? "(default)"),
-      help: docText("agent.variant"),
-    },
-    {
-      title: "Temperature",
-      value: "temperature",
-      description: String(getIn(safeStateConfig(api), ["agent", agent, "temperature"]) ?? "(model default)"),
-      help: docText("agent.temperature"),
-    },
-    {
-      title: "Top P",
-      value: "top_p",
-      description: String(getIn(safeStateConfig(api), ["agent", agent, "top_p"]) ?? "(model default)"),
-      help: docText("agent.top_p"),
-    },
-  ]
-  for (const module of enabledModuleList()) {
-    if (moduleUsesOwnMenu(studioSettings, module)) continue
-    for (const entry of module.agentDetailEntries?.(moduleContext(api, state), agent) ?? []) {
-      options.push({ title: entry.title, value: `module-agent:${module.id}:${entry.title}`, description: entry.description, help: entry.help, edited: entry.edited, danger: entry.danger })
+  let selectedField: string | undefined = AGENT_CONFIG_FIELDS[0]?.key
+
+  while (true) {
+    const moduleRuns: Array<{ run: (ctx: ModuleContext) => Promise<void> }> = []
+    const options: AVFieldListOption[] = []
+
+    if (avAgentMode(avApiForWizard(api), agent) === "primary") {
+      options.push({ title: "! Primary-only agent", value: "__primary_info__", description: "task tool cannot call it", kind: "action" })
     }
-  }
-  options.push({ title: "< Back", value: "__back__", description: "Return to agent list" })
-  const picked = await showMenu(api, { title: `Agent ${agent}`, options })
-  if (!picked || picked === "__back__") return agentsScreen(api, state)
-  if (picked.startsWith("module-agent:")) {
-    const rest = picked.slice("module-agent:".length)
-    const [moduleId, ...titleParts] = rest.split(":")
-    const module = enabledModuleList().find((item) => item.id === moduleId)
-    const entry = module && !moduleUsesOwnMenu(studioSettings, module)
-      ? module.agentDetailEntries?.(moduleContext(api, state), agent).find((item) => item.title === titleParts.join(":"))
-      : undefined
-    if (entry) await entry.run(moduleContext(api, state))
-    return agentDetail(api, state, agent)
-  }
 
-  if (picked === "model") {
-    const modelPick = await pickAnyModel(api, state, `Model for agent ${agent}`)
-    if (!modelPick) return agentDetail(api, state, agent)
-    const ok = await applyEdits(write, [{ op: "set", path: ["agent", agent, "model"], value: `${modelPick.providerID}/${modelPick.modelID}` }], `agent ${agent} model`)
-    if (ok) return agentDetail(api, await refreshedState(api, state), agent)
-    return agentDetail(api, state, agent)
-  }
-
-  if (picked === "variant") {
-    const modelRef = getIn(safeStateConfig(api), ["agent", agent, "model"])
-    let providerID: string | undefined
-    let modelID: string | undefined
-    if (typeof modelRef === "string" && modelRef.includes("/")) {
-      const [pid, ...rest] = modelRef.split("/")
-      providerID = pid
-      modelID = rest.join("/")
-    } else {
-      const pick = await pickAnyModel(api, state, `Agent ${agent} has no model set. Pick the model whose variants to list`)
-      if (!pick) return agentDetail(api, state, agent)
-      providerID = pick.providerID
-      modelID = pick.modelID
+    for (const field of AGENT_CONFIG_FIELDS) {
+      const pointer: JSONPath = ["agent", agent, field.key]
+      options.push({
+        title: field.label,
+        value: field.key,
+        description: fieldRowDescription(agentConfigValue(state, agent, field.key), state, pointer),
+        restart: field.restart === true,
+        kind: "field",
+      })
     }
-    const runtime = state.providers.find((item) => item.id === providerID)?.models?.[modelID!]
-    const variantNames = runtime?.variants ? Object.keys(runtime.variants) : []
-    const variantPick = await showMenu(api, {
-      title: `Variant for ${agent} (on ${providerID}/${modelID})`,
-      options: [
-        { title: "Default (no variant)", value: "__remove__", description: "Remove the agent variant override" },
-        ...variantNames.map((name) => ({ title: name, value: name, description: "catalog variant" })),
-        { title: "< Cancel", value: "__cancel__", description: "" },
-      ],
-    })
-    if (!variantPick || variantPick === "__cancel__") return agentDetail(api, state, agent)
-    const ok = await applyEdits(
-      write,
-      variantPick === "__remove__"
-        ? [{ op: "delete", path: ["agent", agent, "variant"] }]
-        : [{ op: "set", path: ["agent", agent, "variant"], value: variantPick }],
-      `agent ${agent} variant`,
-    )
-    if (ok) return agentDetail(api, await refreshedState(api, state), agent)
-    return agentDetail(api, state, agent)
-  }
 
-  if (picked === "temperature" || picked === "top_p") {
-    const label = picked === "temperature" ? "Temperature" : "Top P"
-    const input = await showPrompt(api.ui, {
-      title: `Agent ${agent} - ${label}`,
-      placeholder: picked === "temperature" ? "0.0 - 2.0 (empty removes)" : "0.0 - 1.0 (empty removes)",
-      value: getIn(safeStateConfig(api), ["agent", agent, picked]) !== undefined ? String(getIn(safeStateConfig(api), ["agent", agent, picked])) : "",
-    })
-    if (input === undefined) return agentDetail(api, state, agent)
-    let ok = false
-    if (input.trim() === "") {
-      ok = await applyEdits(write, [{ op: "delete", path: ["agent", agent, picked] }], `agent ${agent} ${picked} remove`)
-    } else {
-      const num = Number(input)
-      if (!Number.isFinite(num)) {
-        await showAlert(api.ui, { title: "Invalid number", message: `"${input}" is not a number.` })
-        return agentDetail(api, state, agent)
+    for (const module of enabledModuleList()) {
+      if (moduleUsesOwnMenu(studioSettings, module)) continue
+      for (const entry of module.agentDetailEntries?.(moduleContext(api, state), agent) ?? []) {
+        moduleRuns.push(entry)
+        options.push({ title: entry.title, value: `module-agent:${module.id}:${moduleRuns.length - 1}`, description: entry.description ?? "", kind: "action" })
       }
-      ok = await applyEdits(write, [{ op: "set", path: ["agent", agent, picked], value: num }], `agent ${agent} ${picked}`)
     }
-    if (ok) return agentDetail(api, await refreshedState(api, state), agent)
-    return agentDetail(api, state, agent)
+    options.push({ title: "< Back", value: "__back__", description: "Return to agent list", kind: "action" })
+
+    const pickedField = await avFieldList(api, { title: `Agent ${agent}`, options, current: selectedField })
+    const field = pickedField?.value
+    if (!field || field === "__back__") return agentsScreen(api, state)
+    selectedField = field
+
+    if (field === "__primary_info__") {
+      await showInfo(api, {
+        title: "Primary-only agent",
+        message: [
+          `"${agent}" runs in primary mode: the task tool cannot call it, so Agent Variants cannot attach variants to it.`,
+          "Set mode: subagent (or all) in the agent config to make it task-callable.",
+        ].join("\n"),
+      })
+      continue
+    }
+
+    if (field.startsWith("module-agent:")) {
+      const rest = field.slice("module-agent:".length)
+      const splitAt = rest.lastIndexOf(":")
+      const index = Number(rest.slice(splitAt + 1))
+      const entry = moduleRuns[index]
+      if (entry) await entry.run(moduleContext(api, state))
+      continue
+    }
+
+    const def = AGENT_CONFIG_FIELDS.find((item) => item.key === field)
+    if (!def) continue
+    const pointer: JSONPath = ["agent", agent, def.key]
+
+    if (pickedField.action === "inspect") {
+      await showInfo(api, {
+        title: def.label,
+        message: docText(def.doc, [
+          `Current: ${fieldRowDescription(agentConfigValue(state, agent, def.key), state, pointer)}`,
+          def.restart ? "RESTART REQUIRED when this field changes." : "Applies via config reload after Save & exit.",
+        ]),
+      })
+      continue
+    }
+
+    // ---- edit flows ----
+    if (def.type === "model") {
+      const picked = await showMenu(api, {
+        title: `Model - ${agent}`,
+        options: [
+          { title: "Pick model", value: "pick", description: "Full catalog picker" },
+          { title: "Remove model override", value: "remove", description: "Use the session model", danger: Boolean(agentConfigValue(state, agent, "model")) },
+          { title: "< Cancel", value: "__cancel__", description: "" },
+        ],
+      })
+      if (!picked || picked === "__cancel__") continue
+      if (picked === "remove") {
+        await applyEdits(write, [{ op: "delete", path: pointer }], `agent ${agent} model remove`)
+      } else {
+        const modelPick = await pickAnyModel(api, state, `Model for agent ${agent}`)
+        if (!modelPick) continue
+        await applyEdits(write, [{ op: "set", path: pointer, value: `${modelPick.providerID}/${modelPick.modelID}` }], `agent ${agent} model`)
+      }
+      continue
+    }
+
+    if (def.type === "variant") {
+      const modelRef = agentConfigValue(state, agent, "model")
+      let providerID: string | undefined
+      let modelID: string | undefined
+      if (typeof modelRef === "string" && modelRef.includes("/")) {
+        const [pid, ...rest] = modelRef.split("/")
+        providerID = pid
+        modelID = rest.join("/")
+      } else {
+        const pick = await pickAnyModel(api, state, `Agent ${agent} has no model set. Pick the model whose variants to list`)
+        if (!pick) continue
+        providerID = pick.providerID
+        modelID = pick.modelID
+      }
+      const runtime = state.providers.find((item) => item.id === providerID)?.models?.[modelID!]
+      const variantNames = runtime?.variants ? Object.keys(runtime.variants) : []
+      const variantPick = await showMenu(api, {
+        title: `Model variant - ${agent} (on ${providerID}/${modelID})`,
+        options: [
+          { title: "Default (no variant)", value: "__remove__", description: "Remove the agent variant override" },
+          ...variantNames.map((name) => ({ title: name, value: name, description: "catalog variant" })),
+          { title: "< Cancel", value: "__cancel__", description: "" },
+        ],
+      })
+      if (!variantPick || variantPick === "__cancel__") continue
+      await applyEdits(
+        write,
+        variantPick === "__remove__"
+          ? [{ op: "delete", path: pointer }]
+          : [{ op: "set", path: pointer, value: variantPick }],
+        `agent ${agent} variant`,
+      )
+      continue
+    }
+
+    if (def.type === "number") {
+      const input = await showPrompt(api.ui, {
+        title: `Agent ${agent} - ${def.label}`,
+        placeholder: def.key === "temperature" ? "0.0 - 2.0 (empty removes)" : "0.0 - 1.0 (empty removes)",
+        value: agentConfigValue(state, agent, def.key) !== undefined ? String(agentConfigValue(state, agent, def.key)) : "",
+      })
+      if (input === undefined) continue
+      if (input.trim() === "") {
+        await applyEdits(write, [{ op: "delete", path: pointer }], `agent ${agent} ${def.key} remove`)
+      } else {
+        const num = Number(input)
+        if (!Number.isFinite(num)) {
+          await showAlert(api.ui, { title: "Invalid number", message: `"${input}" is not a number.` })
+          continue
+        }
+        await applyEdits(write, [{ op: "set", path: pointer, value: num }], `agent ${agent} ${def.key}`)
+      }
+      continue
+    }
+
+    if (def.type === "json") {
+      const body = await showJSONEditor(api, `agent.${agent}.${def.key}`, agentConfigValue(state, agent, def.key))
+      if (body === undefined) continue
+      if (body === "__delete__") {
+        await applyEdits(write, [{ op: "delete", path: pointer }], `agent ${agent} ${def.key} remove`)
+      } else {
+        await applyEdits(write, [{ op: "set", path: pointer, value: body }], `agent ${agent} ${def.key}`)
+      }
+      continue
+    }
+
+    if (def.type === "color") {
+      const input = await showPrompt(api.ui, {
+        title: `Agent ${agent} - Color`,
+        placeholder: `#RRGGBB or ${THEME_COLOR_NAMES.join("/")} (empty removes)`,
+        value: typeof agentConfigValue(state, agent, "color") === "string" ? String(agentConfigValue(state, agent, "color")) : "",
+      })
+      if (input === undefined) continue
+      if (input.trim() === "") {
+        await applyEdits(write, [{ op: "delete", path: pointer }], `agent ${agent} color remove`)
+      } else if (!/^#[0-9a-fA-F]{6}$/.test(input.trim()) && !THEME_COLOR_NAMES.includes(input.trim())) {
+        await showAlert(api.ui, { title: "Invalid color", message: "Use a #RRGGBB hex code or a theme color name." })
+        continue
+      } else {
+        await applyEdits(write, [{ op: "set", path: pointer, value: input.trim() }], `agent ${agent} color`)
+        configRestartReasons.push(`${agent}: color change requires restart.`)
+      }
+      continue
+    }
+
+    // string: prompt / description
+    const input = await showPrompt(api.ui, {
+      title: `Agent ${agent} - ${def.label}`,
+      placeholder: `(empty removes the ${def.label} override)`,
+      value: typeof agentConfigValue(state, agent, def.key) === "string" ? String(agentConfigValue(state, agent, def.key)) : "",
+    })
+    if (input === undefined) continue
+    if (input === "") {
+      await applyEdits(write, [{ op: "delete", path: pointer }], `agent ${agent} ${def.key} remove`)
+    } else {
+      await applyEdits(write, [{ op: "set", path: pointer, value: input }], `agent ${agent} ${def.key}`)
+    }
+    if (def.restart) configRestartReasons.push(`${agent}: ${def.label.toLowerCase()} change requires restart.`)
+    continue
   }
-  return agentsScreen(api, state)
 }
 
 // ---------------------------------------------------------------------------
@@ -3053,14 +3252,17 @@ const tui: TuiPlugin = async (api) => {
   )
   studioSettings = loadSettings(studioDataDir(api))
 
-  // Startup duplicate check: the TUI entry runs at OpenCode startup, so this
-  // shows the same interactive removal dialog the studio command uses, without
-  // the user having to open the studio first. Delayed briefly so the initial
-  // TUI render settles; opening the studio re-checks (duplicateCheckDone is
-  // reset per command run), which is fine - users should be warned twice
-  // rather than never.
+  // Startup duplicate check + cache preload: the TUI entry runs at OpenCode
+  // startup. Delayed briefly so the initial TUI render settles; the preload
+  // warms the provider-catalog and models.dev caches so the first studio open
+  // is instant. Opening the studio re-checks (duplicateCheckDone is reset per
+  // command run), which is fine - users should be warned twice rather than
+  // never.
   const startupCheckTimer = setTimeout(() => {
     void checkStandaloneDuplicates(api).catch(() => {})
+    void refreshStudio(api)
+      .then(() => undefined)
+      .catch(() => undefined)
   }, STARTUP_CHECK_DELAY_MS)
   ;(startupCheckTimer as { unref?: () => void }).unref?.()
 
@@ -3068,9 +3270,22 @@ const tui: TuiPlugin = async (api) => {
     studioSettings = loadSettings(studioDataDir(api))
     duplicateCheckDone = false
     let state: StudioState | undefined
-    await showBusy(api, "Loading config layers...", (async () => {
-      state = await refreshStudio(api)
-    })())
+    // Deferred busy indicator: warm caches skip the dialog entirely; only a
+    // genuinely slow load (cold start) flashes it after 150ms.
+    let settled = false
+    const loading = refreshStudio(api).then((result) => {
+      settled = true
+      return result
+    })
+    const busyTimer = setTimeout(() => {
+      if (!settled) void showBusy(api, "Loading config layers...", loading.then(() => undefined))
+    }, 150)
+    ;(busyTimer as { unref?: () => void }).unref?.()
+    try {
+      state = await loading
+    } finally {
+      clearTimeout(busyTimer)
+    }
     if (!state) return
     await mainMenu(api, state)
   })
