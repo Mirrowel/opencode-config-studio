@@ -28,12 +28,16 @@ const required = [
   "dist/catalog.js",
   "dist/docs.js",
   "dist/sink.js",
+  "dist/selfwire.js",
+  "dist/server.js",
   "src/tui.tsx",
   "src/jsonc.ts",
   "src/discovery.ts",
   "src/catalog.ts",
   "src/docs.ts",
   "src/sink.ts",
+  "src/selfwire.ts",
+  "src/server.ts",
   "tsconfig.json",
 ]
 

@@ -15,6 +15,7 @@ const { applySet, applyDelete, parseJsonc, editConfigFile, createConfigFile, get
 const { discoverConfigFiles, mergeWithProvenance, getIn, provenanceAt, findUneditableLayers } = await import(dist("discovery"))
 const { deriveVariantsFromMeta, reasoningEffortBody, reasoningBudgetBody, computeBaseDefaults, computeSmallModelOptions, analyzeModel, analyzeProviders, bodyOneLine } = await import(dist("catalog"))
 const { diffBodies, buildInlineConfig } = await import(dist("sink"))
+const { isOwnSpec, ensureTuiRegistration, ourRootDir, PLUGIN_NPM_NAME } = await import(dist("selfwire"))
 
 function assert(condition, message) {
   if (!condition) throw new Error(`assert failed: ${message}`)
@@ -359,6 +360,82 @@ function section(name) {
 {
   section("utils: formatPath")
   assert(formatPath(["provider", "zai", "models", "glm-5.2", "variants"]) === "provider.zai.models.glm-5.2.variants", `formatPath wrong: ${formatPath(["provider", "zai", "models", "glm-5.2", "variants"])}`)
+}
+
+// ---------------------------------------------------------------------------
+// selfwire
+// ---------------------------------------------------------------------------
+
+{
+  section("selfwire: spec matching")
+  assert(isOwnSpec(PLUGIN_NPM_NAME, "C:/irrelevant"), "npm name should match")
+  assert(isOwnSpec(`${PLUGIN_NPM_NAME}@latest`, "C:/irrelevant"), "npm name with tag should match")
+  assert(isOwnSpec("file:///C:/Projects/OC%20Plugins/opencode-config-studio", "C:/Projects/OC Plugins/opencode-config-studio"), "file spec with encoded spaces should match")
+  assert(!isOwnSpec("file:///C:/other/plugin", "C:/Projects/OC Plugins/opencode-config-studio"), "foreign file spec should not match")
+  assert(!isOwnSpec("@mirrowel/opencode-agent-variants", "C:/irrelevant"), "foreign npm name should not match")
+  assert(!isOwnSpec(42, "C:/irrelevant"), "non-string should not match")
+  assert(ourRootDir().length > 0, "ourRootDir should resolve")
+}
+
+{
+  section("selfwire: wires opencode.json registration into tui.json")
+  const dir = mkdtempSync(path.join(tmpdir(), "config-studio-test-"))
+  const globalDir = path.join(dir, "global")
+  const pluginRoot = path.join(dir, "plugins", "config-studio")
+  mkdirSync(globalDir, { recursive: true })
+  mkdirSync(pluginRoot, { recursive: true })
+  try {
+    const spec = `file:///${pluginRoot.split(path.sep).join("/").replace(/ /g, "%20")}`
+    writeFileSync(path.join(globalDir, "opencode.json"), JSON.stringify({ plugin: ["@mirrowel/opencode-agent-variants", spec] }), "utf8")
+
+    const first = ensureTuiRegistration({ globalConfigDir: globalDir, ourRoot: pluginRoot })
+    if (first.status !== "wired") throw new Error(`expected wired, got ${first.status} (${first.error ?? ""})`)
+    const tuiText = readFileSync(path.join(globalDir, "tui.json"), "utf8")
+    if (!tuiText.includes(spec)) throw new Error(`tui.json does not contain the spec: ${tuiText}`)
+    if (tuiText.includes("agent-variants")) throw new Error("foreign plugin spec leaked into tui.json")
+
+    const second = ensureTuiRegistration({ globalConfigDir: globalDir, ourRoot: pluginRoot })
+    if (second.status !== "already-wired") throw new Error(`expected already-wired, got ${second.status}`)
+    if (second.spec !== spec) throw new Error(`spec mismatch: ${second.spec}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+{
+  section("selfwire: npm spec and project tui.json detection")
+  const dir = mkdtempSync(path.join(tmpdir(), "config-studio-test-"))
+  const globalDir = path.join(dir, "global")
+  const project = path.join(dir, "project", "src")
+  mkdirSync(globalDir, { recursive: true })
+  mkdirSync(project, { recursive: true })
+  try {
+    writeFileSync(path.join(globalDir, "opencode.json"), JSON.stringify({ plugin: [PLUGIN_NPM_NAME] }), "utf8")
+    const first = ensureTuiRegistration({ globalConfigDir: globalDir, ourRoot: "C:/somewhere" })
+    if (first.status !== "wired" || first.spec !== PLUGIN_NPM_NAME) throw new Error(`npm wiring failed: ${JSON.stringify(first)}`)
+    // Project-level tui.json also counts as wired.
+    rmSync(path.join(globalDir, "tui.json"))
+    writeFileSync(path.join(project, "tui.json"), JSON.stringify({ plugin: [[PLUGIN_NPM_NAME, {}]] }), "utf8")
+    const second = ensureTuiRegistration({ globalConfigDir: globalDir, ourRoot: "C:/somewhere", directory: project, worktree: path.join(dir, "project") })
+    if (second.status !== "already-wired") throw new Error(`project tui.json not detected: ${second.status}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+{
+  section("selfwire: no registration is a no-op")
+  const dir = mkdtempSync(path.join(tmpdir(), "config-studio-test-"))
+  const globalDir = path.join(dir, "global")
+  mkdirSync(globalDir, { recursive: true })
+  try {
+    writeFileSync(path.join(globalDir, "opencode.json"), JSON.stringify({ model: "zai/glm-5.2" }), "utf8")
+    const result = ensureTuiRegistration({ globalConfigDir: globalDir, ourRoot: "C:/somewhere" })
+    if (result.status !== "not-registered") throw new Error(`expected not-registered, got ${result.status}`)
+    if (existsSync(path.join(globalDir, "tui.json"))) throw new Error("tui.json should not be created")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 }
 
 console.log("all unit tests passed")

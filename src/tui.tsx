@@ -33,6 +33,7 @@ import {
   type VariantAnalysis,
 } from "./catalog.js"
 import { runCapture, diffBodies, type CaptureRunResult } from "./sink.js"
+import { ensureTuiRegistration, ourRootDir } from "./selfwire.js"
 import { FIELD_DOCS } from "./docs.js"
 
 // ---------------------------------------------------------------------------
@@ -252,6 +253,7 @@ function showSelect<Value>(
     options: TuiDialogSelectOption<Value>[]
     placeholder?: string
     current?: Value
+    flat?: boolean
   },
 ): Promise<Value | undefined> {
   return new Promise((resolve) => {
@@ -267,7 +269,7 @@ function showSelect<Value>(
         placeholder: props.placeholder ?? "Type to filter...",
         options: props.options,
         current: props.current,
-        flat: props.options.length < 15,
+        flat: props.flat ?? props.options.length < 15,
         onSelect: (opt) => {
           done(opt.value)
           ui.dialog.clear()
@@ -1621,28 +1623,38 @@ async function refreshedState(api: TuiPluginApi, state: StudioState): Promise<St
 }
 
 async function pickAnyModel(api: TuiPluginApi, state: StudioState, title: string): Promise<{ providerID: string; modelID: string } | undefined> {
-  const options: WizardSelectOption<string>[] = []
-  for (const provider of state.providers) {
+  // Grouped, searchable picker (same pattern as OpenCode's native model
+  // picker): DialogSelect groups by provider category and its built-in filter
+  // searches both option titles (model IDs) and categories (providers).
+  const providerAnalyses = analyzeProviders(state.providers, state.defaults, state.merge)
+  const options: TuiDialogSelectOption<string>[] = []
+  for (const analysis of providerAnalyses) {
+    const provider = state.providers.find((item) => item.id === analysis.providerID)
+    if (!provider) continue
+    const category = analysis.edited ? `${provider.name || analysis.providerID} *` : (provider.name || analysis.providerID)
     for (const [modelID, model] of Object.entries(provider.models ?? {})) {
-      const edited = provenanceAt(state.merge, ["provider", provider.id, "models", modelID]).contributors.length > 0
+      const edited = provenanceAt(state.merge, ["provider", analysis.providerID, "models", modelID]).contributors.length > 0
+      const isDefault = state.defaults[analysis.providerID] === modelID
       options.push({
-        title: `${provider.id}/${modelID}`,
-        value: `${provider.id}/${modelID}`,
+        title: modelID,
+        value: `${analysis.providerID}/${modelID}`,
         description: [
           model.name !== modelID ? model.name : undefined,
-          model.variants && Object.keys(model.variants).length > 0 ? `${Object.keys(model.variants).length} variant(s)` : undefined,
-          state.defaults[provider.id] === modelID ? "provider default" : undefined,
+          isDefault ? "default model" : undefined,
+          edited ? "config-edited" : undefined,
         ].filter(Boolean).join(" - "),
-        edited,
+        category,
       })
     }
   }
-  options.sort((a, b) => {
-    if (a.edited !== b.edited) return a.edited ? -1 : 1
-    return a.title.localeCompare(b.title)
+  options.push({ title: "< Cancel", value: "__cancel__", description: "Do not change", category: "" })
+
+  const picked = await showSelect(api.ui, {
+    title,
+    options,
+    flat: false,
+    placeholder: "Search models or providers...",
   })
-  options.push({ title: "< Cancel", value: "__cancel__", description: "Do not change" })
-  const picked = await showMenu(api, { title, options })
   if (!picked || picked === "__cancel__") return undefined
   const [providerID, ...rest] = picked.split("/")
   return { providerID: providerID!, modelID: rest.join("/") }
@@ -2105,6 +2117,28 @@ function registerStudioCommand(api: TuiPluginApi, run: () => Promise<void>) {
 }
 
 const tui: TuiPlugin = async (api) => {
+  // Belt-and-braces: if this plugin got registered in opencode.json but not in
+  // any tui.json layer, mirror the registration (normally done by the server
+  // entry; no-op when the TUI part is already properly wired).
+  try {
+    const wired = ensureTuiRegistration({
+      globalConfigDir: api.state.path.config,
+      ourRoot: ourRootDir(),
+      directory: api.state.path.directory,
+      worktree: api.state.path.worktree,
+      env: process.env,
+    })
+    if (wired.status === "wired") {
+      api.ui.toast({
+        variant: "info",
+        title: "Config Studio",
+        message: `Added ${wired.spec} to tui.json - restart OpenCode to load the TUI part.`,
+      })
+    }
+  } catch {
+    // never block activation on self-wiring
+  }
+
   const unregister = registerStudioCommand(api, async () => {
     let state: StudioState | undefined
     await showBusy(api, "Loading config layers...", (async () => {
