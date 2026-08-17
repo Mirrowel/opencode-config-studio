@@ -372,13 +372,21 @@ function section(name) {
 
 {
   section("selfwire: spec matching")
-  assert(isOwnSpec(PLUGIN_NPM_NAME, "C:/irrelevant"), "npm name should match")
-  assert(isOwnSpec(`${PLUGIN_NPM_NAME}@latest`, "C:/irrelevant"), "npm name with tag should match")
-  assert(isOwnSpec("file:///C:/Projects/OC%20Plugins/opencode-config-studio", "C:/Projects/OC Plugins/opencode-config-studio"), "file spec with encoded spaces should match")
-  assert(!isOwnSpec("file:///C:/other/plugin", "C:/Projects/OC Plugins/opencode-config-studio"), "foreign file spec should not match")
-  assert(!isOwnSpec("@mirrowel/opencode-agent-variants", "C:/irrelevant"), "foreign npm name should not match")
-  assert(!isOwnSpec(42, "C:/irrelevant"), "non-string should not match")
-  assert(ourRootDir().length > 0, "ourRootDir should resolve")
+  // Path-based specs go through fileURLToPath, which is platform-dependent:
+  // build the spec from a real temp path so the test is cross-platform.
+  const ownRoot = mkdtempSync(path.join(tmpdir(), "selfwire own "))
+  try {
+    const ownSpec = pathToFileURL(ownRoot).href
+    assert(isOwnSpec(PLUGIN_NPM_NAME, "C:/irrelevant"), "npm name should match")
+    assert(isOwnSpec(`${PLUGIN_NPM_NAME}@latest`, "C:/irrelevant"), "npm name with tag should match")
+    assert(isOwnSpec(ownSpec, ownRoot), "file spec with encoded spaces should match")
+    assert(!isOwnSpec("file:///C:/other/plugin", ownRoot), "foreign file spec should not match")
+    assert(!isOwnSpec("@mirrowel/opencode-agent-variants", "C:/irrelevant"), "foreign npm name should not match")
+    assert(!isOwnSpec(42, "C:/irrelevant"), "non-string should not match")
+    assert(ourRootDir().length > 0, "ourRootDir should resolve")
+  } finally {
+    rmSync(ownRoot, { recursive: true, force: true })
+  }
 }
 
 {
@@ -389,7 +397,7 @@ function section(name) {
   mkdirSync(globalDir, { recursive: true })
   mkdirSync(pluginRoot, { recursive: true })
   try {
-    const spec = `file:///${pluginRoot.split(path.sep).join("/").replace(/ /g, "%20")}`
+    const spec = pathToFileURL(pluginRoot).href
     writeFileSync(path.join(globalDir, "opencode.json"), JSON.stringify({ plugin: ["@mirrowel/opencode-agent-variants", spec] }), "utf8")
 
     const first = ensureTuiRegistration({ globalConfigDir: globalDir, ourRoot: pluginRoot })
