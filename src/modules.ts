@@ -59,6 +59,8 @@ export type StudioModule = {
   diagnosticsSections?: (ctx: ModuleContext) => Promise<PagedSection[]>
   /** Sections merged into How it works. */
   infoSections?: () => PagedSection[]
+  /** Entries on the studio Advanced screen (debug toggles, logs, backups...). */
+  advancedEntries?: (ctx: ModuleContext) => Array<MenuEntry & { run: (ctx: ModuleContext) => Promise<void> }>
   /**
    * Human-readable summary of staged changes for the Review screen plus
    * restart reasons collected so far.

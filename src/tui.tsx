@@ -277,6 +277,10 @@ function showSelect<Value>(
     flat?: boolean
   },
 ): Promise<Value | undefined> {
+  if (menuProbe?.onMenu) {
+    const selection = menuProbe.onMenu(props.title, (props.options as unknown as WizardSelectOption<unknown>[]).map((option) => ({ title: option.title, value: option.value, description: option.description })))
+    return Promise.resolve((selection as Value | undefined) ?? undefined)
+  }
   const debounced = props.options.length >= DEBOUNCE_THRESHOLD
   return new Promise((resolve) => {
     let settled = false
@@ -356,7 +360,41 @@ async function showMenu<Value>(api: TuiPluginApi, props: { title: string; option
   }
 }
 
+// ---------------------------------------------------------------------------
+// Menu-tree probe (menu-tree smoke test)
+// ---------------------------------------------------------------------------
+
+/**
+ * When set, all studio dialogs short-circuit through the probe instead of
+ * rendering: menus report their options and optionally return a selection,
+ * infos/confirms/prompts auto-resolve. Lets the menu-tree smoke test walk
+ * every screen for crashes, duplicate/ambiguous titles, and dead entries.
+ */
+export type MenuProbe = {
+  onMenu?: (title: string, options: WizardSelectOption<unknown>[]) => string | unknown | undefined
+  onInfo?: (title: string, message: string) => void
+  onPaged?: (title: string, sections: PagedSection[]) => void
+  onConfirm?: (title: string, message: string) => boolean
+}
+
+let menuProbe: MenuProbe | undefined
+
+export function __setMenuProbe(probe?: MenuProbe): void {
+  menuProbe = probe
+}
+
+function probeMenuOnce<Value>(props: { title: string; options: WizardSelectOption<Value>[] }): { handled: boolean; selection?: Value } {
+  if (!menuProbe?.onMenu) return { handled: false }
+  const selection = menuProbe.onMenu(props.title, props.options as WizardSelectOption<unknown>[])
+  if (selection === undefined || selection === null) return { handled: true }
+  return { handled: true, selection: selection as Value }
+}
+
 function showMenuOnce<Value>(api: TuiPluginApi, props: { title: string; options: WizardSelectOption<Value>[]; current?: Value }): Promise<MenuChoice<Value> | undefined> {
+  if (menuProbe?.onMenu) {
+    const probed = probeMenuOnce(props)
+    return Promise.resolve(probed.selection !== undefined ? { action: "select", value: probed.selection } : undefined)
+  }
   return new Promise((resolve) => {
     let settled = false
     const done = (value: MenuChoice<Value> | undefined, clear = true) => {
@@ -483,6 +521,7 @@ function showPrompt(
     value?: string
   },
 ): Promise<string | undefined> {
+  if (menuProbe) return Promise.resolve(undefined)
   return new Promise((resolve) => {
     let settled = false
     const done = (value: string | undefined) => {
@@ -517,6 +556,7 @@ function showConfirm(
     confirmLabel?: string
   },
 ): Promise<boolean> {
+  if (menuProbe) return Promise.resolve(menuProbe.onConfirm?.(props.title, props.message) ?? false)
   return new Promise((resolve) => {
     let settled = false
     const done = (value: boolean) => {
@@ -566,6 +606,10 @@ function showAlert(ui: UI, props: { title: string; message: string }): Promise<v
 }
 
 function showInfo(api: TuiPluginApi, props: { title: string; message: string }): Promise<void> {
+  if (menuProbe) {
+    menuProbe.onInfo?.(props.title, props.message)
+    return Promise.resolve()
+  }
   return new Promise((resolve) => {
     let settled = false
     const done = () => {
@@ -674,6 +718,10 @@ function showBusy(api: TuiPluginApi, title: string, work: Promise<void>): Promis
 export type PagedSection = { title: string; lines: string[] }
 
 function showPagedInfo(api: TuiPluginApi, props: { title: string; sections: PagedSection[] }): Promise<void> {
+  if (menuProbe) {
+    menuProbe.onPaged?.(props.title, props.sections)
+    return Promise.resolve()
+  }
   return new Promise((resolve) => {
     let settled = false
     const done = () => {
@@ -1246,10 +1294,10 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
       help: "Enable or disable feature modules (Agent Variants, ...) and configure how they integrate into the studio. Disabled modules disappear from every menu; their server-side parts stop at the next restart.",
     },
     {
-      title: "Wizard UI",
+      title: "Advanced",
       value: "ui",
-      description: `Width ${wizardDialogSize(api)}, height ${wizardDialogHeightPercent(api)}%`,
-      help: "Dialog sizing for Config Studio screens.",
+      description: `Dialog sizing, debug tools, module options`,
+      help: "Wizard UI sizing for Config Studio screens plus advanced tools contributed by enabled modules (Agent Variants debug mode, logs, backups, ...).",
     },
   ]
   for (const module of modules) {
@@ -1270,14 +1318,16 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
       edited: true,
       help: "Edits are queued in memory. Nothing is written until Save & exit; review the diff, discard single changes, or drop everything.",
     })
-    opts.push({
-      title: "Save & exit",
-      value: "save",
-      description: "Write staged changes to disk",
-      edited: true,
-      help: "Writes every staged change to its target (with backups), reloads OpenCode config once, and closes the studio.",
-    })
   }
+  opts.push({
+    title: pendingCount > 0 ? `Save & exit (${pendingCount})` : "Save & exit",
+    value: "save",
+    description: pendingCount > 0 ? "Write staged changes to disk" : "Nothing staged - close the studio",
+    edited: pendingCount > 0,
+    help: pendingCount > 0
+      ? "Writes every staged change to its target (with backups), reloads OpenCode config once, and closes the studio."
+      : "No changes are staged. Esc also closes the studio.",
+  })
 
   const action = await showMenu(api, { title: "Config Studio", options: opts })
   if (action?.startsWith("module:")) {
@@ -1604,7 +1654,10 @@ async function stagedChangeDetail(api: TuiPluginApi, state: StudioState, change:
 async function saveAndExit(api: TuiPluginApi, state: StudioState): Promise<void> {
   const moduleSummaries = modulePendingSummaries(moduleContext(api, state))
   const total = state.pending.length + moduleSummaries.length
-  if (total === 0) return
+  if (total === 0) {
+    api.ui.toast({ variant: "info", title: "Nothing staged", message: "No changes to save - closing the studio." })
+    return
+  }
   const confirmed = await showConfirm(api.ui, {
     title: "Save staged changes",
     message: `Write ${state.pending.length} staged file change(s) and ${moduleSummaries.length} module change(s)?\nEach file write creates a backup first.`,
@@ -2514,7 +2567,7 @@ async function agentDetail(api: TuiPluginApi, state: StudioState, agent: string)
       help: docText("agent.model", [provenanceLine(state, ["agent", agent, "model"])]),
     },
     {
-      title: "Variant",
+      title: "Model variant",
       value: "variant",
       description: String(getIn(safeStateConfig(api), ["agent", agent, "variant"]) ?? "(default)"),
       help: docText("agent.variant"),
@@ -2885,9 +2938,21 @@ async function uiScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
       description: "Adjust with presets or a custom percent",
       help: "Maximum height of Config Studio screens. Presets: compact=32%, normal=50%, tall=68%, max=100%.",
     },
-    { title: "< Back", value: "__back__", description: "Return to main menu" },
   ]
-  const picked = await showMenu(api, { title: "Wizard UI", options })
+  for (const module of enabledModuleList()) {
+    const entries = module.advancedEntries?.(moduleContext(api, state)) ?? []
+    entries.forEach((entry, index) => {
+      options.push({
+        title: entry.title,
+        value: `module-advanced:${module.id}:${index}`,
+        description: entry.description,
+        help: entry.help,
+        danger: entry.danger,
+      })
+    })
+  }
+  options.push({ title: "< Back", value: "__back__", description: "Return to main menu" })
+  const picked = await showMenu(api, { title: "Advanced", options })
   if (!picked || picked === "__back__") return mainMenu(api, state)
   if (picked === "width") {
     setWizardDialogSize(api, nextWizardDialogSize(api))
@@ -2899,6 +2964,16 @@ async function uiScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
       const num = Number(input)
       if (Number.isFinite(num)) setWizardDialogHeightPercent(api, num)
     }
+    return uiScreen(api, state)
+  }
+  if (picked.startsWith("module-advanced:")) {
+    const rest = picked.slice("module-advanced:".length)
+    const splitAt = rest.lastIndexOf(":")
+    const moduleId = rest.slice(0, splitAt)
+    const entryIndex = Number(rest.slice(splitAt + 1))
+    const module = enabledModuleList().find((item) => item.id === moduleId)
+    const entry = module?.advancedEntries?.(moduleContext(api, state))?.[entryIndex]
+    if (entry) await entry.run(moduleContext(api, state))
     return uiScreen(api, state)
   }
   return mainMenu(api, state)
@@ -3007,3 +3082,17 @@ const tui: TuiPlugin = async (api) => {
 }
 
 export default { id: "config-studio", tui }
+
+// Test hooks for the menu-tree smoke test (scripts/menu-tree-smoke.mjs).
+export const __testInternals = {
+  mainMenu,
+  refreshStudio,
+  __setMenuProbe,
+  setStudioSettings: (settings: StudioSettings) => {
+    studioSettings = settings
+  },
+  resetDuplicateCheck: () => {
+    duplicateCheckDone = false
+  },
+  defaultHiddenSections: () => [...DEFAULT_HIDDEN_SECTIONS],
+}

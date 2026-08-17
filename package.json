@@ -58,7 +58,7 @@
     "build:tui": "bun scripts/build-tui.mjs",
     "typecheck": "tsc --noEmit",
     "check:deps": "node scripts/check-deps.mjs",
-    "ci:package": "npm run typecheck && npm run build && npm run test:unit && npm run test:tui-reactivity && npm run test:tui-startup && npm run pack:dry-run && npm run test:tui-package",
+    "ci:package": "npm run typecheck && npm run build && npm run test:unit && npm run test:tui-reactivity && npm run test:tui-startup && npm run test:menu-tree && npm run pack:dry-run && npm run test:tui-package",
     "ci": "npm run release:intent:check && node scripts/check-deps.mjs && npm run ci:package",
     "commit:check": "npm run ci",
     "hooks:install": "node scripts/install-git-hooks.mjs",
@@ -68,6 +68,7 @@
     "test:unit": "node scripts/unit-tests.mjs",
     "test:tui-reactivity": "bun --conditions=browser scripts/tui-reactivity-smoke.mjs",
     "test:tui-startup": "bun --conditions=browser scripts/tui-startup-smoke.mjs silent && bun --conditions=browser scripts/tui-startup-smoke.mjs duplicate",
+    "test:menu-tree": "bun --conditions=browser scripts/menu-tree-smoke.mjs",
     "test:tui-package": "node scripts/tui-package-smoke.mjs",
     "prepublishOnly": "npm run typecheck && npm run build"
   },
@@ -76,7 +77,7 @@
     "@opentui/solid": "^0.4.1",
     "jsonc-parser": "^3.3.1",
     "solid-js": "1.9.12",
-    "@mirrowel/opencode-agent-variants": "^0.8.0-dev.1"
+    "@mirrowel/opencode-agent-variants": "^0.8.0-dev.3"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
