@@ -1,0 +1,77 @@
+{
+  "name": "@mirrowel/opencode-config-studio",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "OpenCode plugin for inspecting and editing model variants and request defaults across config files",
+  "license": "MIT",
+  "author": "Mirrowel",
+  "homepage": "https://github.com/Mirrowel/opencode-config-studio#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mirrowel/opencode-config-studio.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Mirrowel/opencode-config-studio/issues"
+  },
+  "main": "./dist/tui.js",
+  "types": "./dist/tui.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "tsconfig.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "config",
+    "model",
+    "variants",
+    "editor"
+  ],
+  "oc-plugin": [
+    "tui"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc --outDir dist --declaration && npm run build:tui",
+    "build:tui": "bun scripts/build-tui.mjs",
+    "typecheck": "tsc --noEmit",
+    "ci:package": "npm run typecheck && npm run build && npm run test:unit && npm run test:tui-reactivity && npm run pack:dry-run && npm run test:tui-package",
+    "ci": "npm run ci:package",
+    "commit:check": "npm run ci",
+    "hooks:install": "node scripts/install-git-hooks.mjs",
+    "pack:dry-run": "node scripts/pack-dry-run.mjs",
+    "test:unit": "node scripts/unit-tests.mjs",
+    "test:tui-reactivity": "bun --conditions=browser scripts/tui-reactivity-smoke.mjs",
+    "test:tui-package": "node scripts/tui-package-smoke.mjs"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": ">=1.14.0",
+    "@opentui/solid": "^0.4.1",
+    "jsonc-parser": "^3.3.1",
+    "solid-js": "1.9.12"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.14.0"
+  }
+}

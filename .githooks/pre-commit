@@ -1,0 +1,3 @@
+#!/bin/sh
+# Runs the full package validation before every commit.
+npm run commit:check

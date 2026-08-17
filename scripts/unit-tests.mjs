@@ -1,0 +1,364 @@
+/**
+ * Unit tests for the core library, run against compiled dist/ output.
+ * Throws on failure; prints one line per passing test.
+ */
+
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs"
+import { tmpdir } from "node:os"
+import path from "node:path"
+import { fileURLToPath, pathToFileURL } from "node:url"
+
+const root = path.resolve(fileURLToPath(new URL("..", import.meta.url)))
+const dist = (name) => pathToFileURL(path.join(root, "dist", `${name}.js`)).href
+
+const { applySet, applyDelete, parseJsonc, editConfigFile, createConfigFile, getValueAtPath, detectFormatting, formatPath } = await import(dist("jsonc"))
+const { discoverConfigFiles, mergeWithProvenance, getIn, provenanceAt, findUneditableLayers } = await import(dist("discovery"))
+const { deriveVariantsFromMeta, reasoningEffortBody, reasoningBudgetBody, computeBaseDefaults, computeSmallModelOptions, analyzeModel, analyzeProviders, bodyOneLine } = await import(dist("catalog"))
+const { diffBodies, buildInlineConfig } = await import(dist("sink"))
+
+function assert(condition, message) {
+  if (!condition) throw new Error(`assert failed: ${message}`)
+}
+
+function section(name) {
+  console.log(`- ${name}`)
+}
+
+// ---------------------------------------------------------------------------
+// jsonc edit engine
+// ---------------------------------------------------------------------------
+
+{
+  section("jsonc: comment preservation on nested set")
+  const before = [
+    "{",
+    "  // my schema",
+    '  "$schema": "https://opencode.ai/config.json",',
+    "  /* provider tweaks */",
+    '  "untouched": { "stay": "inline", "compact": true },',
+    '  "provider": {',
+    '    "zai": {',
+    '      "models": {',
+    '        "glm-5.2": {',
+    '          "variants": {',
+    '            "high": { "reasoningEffort": "high" }',
+    "          }",
+    "        }",
+    "      }",
+    "    }",
+    "  }",
+    "}",
+  ].join("\n")
+  const after = applySet(before, ["provider", "zai", "models", "glm-5.2", "variants", "max"], { reasoningEffort: "max" })
+  assert(after.includes("// my schema"), "line comment lost")
+  assert(after.includes("/* provider tweaks */"), "block comment lost")
+  assert(after.includes('"untouched": { "stay": "inline", "compact": true },'), "untouched sibling block was reflowed")
+  assert(getValueAtPath(after, ["provider", "zai", "models", "glm-5.2", "variants", "high", "reasoningEffort"]) === "high", "existing variant value lost")
+  assert(getValueAtPath(after, ["provider", "zai", "models", "glm-5.2", "variants", "max", "reasoningEffort"]) === "max", "new value missing")
+  // The edit is confined to the touched container: everything before it is byte-identical.
+  const marker = '"provider": {'
+  assert(after.slice(0, after.indexOf(marker)) === before.slice(0, before.indexOf(marker)), "text before the edited block changed")
+}
+
+{
+  section("jsonc: real deletion removes the key")
+  const before = '{"a": 1, "provider": {"zai": {"models": {"glm-5.2": {"variants": {"high": {"reasoningEffort": "high"}}}}}}, "b": 2}'
+  const after = applyDelete(before, ["provider", "zai", "models", "glm-5.2", "variants", "high"])
+  assert(getValueAtPath(after, ["provider", "zai", "models", "glm-5.2", "variants", "high"]) === undefined, "key still present")
+  assert(getValueAtPath(after, ["a"]) === 1 && getValueAtPath(after, ["b"]) === 2, "siblings lost")
+  const report = parseJsonc(after)
+  assert(report.errors.length === 0, "deletion introduced parse errors")
+}
+
+{
+  section("jsonc: nested path creation from minimal file")
+  const before = '{\n  "$schema": "https://opencode.ai/config.json"\n}\n'
+  const after = applySet(before, ["provider", "zai", "models", "glm-5.3", "options"], { enable_thinking: true })
+  assert(getValueAtPath(after, ["provider", "zai", "models", "glm-5.3", "options", "enable_thinking"]) === true, "nested path not created")
+  assert(parseJsonc(after).errors.length === 0, "creation introduced parse errors")
+}
+
+{
+  section("jsonc: formatting detection")
+  assert(detectFormatting('{\r\n    "a": 1\r\n}').tabSize === 4, "4-space indent not detected")
+  assert(detectFormatting('{\n\t"a": 1\n}').insertSpaces === false, "tab indent not detected")
+  assert(detectFormatting("").tabSize === 2, "default tabSize")
+}
+
+{
+  section("jsonc: editConfigFile end to end with backup")
+  const dir = mkdtempSync(path.join(tmpdir(), "config-studio-test-"))
+  const stateDir = path.join(dir, "state")
+  const file = path.join(dir, "opencode.jsonc")
+  try {
+    writeFileSync(file, '{\n  // keep me\n  "model": "zai/glm-5.2"\n}\n', "utf8")
+    const result = editConfigFile(file, [{ op: "set", path: ["provider", "zai", "models", "glm-5.2", "variants", "fast"], value: { reasoningEffort: "low" } }], { stateDir, reason: "unit test" })
+    assert(result.ok, `edit failed: ${result.error}`)
+    const text = readFileSync(file, "utf8")
+    assert(text.includes("// keep me"), "comment lost on disk")
+    assert(text.includes('"fast"'), "new variant missing on disk")
+    assert(result.backupId, "no backup created")
+    assert(existsSync(path.join(stateDir, "backups")), "backup dir missing")
+
+    const second = editConfigFile(file, [{ op: "delete", path: ["provider", "zai", "models", "glm-5.2", "variants", "fast"] }], { stateDir, reason: "unit test 2" })
+    assert(second.ok, `delete failed: ${second.error}`)
+    assert(!readFileSync(file, "utf8").includes('"fast"'), "variant still on disk after delete")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+{
+  section("jsonc: parse-error files are refused")
+  const dir = mkdtempSync(path.join(tmpdir(), "config-studio-test-"))
+  const file = path.join(dir, "opencode.jsonc")
+  try {
+    writeFileSync(file, '{ "broken": ', "utf8")
+    const result = editConfigFile(file, [{ op: "set", path: ["model"], value: "zai/glm-5.2" }], { stateDir: path.join(dir, "state"), reason: "unit test" })
+    assert(!result.ok, "edit should have been refused")
+    assert(result.error?.includes("parse errors"), `unexpected error: ${result.error}`)
+    assert(readFileSync(file, "utf8") === '{ "broken": ', "file was modified despite refusal")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+{
+  section("jsonc: createConfigFile")
+  const dir = mkdtempSync(path.join(tmpdir(), "config-studio-test-"))
+  const file = path.join(dir, "opencode.jsonc")
+  try {
+    const created = createConfigFile(file)
+    assert(created.ok, `create failed: ${created.error}`)
+    assert(readFileSync(file, "utf8").includes('"$schema"'), "schema header missing")
+    const again = createConfigFile(file)
+    assert(!again.ok, "second create should fail")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// discovery + provenance merge
+// ---------------------------------------------------------------------------
+
+{
+  section("discovery: precedence merge with provenance")
+  const dir = mkdtempSync(path.join(tmpdir(), "config-studio-test-"))
+  const global = path.join(dir, "global")
+  const project = path.join(dir, "project")
+  const src = path.join(project, "src")
+  mkdirSync(global, { recursive: true })
+  mkdirSync(src, { recursive: true })
+  try {
+    writeFileSync(path.join(global, "opencode.jsonc"), JSON.stringify({
+      model: "zai/glm-5.2",
+      provider: { zai: { models: { "glm-5.2": { options: { store: false }, variants: { high: { reasoningEffort: "high" } } } } } },
+    }), "utf8")
+    writeFileSync(path.join(src, "opencode.json"), JSON.stringify({
+      provider: { zai: { models: { "glm-5.2": { variants: { high: { reasoningEffort: "max" } } } } } },
+    }), "utf8")
+
+    const files = discoverConfigFiles({ globalConfigDir: global, envConfigFile: undefined, directory: src, worktree: project })
+    const editable = files.filter((file) => file.exists)
+    assert(editable.length === 2, `expected 2 files, got ${editable.length}`)
+    const projectFile = editable.find((file) => file.kind === "project")
+    const globalFile = editable.find((file) => file.kind === "global")
+    assert(projectFile && globalFile, "file kinds missing")
+    assert(projectFile.precedence > globalFile.precedence, "project should outrank global")
+
+    const merge = mergeWithProvenance(files)
+    assert(getIn(merge.merged, ["model"]) === "zai/glm-5.2", "root model lost")
+    assert(getIn(merge.merged, ["provider", "zai", "models", "glm-5.2", "options", "store"]) === false, "options lost in merge")
+    const variantWinner = provenanceAt(merge, ["provider", "zai", "models", "glm-5.2", "variants", "high"])
+    assert(variantWinner.winner === projectFile.id, `variant winner wrong: ${variantWinner.winner}`)
+    assert(variantWinner.contributors.length === 2, `contributors wrong: ${variantWinner.contributors.join(",")}`)
+    const optionsWinner = provenanceAt(merge, ["provider", "zai", "models", "glm-5.2", "options"])
+    assert(optionsWinner.winner === globalFile.id, "options winner wrong")
+
+    const uneditable = findUneditableLayers(merge.merged, { model: "zai/glm-5.2", small_model: "openai/gpt-5.2" })
+    const smallModelFinding = uneditable.find((finding) => finding.pointer === "small_model")
+    assert(smallModelFinding, "small_model from env layer not detected")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// catalog derivation
+// ---------------------------------------------------------------------------
+
+{
+  section("catalog: effort derivation")
+  const derived = deriveVariantsFromMeta("@ai-sdk/openai-compatible", "glm-5.3", {
+    reasoning: true,
+    reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }],
+    limit: { context: 200000, output: 32768 },
+  })
+  assert(derived, "no derivation")
+  assert(JSON.stringify(derived.names) === JSON.stringify(["low", "high", "max"]), `names wrong: ${derived.names.join(",")}`)
+  assert(JSON.stringify(derived.bodies["high"]) === JSON.stringify({ reasoningEffort: "high" }), `body wrong: ${JSON.stringify(derived.bodies["high"])}`)
+}
+
+{
+  section("catalog: budget derivation clamps to output limit")
+  const derived = deriveVariantsFromMeta("@ai-sdk/anthropic", "claude-x", {
+    reasoning: true,
+    reasoning_options: [{ type: "budget_tokens", min: 1024, max: 999999 }],
+    limit: { context: 200000, output: 8192 },
+  })
+  assert(derived && derived.names.includes("max") && derived.names.includes("high"), "budget names missing")
+  const maxBody = derived.bodies["max"]
+  assert(maxBody && maxBody["thinking"] && maxBody["thinking"]["budgetTokens"] === 8191, `max budget not clamped: ${JSON.stringify(maxBody)}`)
+}
+
+{
+  section("catalog: toggle derivation for qwen-style models")
+  const derived = deriveVariantsFromMeta("@ai-sdk/openai-compatible", "qwen3", {
+    reasoning: true,
+    reasoning_options: [{ type: "toggle" }],
+  })
+  assert(derived && JSON.stringify(derived.names) === JSON.stringify(["none", "high"]), `toggle names wrong: ${JSON.stringify(derived?.names)}`)
+}
+
+{
+  section("catalog: reasoning effort bodies per SDK")
+  assert(JSON.stringify(reasoningEffortBody("@openrouter/ai-sdk-provider", "m", "high")) === JSON.stringify({ reasoning: { effort: "high" } }), "openrouter body wrong")
+  assert(JSON.stringify(reasoningEffortBody("@ai-sdk/openai", "gpt-5", "medium")) === JSON.stringify({ reasoningEffort: "medium", reasoningSummary: "auto", include: ["reasoning.encrypted_content"] }), "openai body wrong")
+  assert(reasoningBudgetBody("@ai-sdk/openai-compatible", 1000) === undefined, "budget body for openai-compatible should be undefined")
+}
+
+{
+  section("catalog: base defaults preview for zai")
+  const preview = computeBaseDefaults("@ai-sdk/openai-compatible", "zai-coding-plan", {
+    id: "glm-5.3",
+    api: { id: "glm-5.3", npm: "@ai-sdk/openai-compatible" },
+    capabilities: { reasoning: true },
+  })
+  const thinking = preview.options["thinking"]
+  assert(thinking && thinking["type"] === "enabled" && thinking["clear_thinking"] === false, `zai thinking default wrong: ${JSON.stringify(preview.options)}`)
+  assert(preview.approximate === true, "preview must be labeled approximate")
+}
+
+{
+  section("catalog: small model options use first variant")
+  assert(computeSmallModelOptions({ variants: { high: { reasoningEffort: "high" } } }) && JSON.stringify(computeSmallModelOptions({ variants: { high: { reasoningEffort: "high" } } })) === JSON.stringify({ reasoningEffort: "high" }), "small options wrong")
+  assert(computeSmallModelOptions({ variants: {} }) === undefined, "empty variants should give undefined")
+}
+
+// ---------------------------------------------------------------------------
+// model analysis provenance
+// ---------------------------------------------------------------------------
+
+{
+  section("catalog: analyzeModel attributes config vs catalog")
+  const files = [
+    {
+      id: "global:opencode.jsonc",
+      kind: "global",
+      label: "opencode.jsonc",
+      path: "/tmp/opencode.jsonc",
+      precedence: 0,
+      exists: true,
+      parseErrors: [],
+      data: { provider: { zai: { models: { "glm-5.2": { variants: { high: { reasoningEffort: "max" }, custom: { reasoningEffort: "low" }, off: { disabled: true } } } } } } },
+      text: "{}",
+    },
+  ]
+  const merge = mergeWithProvenance(files)
+  const runtime = {
+    id: "glm-5.2",
+    name: "GLM-5.2",
+    api: { id: "glm-5.2", npm: "@ai-sdk/openai-compatible" },
+    capabilities: { reasoning: true },
+    options: {},
+    variants: { high: { reasoningEffort: "max" }, custom: { reasoningEffort: "low" }, medium: { reasoningEffort: "medium" } },
+  }
+  const modelsDev = { zai: { npm: "@ai-sdk/openai-compatible", models: { "glm-5.2": { reasoning: true, reasoning_options: [{ type: "effort", values: ["high", "medium"] }] } } } }
+  const analysis = analyzeModel(runtime, "zai", "glm-5.2", merge, modelsDev)
+
+  const high = analysis.variants.find((variant) => variant.name === "high")
+  assert(high, "high variant missing")
+  assert(high.keyProvenance.find((key) => key.key === "reasoningEffort")?.source === "config", "high body key should be config-sourced")
+  assert(high.resolvedBody["reasoningEffort"] === "max", "resolved body should reflect config override")
+
+  const medium = analysis.variants.find((variant) => variant.name === "medium")
+  assert(medium, "medium variant missing")
+  assert(medium.files.length === 0, "medium should be catalog-only")
+  assert(medium.keyProvenance.find((key) => key.key === "reasoningEffort")?.source === "catalog", "medium key should be catalog-sourced")
+
+  const custom = analysis.variants.find((variant) => variant.name === "custom")
+  assert(custom && custom.source === "config", "custom variant should be config-sourced")
+
+  const off = analysis.variants.find((variant) => variant.name === "off")
+  assert(off && off.disabled, "off variant should be disabled")
+  assert(analysis.variants[analysis.variants.length - 1] === off || off.disabled, "disabled variant present in list")
+}
+
+{
+  section("catalog: analyzeProviders sorts edited first")
+  const files = [
+    { id: "g", kind: "global", label: "opencode.jsonc", path: "/g", precedence: 0, exists: true, parseErrors: [], data: { provider: { zai: { models: { "glm-5.2": {} } } } }, text: "" },
+  ]
+  const merge = mergeWithProvenance(files)
+  const providers = [
+    { id: "aaa", name: "AAA", models: { m1: {} } },
+    { id: "zai", name: "Z.ai", models: {} },
+    { id: "bbb", name: "BBB", models: {} },
+  ]
+  const analyses = analyzeProviders(providers, { zai: "glm-5.2" }, merge)
+  assert(analyses[0].providerID === "zai", `edited provider not first: ${analyses[0].providerID}`)
+  assert(analyses[0].edited, "zai should be marked edited")
+}
+
+{
+  section("catalog: bodyOneLine truncates")
+  const line = bodyOneLine({ reasoningEffort: "high" }, 10)
+  assert(line.length <= 10 && line.endsWith("..."), `truncation wrong: "${line}"`)
+}
+
+// ---------------------------------------------------------------------------
+// sink helpers
+// ---------------------------------------------------------------------------
+
+{
+  section("sink: buildInlineConfig redirects baseURL")
+  const config = buildInlineConfig({
+    providerID: "zai",
+    modelID: "glm-5.3",
+    runtimeModel: { id: "glm-5.3", name: "GLM-5.3", capabilities: { reasoning: true }, limit: { context: 128000, output: 8192 }, variants: { high: { reasoningEffort: "high" } } },
+    providerNpm: "@ai-sdk/openai-compatible",
+    variant: "high",
+  }, "http://127.0.0.1:45678")
+  assert(config["provider"]["zai"]["options"]["baseURL"] === "http://127.0.0.1:45678", "baseURL wrong")
+  assert(config["provider"]["zai"]["npm"] === "@ai-sdk/openai-compatible", "npm wrong")
+  const model = config["provider"]["zai"]["models"]["glm-5.3"]
+  assert(model["reasoning"] === true && model["tool_call"] === true, "capabilities not cloned")
+  assert(model["limit"]["context"] === 128000, "limit not cloned")
+  assert(model["variants"]["high"]["reasoningEffort"] === "high", "variants not cloned")
+  assert(config["agent"]["config-studio-sim"]["model"] === "zai/glm-5.3", "sim agent wrong")
+}
+
+{
+  section("sink: diffBodies finds added/removed/changed")
+  const diff = diffBodies(
+    { model: "m", reasoningEffort: "low", extra: 1 },
+    { model: "m", reasoningEffort: "high" },
+  )
+  const changed = diff.find((entry) => entry.pointer === "reasoningEffort")
+  const removed = diff.find((entry) => entry.pointer === "extra")
+  assert(changed && changed.kind === "changed", "changed entry missing")
+  assert(removed && removed.kind === "removed", "removed entry missing")
+  assert(diff.length === 2, `unexpected diff size: ${diff.length}`)
+}
+
+// ---------------------------------------------------------------------------
+// utils
+// ---------------------------------------------------------------------------
+
+{
+  section("utils: formatPath")
+  assert(formatPath(["provider", "zai", "models", "glm-5.2", "variants"]) === "provider.zai.models.glm-5.2.variants", `formatPath wrong: ${formatPath(["provider", "zai", "models", "glm-5.2", "variants"])}`)
+}
+
+console.log("all unit tests passed")
