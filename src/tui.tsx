@@ -629,21 +629,12 @@ function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; 
   return (
     <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
       <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
-        <text fg={theme().accent}><b>{props.title}</b></text>
+        <text fg={isRestartRequired(props.title) ? theme().error : theme().accent}><b>{props.title}</b></text>
         <text fg={theme().textMuted} onMouseUp={props.onDone}>esc</text>
       </box>
       <scrollbox maxHeight={bodyHeight()} ref={(element: ScrollBoxRenderable) => (scroll = element)}>
       <box flexDirection="column" gap={0}>
-        <For each={lines()}>
-          {(line) => {
-            const heading = line.length > 0 && !line.startsWith(" ") && (line.endsWith(":") || /^[A-Z][A-Za-z0-9 ._-]+$/.test(line))
-            const warning = /error|failed|refus|invalid|delete|danger/i.test(line)
-            const positive = /config|edited|saved|applied|catalog|success/i.test(line)
-            return line.length === 0
-              ? <text> </text>
-              : <text fg={warning ? theme().error : positive && !heading ? theme().success : heading ? theme().accent : theme().textMuted} wrapMode="word">{heading ? <b>{line}</b> : line}</text>
-          }}
-        </For>
+        {renderContentLines(lines(), theme)}
       </box>
       </scrollbox>
       <box flexDirection="row" justifyContent="space-between" width="100%">
@@ -700,17 +691,41 @@ function showPagedInfo(api: TuiPluginApi, props: { title: string; sections: Page
 
 type ThemePalette = { accent: RGBA; error: RGBA; success: RGBA; textMuted: RGBA }
 
+/** Restart phrases that make a line or dialog title scream for attention. */
+const RESTART_REQUIRED_RE = /restart[^\n]{0,40}required|required[^\n]{0,40}restart|requires? restart|restart opencode to|you restart/i
+/** Any other restart mention - still red, but not bold. */
+const RESTART_MENTION_RE = /restart/i
+
+function isRestartRequired(text: string): boolean {
+  return RESTART_REQUIRED_RE.test(text)
+}
+
+function contentLineAttrs(line: string): { fg: "warning" | "positive" | "heading" | "muted"; bold: boolean } {
+  if (isRestartRequired(line)) return { fg: "warning", bold: true }
+  if (RESTART_MENTION_RE.test(line)) return { fg: "warning", bold: false }
+  const heading = line.length > 0 && !line.startsWith(" ") && (line.endsWith(":") || /^[A-Z][A-Za-z0-9 ._-]+$/.test(line))
+  const warning = /error|failed|refus|invalid|delete|danger/i.test(line)
+  const positive = /config|edited|saved|applied|catalog|success/i.test(line)
+  if (warning) return { fg: "warning", bold: false }
+  if (positive && !heading) return { fg: "positive", bold: false }
+  if (heading) return { fg: "heading", bold: true }
+  return { fg: "muted", bold: false }
+}
+
+function lineTheme(attrs: { fg: string; bold: boolean }, theme: () => ThemePalette) {
+  const fg = attrs.fg === "warning" ? theme().error : attrs.fg === "positive" ? theme().success : attrs.fg === "heading" ? theme().accent : theme().textMuted
+  return { fg, bold: attrs.bold }
+}
+
 function renderContentLines(lines: string[], theme: () => ThemePalette) {
   return (
     <box flexDirection="column" gap={0}>
       <For each={lines}>
         {(line) => {
-          const heading = line.length > 0 && !line.startsWith(" ") && (line.endsWith(":") || /^[A-Z][A-Za-z0-9 ._-]+$/.test(line))
-          const warning = /error|failed|refus|invalid|delete|danger|restart required/i.test(line)
-          const positive = /config|edited|saved|applied|catalog|success/i.test(line)
+          const style = lineTheme(contentLineAttrs(line), theme)
           return line.length === 0
             ? <text> </text>
-            : <text fg={warning ? theme().error : positive && !heading ? theme().success : heading ? theme().accent : theme().textMuted} wrapMode="word">{heading ? <b>{line}</b> : line}</text>
+            : <text fg={style.fg} wrapMode="word">{style.bold ? <b>{line}</b> : line}</text>
         }}
       </For>
     </box>
@@ -805,7 +820,7 @@ function PagedDialog(props: { api: TuiPluginApi; title: string; sections: PagedS
   return (
     <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
       <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
-        <text fg={theme().accent}><b>{props.title}</b></text>
+        <text fg={isRestartRequired(props.title) ? theme().error : theme().accent}><b>{props.title}</b></text>
         <text fg={theme().textMuted} onMouseUp={props.onDone}>esc</text>
       </box>
       {props.sections.length > 1 ? (
