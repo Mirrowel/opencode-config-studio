@@ -31,12 +31,13 @@ try {
   if (!packed?.filename) throw new Error("npm pack returned an unsupported JSON result")
   const tarball = path.join(temp, packed.filename)
 
-  // The agent-variants dependency may be a local file: link (development) or
-  // a registry range (not yet published). Either way the smoke stays
-  // hermetic: pack the sibling repo and pin it through overrides.
+  // Development checkout: the agent-variants dependency may point at the
+  // sibling repo (dev:link). Keep the smoke hermetic by packing the sibling
+  // and pinning it via overrides. On CI the dependency resolves from the
+  // npm registry directly (existsSync guard: no sibling there).
   const agentVariantsDep = pkg.dependencies?.["@mirrowel/opencode-agent-variants"]
   const manifest = { private: true, type: "module", dependencies: { [pkg.name]: `file:${tarball}` } }
-  if (agentVariantsDep) {
+  if (agentVariantsDep?.startsWith("file:")) {
     const avRoot = path.resolve(root, "..", "agent-variants")
     const avPacks = JSON.parse(run("npm", ["pack", "--json", "--pack-destination", temp], { cwd: avRoot }))
     const avPacked = Array.isArray(avPacks) ? avPacks[0] : Object.values(avPacks)[0]
