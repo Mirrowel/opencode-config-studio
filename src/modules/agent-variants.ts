@@ -444,7 +444,7 @@ const agentVariantsModule: StudioModule = {
     }
     return [
       {
-        title: "Agent Variants",
+        title: "AV summary",
         lines: [
           `sidecar: ${defaultSidecarPath()}`,
           `agents configured: ${Object.keys(config.agents).length}`,
@@ -452,11 +452,20 @@ const agentVariantsModule: StudioModule = {
           `debug mode: ${config.debug ? "enabled" : "disabled"}`,
           `prompt route markers: ${config.routing.prompt_markers ? "enabled" : "disabled"}`,
           `summary: ${errors} error(s), ${warnings} warning(s), ${infos} info`,
-          ...(migrateHints.length > 0 ? ["", "Migrate to config:", ...migrateHints.map((hint) => `  ${hint}`)] : []),
-          "",
-          ...(diagnostics.length === 0 ? ["No diagnostics."] : diagnostics.map((item) => `${item.level.toUpperCase()}: ${item.message}`)),
         ],
       },
+      {
+        title: "AV diagnostics",
+        lines: diagnostics.length === 0 ? ["No diagnostics."] : diagnostics.map((item) => `${item.level.toUpperCase()}: ${item.message}`),
+      },
+      ...(migrateHints.length > 0
+        ? [
+            {
+              title: "AV migrate hints",
+              lines: migrateHints,
+            },
+          ]
+        : []),
     ]
   },
   infoSections: () => [{ title: "Agent Variants", lines: wizardInfoText().split("\n") }],

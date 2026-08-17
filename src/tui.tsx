@@ -3,7 +3,7 @@
 import { existsSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import type { TuiPlugin, TuiPluginApi, TuiDialogSelectOption } from "@opencode-ai/plugin/tui"
-import type { RGBA, ScrollBoxRenderable } from "@opentui/core"
+import type { BoxRenderable, RGBA, ScrollBoxRenderable } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js"
 import { createConfigFile, deleteBackup, editConfigFile, formatPath, getAtPath, applyOpsToData, isPlainObject, loadBackupJournal, parseJsonc, readBackupContent, writeTextAtomic, type EditOp, type JSONPath } from "./jsonc.js"
@@ -789,53 +789,74 @@ function PagedDialog(props: { api: TuiPluginApi; title: string; sections: PagedS
   useHidePromptCursor(props.api)
   const dimensions = useTerminalDimensions()
   const popMode = props.api.mode.push("config-studio.dialog")
-  const width = dialogContentWidth(props.api)
-  const rowsPerPage = createMemo(() => Math.max(6, wizardMaxRows(props.api, dimensions().height, 14, 6)))
 
-  type Page = { sectionIndex: number; lines: string[] }
-  const pages = createMemo<Page[]>(() => {
-    const result: Page[] = []
-    const perPage = rowsPerPage()
-    props.sections.forEach((section, sectionIndex) => {
-      let current: string[] = []
-      let used = 0
-      const flush = () => {
-        if (current.length > 0) result.push({ sectionIndex, lines: current })
-        current = []
-        used = 0
-      }
-      for (const line of section.lines) {
-        const rows = Math.max(1, Math.ceil(line.length / Math.max(1, width)))
-        if (used + rows > perPage && current.length > 0) flush()
-        current.push(line)
-        used += rows
-      }
-      flush()
-    })
-    return result.length > 0 ? result : [{ sectionIndex: 0, lines: ["(empty)"] }]
-  })
+  const height = createMemo(() => Math.max(6, wizardMaxRows(props.api, dimensions().height, 14, 6)))
+  const sections = createMemo(() => (props.sections.length > 0 ? props.sections : [{ title: "", lines: ["(empty)"] }]))
+  const jumpKeys = createMemo(() => sections().slice(0, 9).map((section, index) => ({ section, key: String(index + 1) })))
 
-  const [pageIndex, setPageIndex] = createSignal(0)
-  const page = createMemo(() => pages()[Math.min(pageIndex(), pages().length - 1)]!)
-  const sectionTitle = createMemo(() => props.sections[page().sectionIndex]?.title ?? "")
-  const jumpKeys = createMemo(() => props.sections.slice(0, 9).map((section, index) => ({ section, key: String(index + 1) })))
+  let scroll: ScrollBoxRenderable | undefined
+  const sectionRefs: (BoxRenderable | undefined)[] = []
 
+  /** Exact content offset of a section header (measured, not estimated). */
+  function sectionOffset(index: number): number | undefined {
+    const box = sectionRefs[index]
+    if (!scroll || !box || box.isDestroyed) return undefined
+    try {
+      return box.screenY - scroll.content.screenY
+    } catch {
+      return undefined
+    }
+  }
+
+  const [current, setCurrent] = createSignal(0)
+
+  function scrollToSection(index: number) {
+    if (!scroll || scroll.isDestroyed) return
+    const clamped = Math.max(0, Math.min(index, sections().length - 1))
+    setCurrent(clamped)
+    // Defer to the next frame so a freshly-changed signal has rendered.
+    setTimeout(() => {
+      if (!scroll || scroll.isDestroyed) return
+      const offset = sectionOffset(clamped)
+      if (offset !== undefined) scroll.scrollTop = offset
+    }, 0)
+  }
+
+  // Track wheel/scrollbar scrolling: nearest section whose header is at or
+  // above the scroll position wins. Polling keeps it decoupled from render.
+  const trackTimer = setInterval(() => {
+    if (!scroll || scroll.isDestroyed || scroll.scrollHeight <= scroll.height) return
+    const top = scroll.scrollTop
+    let best = 0
+    for (let index = 0; index < sections().length; index++) {
+      const offset = sectionOffset(index)
+      if (offset !== undefined && offset <= top + 1) best = index
+    }
+    if (best !== current()) setCurrent(best)
+  }, 250)
+  ;(trackTimer as { unref?: () => void }).unref?.()
+  onCleanup(() => clearInterval(trackTimer))
+
+  const page = () => Math.max(1, (scroll?.height ?? height()) - 1)
   const commandPrefix = `config-studio.paged.${Math.random().toString(36).slice(2)}`
   const unregister = props.api.keymap.registerLayer({
     priority: 10000,
     commands: [
       { name: `${commandPrefix}.close`, title: "Close", run: (ctx: KeyContext) => { blockKey(ctx); props.onDone() } },
-      { name: `${commandPrefix}.next`, title: "Next page", run: (ctx: KeyContext) => { blockKey(ctx); setPageIndex(Math.min(pageIndex() + 1, pages().length - 1)) } },
-      { name: `${commandPrefix}.prev`, title: "Previous page", run: (ctx: KeyContext) => { blockKey(ctx); setPageIndex(Math.max(pageIndex() - 1, 0)) } },
-      { name: `${commandPrefix}.first`, title: "First page", run: (ctx: KeyContext) => { blockKey(ctx); setPageIndex(0) } },
-      { name: `${commandPrefix}.last`, title: "Last page", run: (ctx: KeyContext) => { blockKey(ctx); setPageIndex(pages().length - 1) } },
+      { name: `${commandPrefix}.next`, title: "Next section", run: (ctx: KeyContext) => { blockKey(ctx); scrollToSection(current() + 1) } },
+      { name: `${commandPrefix}.prev`, title: "Previous section", run: (ctx: KeyContext) => { blockKey(ctx); scrollToSection(current() - 1) } },
+      { name: `${commandPrefix}.up`, title: "Scroll up", run: (ctx: KeyContext) => { blockKey(ctx); scroll?.scrollBy(-1) } },
+      { name: `${commandPrefix}.down`, title: "Scroll down", run: (ctx: KeyContext) => { blockKey(ctx); scroll?.scrollBy(1) } },
+      { name: `${commandPrefix}.pageUp`, title: "Page up", run: (ctx: KeyContext) => { blockKey(ctx); scroll?.scrollBy(-page()) } },
+      { name: `${commandPrefix}.pageDown`, title: "Page down", run: (ctx: KeyContext) => { blockKey(ctx); scroll?.scrollBy(page()) } },
+      { name: `${commandPrefix}.home`, title: "Scroll top", run: (ctx: KeyContext) => { blockKey(ctx); if (scroll) scroll.scrollTop = 0 } },
+      { name: `${commandPrefix}.end`, title: "Scroll bottom", run: (ctx: KeyContext) => { blockKey(ctx); if (scroll) scroll.scrollTop = scroll.scrollHeight } },
       ...jumpKeys().map(({ key }) => ({
         name: `${commandPrefix}.jump${key}`,
         title: "Jump to section",
         run: (ctx: KeyContext) => {
           blockKey(ctx)
-          const target = pages().find((item) => item.sectionIndex === Number(key) - 1)
-          if (target) setPageIndex(pages().indexOf(target))
+          scrollToSection(Number(key) - 1)
         },
       })),
       { name: `${commandPrefix}.shield`, title: "Block background input", run: blockKey },
@@ -843,14 +864,18 @@ function PagedDialog(props: { api: TuiPluginApi; title: string; sections: PagedS
     bindings: [
       { key: "enter", cmd: `${commandPrefix}.close`, desc: "Close" },
       { key: "escape", cmd: `${commandPrefix}.close`, desc: "Close" },
-      { key: "n", cmd: `${commandPrefix}.next`, desc: "Next page" },
-      { key: "right", cmd: `${commandPrefix}.next`, desc: "Next page" },
-      { key: "pagedown", cmd: `${commandPrefix}.next`, desc: "Next page" },
-      { key: "p", cmd: `${commandPrefix}.prev`, desc: "Previous page" },
-      { key: "left", cmd: `${commandPrefix}.prev`, desc: "Previous page" },
-      { key: "pageup", cmd: `${commandPrefix}.prev`, desc: "Previous page" },
-      { key: "home", cmd: `${commandPrefix}.first`, desc: "First page" },
-      { key: "end", cmd: `${commandPrefix}.last`, desc: "Last page" },
+      { key: "n", cmd: `${commandPrefix}.next`, desc: "Next section" },
+      { key: "p", cmd: `${commandPrefix}.prev`, desc: "Previous section" },
+      { key: "up", cmd: `${commandPrefix}.up`, desc: "Scroll up" },
+      { key: "ctrl+p", cmd: `${commandPrefix}.up`, desc: "Scroll up" },
+      { key: "down", cmd: `${commandPrefix}.down`, desc: "Scroll down" },
+      { key: "ctrl+n", cmd: `${commandPrefix}.down`, desc: "Scroll down" },
+      { key: "pageup", cmd: `${commandPrefix}.pageUp`, desc: "Page up" },
+      { key: "ctrl+b", cmd: `${commandPrefix}.pageUp`, desc: "Page up" },
+      { key: "pagedown", cmd: `${commandPrefix}.pageDown`, desc: "Page down" },
+      { key: "ctrl+f", cmd: `${commandPrefix}.pageDown`, desc: "Page down" },
+      { key: "home", cmd: `${commandPrefix}.home`, desc: "Scroll top" },
+      { key: "end", cmd: `${commandPrefix}.end`, desc: "Scroll bottom" },
       ...jumpKeys().map(({ key }) => ({ key, cmd: `${commandPrefix}.jump${key}`, desc: "Jump to section" })),
       ...shieldBindings(`${commandPrefix}.shield`, ["home", "end"]),
     ],
@@ -861,11 +886,9 @@ function PagedDialog(props: { api: TuiPluginApi; title: string; sections: PagedS
   })
 
   const footerHint = createMemo(() => {
-    const sections = jumpKeys().map(({ key, section }) => `${key}=${truncate(section.title, 12)}`).join("  ")
-    return [
-      `p < ${pageIndex() + 1}/${pages().length} > n`,
-      props.sections.length > 1 ? sections : "",
-    ].filter(Boolean).join("   ")
+    if (sections().length <= 1) return "up/down scroll"
+    const keys = jumpKeys().map(({ key, section }) => `${key}=${truncate(section.title, 12)}`).join("  ")
+    return [`p < ${current() + 1}/${sections().length} > n`, keys].filter(Boolean).join("   ")
   })
 
   return (
@@ -874,15 +897,25 @@ function PagedDialog(props: { api: TuiPluginApi; title: string; sections: PagedS
         <text fg={isRestartRequired(props.title) ? theme().error : theme().accent}><b>{props.title}</b></text>
         <text fg={theme().textMuted} onMouseUp={props.onDone}>esc</text>
       </box>
-      {props.sections.length > 1 ? (
-        <box marginBottom={1}>
-          <text fg={theme().textMuted}>section: </text>
-          <text fg={theme().accent}><b>{sectionTitle()}</b></text>
+      <scrollbox maxHeight={height()} ref={(element: ScrollBoxRenderable) => (scroll = element)}>
+        <box flexDirection="column" gap={0}>
+          <For each={sections()}>
+            {(section, index) => (
+              <box
+                flexDirection="column"
+                gap={0}
+                paddingTop={index() > 0 ? 1 : 0}
+                ref={(element: BoxRenderable) => (sectionRefs[index()] = element)}
+              >
+                <Show when={section.title.length > 0}>
+                  <text fg={theme().accent}><b>{`── ${section.title} ${"─".repeat(Math.max(0, Math.min(40, 40 - section.title.length)))}`}</b></text>
+                </Show>
+                {renderContentLines(section.lines, theme)}
+              </box>
+            )}
+          </For>
         </box>
-      ) : undefined}
-      <box flexDirection="column" height={rowsPerPage()}>
-        {renderContentLines(page().lines, theme)}
-      </box>
+      </scrollbox>
       <box flexDirection="row" justifyContent="space-between" width="100%" marginTop={1}>
         <text fg={theme().textMuted}>{footerHint()}</text>
         <box paddingLeft={3} paddingRight={3} backgroundColor={theme().primary} onMouseUp={props.onDone}>
