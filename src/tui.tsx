@@ -35,6 +35,7 @@ import {
 import { runCapture, diffBodies, type CaptureRunResult } from "./sink.js"
 import { ensureTuiRegistration, ourRootDir } from "./selfwire.js"
 import { FIELD_DOCS } from "./docs.js"
+import { rankOptions } from "./search.js"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -246,6 +247,11 @@ function menuTitleWidth(size: DialogSize, options: readonly { title: string }[])
 
 type UI = TuiPluginApi["ui"]
 
+/** Option counts at or above this use debounced external search. */
+const DEBOUNCE_THRESHOLD = 100
+/** How long the filter input must settle before the query runs once. */
+const DEBOUNCE_MS = 1200
+
 function showSelect<Value>(
   ui: UI,
   props: {
@@ -256,20 +262,59 @@ function showSelect<Value>(
     flat?: boolean
   },
 ): Promise<Value | undefined> {
+  const debounced = props.options.length >= DEBOUNCE_THRESHOLD
   return new Promise((resolve) => {
     let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let lastQuery = ""
+    // Signal-backed option list: with skipFilter DialogSelect never runs its
+    // per-keystroke fuzzysort; it only re-renders when this signal changes,
+    // which happens once per settled query.
+    const [shown, setShown] = createSignal<TuiDialogSelectOption<Value>[]>(props.options)
     const done = (value: Value | undefined) => {
       if (settled) return
       settled = true
+      if (timer) clearTimeout(timer)
       resolve(value)
+    }
+    const applyQuery = (query: string) => {
+      setShown(rankOptions(props.options, query))
     }
     ui.dialog.replace(() =>
       ui.DialogSelect<Value>({
-        title: props.title,
-        placeholder: props.placeholder ?? "Type to filter...",
-        options: props.options,
-        current: props.current,
-        flat: props.flat ?? props.options.length < 15,
+        get title() {
+          return props.title
+        },
+        get placeholder() {
+          return props.placeholder ?? (debounced ? "Type query, pause to search (models + providers)..." : "Type to filter...")
+        },
+        get options() {
+          return shown()
+        },
+        get current() {
+          return props.current
+        },
+        get flat() {
+          return props.flat ?? props.options.length < 15
+        },
+        ...(debounced
+          ? {
+              skipFilter: true as const,
+              onFilter: (query: string) => {
+                if (query === lastQuery) return
+                lastQuery = query
+                if (timer) clearTimeout(timer)
+                if (query.trim() === "") {
+                  applyQuery(query)
+                  return
+                }
+                timer = setTimeout(() => {
+                  timer = undefined
+                  applyQuery(query)
+                }, DEBOUNCE_MS)
+              },
+            }
+          : {}),
         onSelect: (opt) => {
           done(opt.value)
           ui.dialog.clear()

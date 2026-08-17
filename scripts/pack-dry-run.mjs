@@ -30,6 +30,7 @@ const required = [
   "dist/sink.js",
   "dist/selfwire.js",
   "dist/server.js",
+  "dist/search.js",
   "src/tui.tsx",
   "src/jsonc.ts",
   "src/discovery.ts",
@@ -38,6 +39,7 @@ const required = [
   "src/sink.ts",
   "src/selfwire.ts",
   "src/server.ts",
+  "src/search.ts",
   "tsconfig.json",
 ]
 

@@ -16,6 +16,7 @@ const { discoverConfigFiles, mergeWithProvenance, getIn, provenanceAt, findUnedi
 const { deriveVariantsFromMeta, reasoningEffortBody, reasoningBudgetBody, computeBaseDefaults, computeSmallModelOptions, analyzeModel, analyzeProviders, bodyOneLine } = await import(dist("catalog"))
 const { diffBodies, buildInlineConfig } = await import(dist("sink"))
 const { isOwnSpec, ensureTuiRegistration, ourRootDir, PLUGIN_NPM_NAME } = await import(dist("selfwire"))
+const { fuzzyScore, rankOptions } = await import(dist("search"))
 
 function assert(condition, message) {
   if (!condition) throw new Error(`assert failed: ${message}`)
@@ -436,6 +437,61 @@ function section(name) {
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+}
+
+// ---------------------------------------------------------------------------
+// search (debounced picker scoring)
+// ---------------------------------------------------------------------------
+
+{
+  section("search: ranking basics")
+  const options = [
+    { title: "glm-5.2", value: "a", category: "z.ai" },
+    { title: "gpt-5.1", value: "b", category: "OpenAI" },
+    { title: "glm-4.7", value: "c", category: "z.ai" },
+    { title: "kimi-k2", value: "d", category: "Moonshot" },
+  ]
+  const ranked = rankOptions(options, "glm")
+  if (ranked.length !== 2) throw new Error(`expected 2 glm hits, got ${ranked.length}`)
+  if (ranked[0].value !== "a" && ranked[0].value !== "c") throw new Error(`unexpected top hit ${ranked[0].value}`)
+  if (rankOptions(options, "zzz").length !== 0) throw new Error("no-match query should exclude everything")
+  if (rankOptions(options, "  ").length !== 4) throw new Error("blank query should return all options")
+}
+
+{
+  section("search: provider-only query matches via category")
+  const options = [
+    { title: "glm-5.2", value: "a", category: "z.ai" },
+    { title: "kimi-k2", value: "d", category: "Moonshot" },
+  ]
+  const ranked = rankOptions(options, "zai")
+  if (ranked.length !== 1 || ranked[0].value !== "a") throw new Error("category match failed")
+  // A model matching on title should outrank one matching only on category.
+  const mixed = [
+    { title: "gpt-5.2", value: "cat-only", category: "OpenAI" },
+    { title: "openai-mini", value: "title-hit", category: "Other Corp" },
+  ]
+  const ranked2 = rankOptions(mixed, "openai")
+  if (ranked2[0].value !== "title-hit") throw new Error(`title match should outrank category match, got ${ranked2[0].value}`)
+}
+
+{
+  section("search: substring beats scattered subsequence")
+  const options = [
+    { title: "g-l-m-scattered", value: "scattered", category: "" },
+    { title: "xglm", value: "substring", category: "" },
+  ]
+  const ranked = rankOptions(options, "glm")
+  if (ranked[0].value !== "substring") throw new Error(`substring should win, got ${ranked[0].value}`)
+  if (fuzzyScore("glm", "g-l-m") === Number.NEGATIVE_INFINITY) throw new Error("subsequence should still match")
+  if (fuzzyScore("glm", "glx") !== Number.NEGATIVE_INFINITY) throw new Error("missing char must not match")
+}
+
+{
+  section("search: case-insensitive on both keys")
+  const options = [{ title: "GLM-5.2", value: "a", category: "Z.AI" }]
+  if (rankOptions(options, "glm")[0]?.value !== "a") throw new Error("lowercase query vs uppercase title failed")
+  if (rankOptions(options, "z.ai")[0]?.value !== "a") throw new Error("category case-insensitive failed")
 }
 
 console.log("all unit tests passed")
