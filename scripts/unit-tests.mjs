@@ -19,6 +19,7 @@ const { isOwnSpec, ensureTuiRegistration, ourRootDir, PLUGIN_NPM_NAME } = await 
 const { fuzzyScore, rankOptions } = await import(dist("search"))
 const { loadSettings, saveSettings, settingsPath, moduleEnabled, setModuleEnabled, setModuleOption, moduleOption, DEFAULT_HIDDEN_SECTIONS } = await import(dist("settings"))
 const { applyOpsToData, getAtPath } = await import(dist("jsonc"))
+const { isStandaloneAgentVariantsSpec, findStandaloneAgentVariants, removeStandaloneHits } = await import(dist("standalone"))
 
 function assert(condition, message) {
   if (!condition) throw new Error(`assert failed: ${message}`)
@@ -553,6 +554,91 @@ function section(name) {
 
   const removed = applyOpsToData({ plugin: ["a", "b"] }, [{ op: "delete", path: ["plugin", 0] }])
   assert(JSON.stringify(removed.plugin) === JSON.stringify(["b"]), "array index delete should splice")
+}
+
+// ---------------------------------------------------------------------------
+// standalone agent-variants detection + removal
+// ---------------------------------------------------------------------------
+
+{
+  section("standalone: spec matching")
+  assert(isStandaloneAgentVariantsSpec("@mirrowel/opencode-agent-variants"), "npm name should be standalone")
+  assert(isStandaloneAgentVariantsSpec("@mirrowel/opencode-agent-variants@latest"), "npm name with tag should be standalone")
+  assert(isStandaloneAgentVariantsSpec("file:///C:/Projects/OC%20Plugins/agent-variants"), "file path to av repo should be standalone")
+  assert(isStandaloneAgentVariantsSpec("file:///C:/x/node_modules/@mirrowel/opencode-agent-variants"), "file path to av install should be standalone")
+  assert(!isStandaloneAgentVariantsSpec("file:///C:/Projects/OC%20Plugins/opencode-config-studio"), "studio spec should not be standalone")
+  assert(!isStandaloneAgentVariantsSpec("@mirrowel/opencode-config-studio"), "studio npm name should not be standalone")
+  assert(!isStandaloneAgentVariantsSpec(undefined), "non-string should not be standalone")
+}
+
+{
+  section("standalone: find + remove across opencode.json and tui.json")
+  const dir = mkdtempSync(path.join(tmpdir(), "config-studio-test-"))
+  const globalDir = path.join(dir, "global")
+  mkdirSync(globalDir, { recursive: true })
+  try {
+    const avSpec = "file:///C:/Projects/OC%20Plugins/agent-variants"
+    writeFileSync(path.join(globalDir, "opencode.json"), JSON.stringify({ plugin: ["@cortexkit/other", avSpec, "file:///C:/Projects/OC%20Plugins/opencode-config-studio"] }), "utf8")
+    writeFileSync(path.join(globalDir, "tui.json"), JSON.stringify({ plugin: [avSpec] }), "utf8")
+
+    const hits = findStandaloneAgentVariants({ globalConfigDir: globalDir })
+    assert(hits.length === 2, `expected 2 hits (opencode.json + tui.json), got ${hits.length}`)
+
+    const results = removeStandaloneHits(hits, path.join(dir, "state"))
+    assert(results.every((result) => !result.error), `removal should succeed: ${JSON.stringify(results)}`)
+    const after = JSON.parse(readFileSync(path.join(globalDir, "opencode.json"), "utf8"))
+    assert(JSON.stringify(after.plugin) === JSON.stringify(["@cortexkit/other", "file:///C:/Projects/OC%20Plugins/opencode-config-studio"]), `opencode.json plugin array wrong: ${JSON.stringify(after.plugin)}`)
+    const tuiAfter = JSON.parse(readFileSync(path.join(globalDir, "tui.json"), "utf8"))
+    assert(Array.isArray(tuiAfter.plugin) && tuiAfter.plugin.length === 0, `tui.json plugin array should be empty: ${JSON.stringify(tuiAfter.plugin)}`)
+
+    const recheck = findStandaloneAgentVariants({ globalConfigDir: globalDir })
+    assert(recheck.length === 0, "no standalone hits should remain")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+{
+  section("standalone: multiple standalone entries in one file")
+  const dir = mkdtempSync(path.join(tmpdir(), "config-studio-test-"))
+  const globalDir = path.join(dir, "global")
+  mkdirSync(globalDir, { recursive: true })
+  try {
+    writeFileSync(path.join(globalDir, "opencode.json"), JSON.stringify({ plugin: ["@mirrowel/opencode-agent-variants", "middle", "@mirrowel/opencode-agent-variants@1.0.0"] }), "utf8")
+    const hits = findStandaloneAgentVariants({ globalConfigDir: globalDir })
+    assert(hits.length === 2, `expected 2 hits, got ${hits.length}`)
+    const results = removeStandaloneHits(hits, path.join(dir, "state"))
+    assert(results.every((result) => !result.error), "removal should succeed")
+    const after = JSON.parse(readFileSync(path.join(globalDir, "opencode.json"), "utf8"))
+    assert(JSON.stringify(after.plugin) === JSON.stringify(["middle"]), `plugin array wrong: ${JSON.stringify(after.plugin)}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+{
+  section("jsonc: array element deletion across formats (library bug workaround)")
+  const cases = [
+    { name: "compact middle", text: JSON.stringify({ plugin: ["a", "middle", "b"] }), path: ["plugin", 1], expect: ["a", "b"] },
+    { name: "compact last", text: JSON.stringify({ plugin: ["a", "middle", "b"] }), path: ["plugin", 2], expect: ["a", "middle"] },
+    { name: "compact only child", text: JSON.stringify({ plugin: ["x"] }), path: ["plugin", 0], expect: [] },
+    { name: "pretty last", text: JSON.stringify({ plugin: ["a", "b"] }, null, 2), path: ["plugin", 1], expect: ["a"] },
+    { name: "pretty middle", text: JSON.stringify({ plugin: ["a", "b", "c"] }, null, 2), path: ["plugin", 1], expect: ["a", "c"] },
+    { name: "trailing comma last", text: '{ "plugin": ["a", "b", ] }', path: ["plugin", 1], expect: ["a"] },
+    { name: "leading comment survives", text: '{\n  // plugins below\n  "plugin": ["a", "b"]\n}', path: ["plugin", 1], expect: ["a"] },
+  ]
+  for (const item of cases) {
+    const after = applyDelete(item.text, item.path)
+    const report = parseJsonc(after)
+    assert(report.errors.length === 0, `${item.name}: parse errors in result: ${JSON.stringify(after)}`)
+    assert(JSON.stringify(report.data.plugin) === JSON.stringify(item.expect), `${item.name}: expected ${JSON.stringify(item.expect)}, got ${JSON.stringify(report.data.plugin)}`)
+  }
+  // Trailing comments on the deleted separator may go with it (same as the
+  // library); comments elsewhere and on surviving elements must survive.
+  const commented = applyDelete('{ // header\n "plugin": [\n  "a", // keep a\n  "b",\n  "c"\n ]\n}', ["plugin", 2])
+  assert(commented.includes("keep a"), "trailing comment of a surviving element must survive")
+  assert(commented.includes("header"), "unrelated comment must survive")
+  assert(parseJsonc(commented).errors.length === 0, "commented deletion must stay parseable")
 }
 
 console.log("all unit tests passed")

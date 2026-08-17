@@ -32,6 +32,9 @@ const required = [
   "dist/server.js",
   "dist/search.js",
   "dist/settings.js",
+  "dist/modules.js",
+  "dist/standalone.js",
+  "dist/modules/agent-variants.js",
   "src/tui.tsx",
   "src/jsonc.ts",
   "src/discovery.ts",
@@ -42,6 +45,9 @@ const required = [
   "src/server.ts",
   "src/search.ts",
   "src/settings.ts",
+  "src/modules.ts",
+  "src/standalone.ts",
+  "src/modules/agent-variants.ts",
   "tsconfig.json",
 ]
 

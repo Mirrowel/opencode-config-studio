@@ -36,7 +36,10 @@ import { runCapture, diffBodies, type CaptureRunResult } from "./sink.js"
 import { ensureTuiRegistration, ourRootDir } from "./selfwire.js"
 import { FIELD_DOCS } from "./docs.js"
 import { rankOptions } from "./search.js"
-import { DEFAULT_HIDDEN_SECTIONS, loadSettings, saveSettings, settingsPath } from "./settings.js"
+import { DEFAULT_HIDDEN_SECTIONS, loadSettings, saveSettings, settingsPath, type StudioSettings } from "./settings.js"
+import { enabledModules, moduleUsesOwnMenu, getModules, type ModuleContext } from "./modules.js"
+import { agentVariantsModuleId, setModulePickImplementation } from "./modules/agent-variants.js"
+import { findStandaloneAgentVariants, removeStandaloneHits } from "./standalone.js"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -59,7 +62,7 @@ interface StagedChange {
   reason: string
 }
 
-interface StudioState {
+export interface StudioState {
   files: ConfigFileEntry[]
   merge: ProvenancedMerge
   providers: RuntimeProviderLike[]
@@ -1179,7 +1182,11 @@ function defaultInfoText(state: StudioState, analysis: ModelAnalysis): string {
 // ---------------------------------------------------------------------------
 
 async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
+  await checkStandaloneDuplicates(api)
   const editedProviders = analyzeProviders(state.providers, state.defaults, state.merge).filter((provider) => provider.edited).length
+  const modules = enabledModuleList()
+  const modulePending = modules.some((module) => module.hasPendingChanges(moduleContext(api, state)))
+  const pendingCount = state.pending.length + (modulePending ? 1 : 0)
   const opts: WizardSelectOption<string>[] = [
     {
       title: "Browse providers & models",
@@ -1208,8 +1215,8 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
     {
       title: "Diagnostics",
       value: "diagnostics",
-      description: "Merge report, hidden layers, backups",
-      help: "Cross-checks your files against OpenCode's resolved config and lists keys that come from non-file layers.",
+      description: "Merge report, hidden layers, modules",
+      help: "Cross-checks your files against OpenCode's resolved config and merges module diagnostics (Agent Variants validation, ...).",
     },
     {
       title: "How it works",
@@ -1218,15 +1225,31 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
       help: "Overview of the request pipeline and how this plugin reads and edits config.",
     },
     {
+      title: "Modules",
+      value: "modules",
+      description: `${modules.length} enabled - toggles and layout`,
+      help: "Enable or disable feature modules (Agent Variants, ...) and configure how they integrate into the studio. Disabled modules disappear from every menu; their server-side parts stop at the next restart.",
+    },
+    {
       title: "Wizard UI",
       value: "ui",
       description: `Width ${wizardDialogSize(api)}, height ${wizardDialogHeightPercent(api)}%`,
       help: "Dialog sizing for Config Studio screens.",
     },
   ]
-  if (state.pending.length > 0) {
+  for (const module of modules) {
+    if (!moduleUsesOwnMenu(studioSettings, module) || !module.mainMenuEntry) continue
+    const entry = module.mainMenuEntry(moduleContext(api, state))
     opts.push({
-      title: `Review staged changes (${state.pending.length})`,
+      title: entry.title,
+      value: `module:${module.id}`,
+      description: entry.description,
+      help: entry.help,
+    })
+  }
+  if (pendingCount > 0) {
+    opts.push({
+      title: `Review staged changes (${pendingCount})`,
       value: "review",
       description: "Diff view, then save or discard",
       edited: true,
@@ -1235,13 +1258,19 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
     opts.push({
       title: "Save & exit",
       value: "save",
-      description: `Write ${state.pending.length} staged change(s) to disk`,
+      description: "Write staged changes to disk",
       edited: true,
-      help: "Writes every staged change to its target file (with backups), reloads OpenCode config once, and closes the studio.",
+      help: "Writes every staged change to its target (with backups), reloads OpenCode config once, and closes the studio.",
     })
   }
 
   const action = await showMenu(api, { title: "Config Studio", options: opts })
+  if (action?.startsWith("module:")) {
+    const module = modules.find((item) => item.id === action.slice("module:".length))
+    const entry = module && moduleUsesOwnMenu(studioSettings, module) ? module.mainMenuEntry?.(moduleContext(api, state)) : undefined
+    if (entry) await entry.run(moduleContext(api, state))
+    return mainMenu(api, state)
+  }
   switch (action) {
     case "browse":
       return providerBrowser(api, state)
@@ -1254,8 +1283,10 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
     case "diagnostics":
       return diagnosticsScreen(api, state)
     case "info":
-      await showInfo(api, { title: "Config Studio", message: overviewText() })
+      await showOverview(api)
       return mainMenu(api, state)
+    case "modules":
+      return modulesScreen(api, state)
     case "ui":
       return uiScreen(api, state)
     case "review":
@@ -1263,23 +1294,174 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
     case "save":
       return saveAndExit(api, state)
     default: {
-      if (state.pending.length > 0) {
+      const hasModulePending = enabledModuleList().some((module) => module.hasPendingChanges(moduleContext(api, state)))
+      if (state.pending.length > 0 || hasModulePending) {
         const discard = await showConfirm(api.ui, {
           title: "Discard staged changes?",
-          message: `${state.pending.length} staged change(s) have not been written to disk.\n\nDiscard them and exit?`,
+          message: `${state.pending.length} staged file change(s) plus module changes have not been written to disk.\n\nDiscard them and exit?`,
           confirmLabel: "Discard & exit",
         })
         if (!discard) return mainMenu(api, state)
         state.pending = []
+        for (const module of enabledModuleList()) module.discard?.()
       }
       return
     }
   }
 }
 
+async function showOverview(api: TuiPluginApi): Promise<void> {
+  const sections: PagedSection[] = [
+    { title: "Requests & config", lines: overviewText().split("\n") },
+    ...enabledModuleList().flatMap((module) => module.infoSections?.() ?? []),
+  ]
+  await showPagedInfo(api, { title: "Config Studio", sections })
+}
+
+async function modulesScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
+  const dataDir = studioDataDir(api)
+  const options: WizardSelectOption<string>[] = getModules().map((module) => {
+    const enabled = studioSettings.modules.enabled[module.id] !== false || (studioSettings.modules.enabled[module.id] === undefined && module.defaultEnabled)
+    const optionBits: string[] = []
+    for (const option of module.options ?? []) {
+      const value = studioSettings.modules.options[module.id]?.[option.key]
+      optionBits.push(`${option.title}: ${value === true ? "on" : "off"}`)
+    }
+    return {
+      title: `${enabled ? "" : "x "}${module.title}`,
+      value: module.id,
+      description: [module.description, ...optionBits].join(" - "),
+      edited: enabled,
+      help: [
+        module.description,
+        "",
+        "Toggle enables or disables this module's menus and server-side parts (server parts stop at the next restart).",
+        ...(module.ownMenuOption ? ["", `${module.ownMenuOption.title}: ${module.ownMenuOption.help ?? module.ownMenuOption.description}`] : []),
+      ].join("\n"),
+    }
+  })
+  options.push({ title: "< Back", value: "__back__", description: "Return to main menu" })
+  const picked = await showMenu(api, { title: "Modules", options })
+  if (!picked || picked === "__back__") return mainMenu(api, state)
+  const module = getModules().find((item) => item.id === picked)
+  if (!module) return modulesScreen(api, state)
+  if (module.ownMenuOption) {
+    const choice = await showMenu(api, {
+      title: module.title,
+      options: [
+        { title: "Toggle enabled", value: "enabled", description: "Show/hide this module everywhere" },
+        { title: `Toggle ${module.ownMenuOption.title}`, value: "layout", description: studioSettings.modules.options[module.id]?.[module.ownMenuOption.key] === true ? "currently: own menu" : "currently: integrated" },
+        { title: "< Back", value: "__back__", description: "Return to modules" },
+      ],
+    })
+    if (!choice || choice === "__back__") return modulesScreen(api, state)
+    if (choice === "enabled") {
+      const nowEnabled = studioSettings.modules.enabled[module.id] !== false || studioSettings.modules.enabled[module.id] === undefined
+      setModuleEnabledInSettings(api, dataDir, module.id, !nowEnabled)
+    } else if (choice === "layout") {
+      const bag = studioSettings.modules.options[module.id] ?? (studioSettings.modules.options[module.id] = {})
+      bag[module.ownMenuOption.key] = bag[module.ownMenuOption.key] !== true
+      saveSettings(dataDir, studioSettings)
+      api.ui.toast({
+        variant: "info",
+        title: module.title,
+        message: bag[module.ownMenuOption.key] === true ? "Module now has its own main-menu entry." : "Module menus are integrated into the studio screens.",
+      })
+    }
+    return modulesScreen(api, state)
+  }
+  const nowEnabled = studioSettings.modules.enabled[module.id] !== false || studioSettings.modules.enabled[module.id] === undefined
+  setModuleEnabledInSettings(api, dataDir, module.id, !nowEnabled)
+  return modulesScreen(api, state)
+}
+
+function setModuleEnabledInSettings(api: TuiPluginApi, dataDir: string, id: string, enabled: boolean) {
+  studioSettings.modules.enabled[id] = enabled
+  saveSettings(dataDir, studioSettings)
+  api.ui.toast({
+    variant: "info",
+    title: enabled ? "Module enabled" : "Module disabled",
+    message: enabled ? "Its menus are back." : "Its menus disappear; server parts stop at the next restart.",
+  })
+}
+
 // ---------------------------------------------------------------------------
-// Review staged changes / Save & exit
+// Module session state (per studio command run)
 // ---------------------------------------------------------------------------
+
+let studioSettings: StudioSettings = loadSettingsDefaultPlaceholder()
+let duplicateCheckDone = false
+
+function loadSettingsDefaultPlaceholder(): StudioSettings {
+  // Replaced at command start; safe default before that.
+  return { capture: { hiddenSections: [...DEFAULT_HIDDEN_SECTIONS] }, modules: { enabled: {}, options: {} } }
+}
+
+function moduleContext(api: TuiPluginApi, state: StudioState): ModuleContext {
+  return {
+    api,
+    state,
+    settings: studioSettings,
+    refresh: async () => {
+      const updated = await refreshStudio(api, state)
+      Object.assign(state, updated)
+    },
+  }
+}
+
+function enabledModuleList() {
+  return enabledModules(studioSettings)
+}
+
+async function checkStandaloneDuplicates(api: TuiPluginApi): Promise<void> {
+  if (duplicateCheckDone) return
+  duplicateCheckDone = true
+  const moduleIdEnabled = studioSettings.modules.enabled[agentVariantsModuleId] !== false
+  if (!moduleIdEnabled) return
+  let hits: ReturnType<typeof findStandaloneAgentVariants> = []
+  try {
+    hits = findStandaloneAgentVariants({
+      globalConfigDir: api.state.path.config,
+      directory: api.state.path.directory,
+      worktree: api.state.path.worktree,
+      env: process.env,
+    })
+  } catch {
+    return
+  }
+  if (hits.length === 0) return
+
+  const files = [...new Set(hits.map((hit) => hit.file))]
+  const remove = await showConfirm(api.ui, {
+    title: "Standalone Agent Variants detected",
+    message: [
+      `${hits.length} standalone registration(s) found:`,
+      ...files.map((file) => `  - ${file}`),
+      "",
+      "Config Studio embeds Agent Variants. Keeping both would run the routing logic twice.",
+      "Remove the standalone registration(s)? Until you restart, the studio's embedded router stays dormant and the standalone plugin keeps handling routing.",
+    ].join("\n"),
+    confirmLabel: "Remove standalone",
+  })
+  if (!remove) return
+  const results = removeStandaloneHits(hits, studioDataDir(api))
+  const failures = results.filter((result) => result.error)
+  const removed = results.filter((result) => !result.error)
+  const lines: string[] = []
+  if (removed.length > 0) {
+    lines.push("Removed standalone Agent Variants from:", ...removed.map((result) => `  - ${result.file}`))
+  }
+  if (failures.length > 0) {
+    lines.push("", "Failed to edit:", ...failures.map((result) => `  - ${result.file}: ${result.error}`))
+  }
+  lines.push(
+    "",
+    "RESTART REQUIRED: restart OpenCode so the embedded Agent Variants",
+    "module takes over routing. Until then the standalone plugin keeps running.",
+  )
+  api.ui.toast({ variant: "warning", title: "Standalone Agent Variants removed", message: "Restart OpenCode to activate the embedded module." })
+  await showInfo(api, { title: "Standalone removed - restart required", message: lines.join("\n") })
+}
 
 function stagedChangeSummary(change: StagedChange): string {
   return change.ops
@@ -1308,8 +1490,16 @@ function diskDataAt(state: StudioState, targetPath: string, pointer: JSONPath): 
   }
 }
 
+function modulePendingSummaries(ctx: ModuleContext) {
+  return enabledModuleList()
+    .map((module) => ({ module, summary: module.pendingSummary?.(ctx) }))
+    .filter((item): item is { module: (typeof item)["module"]; summary: NonNullable<(typeof item)["summary"]> } => Boolean(item.summary))
+}
+
 async function reviewChangesScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
-  if (state.pending.length === 0) return mainMenu(api, state)
+  const moduleSummaries = modulePendingSummaries(moduleContext(api, state))
+  const total = state.pending.length + moduleSummaries.length
+  if (total === 0) return mainMenu(api, state)
   const options: WizardSelectOption<string>[] = state.pending.map((change) => ({
     title: change.reason,
     value: `view:${change.id}`,
@@ -1317,19 +1507,28 @@ async function reviewChangesScreen(api: TuiPluginApi, state: StudioState): Promi
     edited: true,
     help: "Select to inspect the full diff for this staged change (old value from disk, new value from the staged edit).",
   }))
+  for (const { module, summary } of moduleSummaries) {
+    options.push({
+      title: summary.title,
+      value: `module:${module.id}`,
+      description: summary.lines[0] ?? module.title,
+      edited: true,
+      help: "Module-owned staged changes (written by the studio's Save & exit together with file edits).",
+    })
+  }
   options.push(
-    { title: "Save all & exit", value: "__save__", description: `${state.pending.length} change(s), ${new Set(state.pending.map((change) => change.targetPath)).size} file(s)`, edited: true, help: "Writes every staged change with backup, reloads OpenCode config once, then closes the studio." },
+    { title: "Save all & exit", value: "__save__", description: `${state.pending.length} file change(s), ${moduleSummaries.length} module change(s)`, edited: true, help: "Writes every staged change with backup, reloads OpenCode config once, then closes the studio." },
     { title: "Discard all", value: "__discard_all__", description: "Drop every staged change", danger: true, help: "Clears the queue; nothing has been written to disk." },
     { title: "< Back", value: "__back__", description: "Keep changes staged" },
   )
-  const picked = await showMenu(api, { title: `Staged changes (${state.pending.length})`, options })
-  if (!picked) return mainMenu(api, state)
-  if (picked === "__back__") return mainMenu(api, state)
+  const picked = await showMenu(api, { title: `Staged changes (${total})`, options })
+  if (!picked || picked === "__back__") return mainMenu(api, state)
   if (picked === "__save__") return saveAndExit(api, state)
   if (picked === "__discard_all__") {
-    const confirmed = await showConfirm(api.ui, { title: "Discard all staged changes?", message: "Nothing has been written to disk. Drop all staged edits?" })
+    const confirmed = await showConfirm(api.ui, { title: "Discard all staged changes?", message: "Nothing has been written to disk. Drop all staged edits (including module changes)?" })
     if (!confirmed) return reviewChangesScreen(api, state)
     state.pending = []
+    for (const module of enabledModuleList()) module.discard?.()
     const updated = await refreshStudio(api, state)
     Object.assign(state, updated)
     return mainMenu(api, state)
@@ -1338,6 +1537,11 @@ async function reviewChangesScreen(api: TuiPluginApi, state: StudioState): Promi
     const id = Number(picked.slice("view:".length))
     const change = state.pending.find((item) => item.id === id)
     if (change) return stagedChangeDetail(api, state, change)
+    return reviewChangesScreen(api, state)
+  }
+  if (picked.startsWith("module:")) {
+    const entry = moduleSummaries.find((item) => item.module.id === picked.slice("module:".length))
+    if (entry) await showPagedInfo(api, { title: entry.summary.title, sections: [{ title: entry.summary.title, lines: entry.summary.lines }] })
     return reviewChangesScreen(api, state)
   }
   return mainMenu(api, state)
@@ -1381,10 +1585,12 @@ async function stagedChangeDetail(api: TuiPluginApi, state: StudioState, change:
 }
 
 async function saveAndExit(api: TuiPluginApi, state: StudioState): Promise<void> {
-  if (state.pending.length === 0) return
+  const moduleSummaries = modulePendingSummaries(moduleContext(api, state))
+  const total = state.pending.length + moduleSummaries.length
+  if (total === 0) return
   const confirmed = await showConfirm(api.ui, {
     title: "Save staged changes",
-    message: `Write ${state.pending.length} staged change(s) to ${new Set(state.pending.map((change) => change.targetPath)).size} file(s)?\nEach write creates a backup first.`,
+    message: `Write ${state.pending.length} staged file change(s) and ${moduleSummaries.length} module change(s)?\nEach file write creates a backup first.`,
     confirmLabel: "Save & reload",
   })
   if (!confirmed) return mainMenu(api, state)
@@ -1401,18 +1607,47 @@ async function saveAndExit(api: TuiPluginApi, state: StudioState): Promise<void>
     })
     return mainMenu(api, state)
   }
-  api.ui.toast({ variant: "success", title: "Config saved", message: `${result.saved} file(s) written` })
+  const restartReasons: string[] = []
+  for (const { module } of moduleSummaries) {
+    try {
+      const moduleResult = await module.save?.(moduleContext(api, state))
+      restartReasons.push(...(moduleResult?.restartReasons ?? []))
+    } catch (error) {
+      restartReasons.push(`${module.title}: save failed - ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  const uniqueReasons = [...new Set(restartReasons)]
+  api.ui.toast({ variant: uniqueReasons.length > 0 ? "warning" : "success", title: "Config saved", message: uniqueReasons.length > 0 ? "Restart OpenCode to apply task-list/UI changes." : "All changes written." })
   // Summary dialog BEFORE the config reload: dispose reloads plugins and
   // would tear this dialog down mid-display otherwise.
-  await showInfo(api, {
-    title: "Saved",
-    message: [
-      `Wrote staged changes to ${result.saved} file(s).`,
-      "",
-      "OpenCode config reloads now; running sessions keep their previous settings.",
-      "Restart OpenCode if anything looks stale.",
-    ].join("\n"),
-  })
+  if (uniqueReasons.length > 0) {
+    await showPagedInfo(api, {
+      title: "Saved - restart required",
+      sections: [
+        {
+          title: "Restart",
+          lines: [
+            `Wrote staged changes to ${result.saved} file(s) plus ${moduleSummaries.length} module change(s).`,
+            "",
+            "RESTART REQUIRED for these changes:",
+            ...uniqueReasons.map((reason) => `  - ${reason}`),
+            "",
+            "OpenCode config reloads now; running sessions keep their previous settings.",
+          ],
+        },
+      ],
+    })
+  } else {
+    await showInfo(api, {
+      title: "Saved",
+      message: [
+        `Wrote staged changes to ${result.saved} file(s) plus ${moduleSummaries.length} module change(s).`,
+        "",
+        "OpenCode config reloads now; running sessions keep their previous settings.",
+        "Restart OpenCode if anything looks stale.",
+      ].join("\n"),
+    })
+  }
   await reloadOpenCode(api)
 }
 
@@ -2215,10 +2450,26 @@ async function agentsScreen(api: TuiPluginApi, state: StudioState): Promise<void
       help: agentHelpText(state, name, entry),
     }
   })
+  for (const module of enabledModuleList()) {
+    if (moduleUsesOwnMenu(studioSettings, module)) continue
+    for (const entry of module.agentsScreenEntries?.(moduleContext(api, state)) ?? []) {
+      options.push({ title: entry.title, value: `module-agents:${module.id}:${entry.title}`, description: entry.description, help: entry.help, edited: entry.edited })
+    }
+  }
   options.push({ title: "< Back", value: "__back__", description: "Return to main menu" })
 
   const picked = await showMenu(api, { title: "Agents", options })
   if (!picked || picked === "__back__") return mainMenu(api, state)
+  if (picked.startsWith("module-agents:")) {
+    const rest = picked.slice("module-agents:".length)
+    const [moduleId, ...titleParts] = rest.split(":")
+    const module = enabledModuleList().find((item) => item.id === moduleId)
+    const entry = module && !moduleUsesOwnMenu(studioSettings, module)
+      ? module.agentsScreenEntries?.(moduleContext(api, state)).find((item) => item.title === titleParts.join(":"))
+      : undefined
+    if (entry) await entry.run(moduleContext(api, state))
+    return agentsScreen(api, state)
+  }
   return agentDetail(api, state, picked)
 }
 
@@ -2263,10 +2514,26 @@ async function agentDetail(api: TuiPluginApi, state: StudioState, agent: string)
       description: String(getIn(safeStateConfig(api), ["agent", agent, "top_p"]) ?? "(model default)"),
       help: docText("agent.top_p"),
     },
-    { title: "< Back", value: "__back__", description: "Return to agent list" },
   ]
+  for (const module of enabledModuleList()) {
+    if (moduleUsesOwnMenu(studioSettings, module)) continue
+    for (const entry of module.agentDetailEntries?.(moduleContext(api, state), agent) ?? []) {
+      options.push({ title: entry.title, value: `module-agent:${module.id}:${entry.title}`, description: entry.description, help: entry.help, edited: entry.edited, danger: entry.danger })
+    }
+  }
+  options.push({ title: "< Back", value: "__back__", description: "Return to agent list" })
   const picked = await showMenu(api, { title: `Agent ${agent}`, options })
   if (!picked || picked === "__back__") return agentsScreen(api, state)
+  if (picked.startsWith("module-agent:")) {
+    const rest = picked.slice("module-agent:".length)
+    const [moduleId, ...titleParts] = rest.split(":")
+    const module = enabledModuleList().find((item) => item.id === moduleId)
+    const entry = module && !moduleUsesOwnMenu(studioSettings, module)
+      ? module.agentDetailEntries?.(moduleContext(api, state), agent).find((item) => item.title === titleParts.join(":"))
+      : undefined
+    if (entry) await entry.run(moduleContext(api, state))
+    return agentDetail(api, state, agent)
+  }
 
   if (picked === "model") {
     const modelPick = await pickAnyModel(api, state, `Model for agent ${agent}`)
@@ -2571,6 +2838,14 @@ async function diagnosticsScreen(api: TuiPluginApi, state: StudioState): Promise
   } else {
     sections.push({ title: "Non-file layers", lines: ["No values detected from non-file layers."] })
   }
+  for (const module of enabledModuleList()) {
+    try {
+      const moduleSections = await module.diagnosticsSections?.(moduleContext(api, state))
+      if (moduleSections) sections.push(...moduleSections)
+    } catch (error) {
+      sections.push({ title: module.title, lines: [`diagnostics failed: ${error instanceof Error ? error.message : String(error)}`] })
+    }
+  }
   await showPagedInfo(api, { title: "Diagnostics", sections })
   return mainMenu(api, state)
 }
@@ -2671,7 +2946,23 @@ const tui: TuiPlugin = async (api) => {
     // never block activation on self-wiring
   }
 
+  // Module system: register the picker used by module menus and load settings.
+  setModulePickImplementation((moduleApi, props) =>
+    showMenu(moduleApi, {
+      title: props.title,
+      options: props.options.map((option) => ({
+        title: option.title,
+        value: option.value,
+        description: option.description,
+        help: option.help,
+        danger: option.danger,
+      })),
+    }),
+  )
+
   const unregister = registerStudioCommand(api, async () => {
+    studioSettings = loadSettings(studioDataDir(api))
+    duplicateCheckDone = false
     let state: StudioState | undefined
     await showBusy(api, "Loading config layers...", (async () => {
       state = await refreshStudio(api)

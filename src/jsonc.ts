@@ -126,8 +126,41 @@ export function applySet(text: string, path: JSONPath, value: unknown): string {
 }
 
 export function applyDelete(text: string, path: JSONPath): string {
+  const last = path[path.length - 1]
+  if (typeof last === "number") {
+    const fixed = deleteArrayElementText(text, path)
+    if (fixed !== undefined) return fixed
+  }
   const edits = jsonc.modify(text, path, undefined, { formattingOptions: detectFormatting(text) })
   return jsonc.applyEdits(text, edits)
+}
+
+/**
+ * jsonc-parser 3.3.1 corrupts the text when removing the LAST element of an
+ * array in compact (single-line) documents. Array-index deletions are
+ * therefore computed from the parse tree: last child removes its preceding
+ * separator, other children remove themselves plus their trailing comma.
+ * Only the removed range is touched - the container never reflows.
+ */
+function deleteArrayElementText(text: string, path: JSONPath): string | undefined {
+  const tree = jsonc.parseTree(text, undefined, { allowTrailingComma: true, disallowComments: false })
+  if (!tree) return undefined
+  const parent = jsonc.findNodeAtLocation(tree, path.slice(0, -1))
+  const index = path[path.length - 1]
+  const children = parent?.children
+  if (!parent || parent.type !== "array" || !children || typeof index !== "number" || index < 0 || index >= children.length) {
+    return undefined
+  }
+  const node = children[index]!
+  if (node.offset < 0) return undefined
+  const nodeEnd = node.offset + node.length
+  if (index === children.length - 1) {
+    const previous = index > 0 ? children[index - 1] : undefined
+    const start = previous ? previous.offset + previous.length : parent.offset + 1
+    return text.slice(0, start) + text.slice(nodeEnd)
+  }
+  const next = children[index + 1]!
+  return text.slice(0, node.offset) + text.slice(next.offset)
 }
 
 // ---------------------------------------------------------------------------
@@ -289,15 +322,12 @@ export function editConfigFile(filePath: string, ops: EditOp[], options: EditCon
     return { ok: false, filePath, before, after: before, error: `Refusing to write: edit introduced parse errors (${verify.errors[0]})` }
   }
 
-  for (const op of ops) {
-    const landed = getValueAtPath(after, op.path)
-    if (op.op === "set") {
-      if (JSON.stringify(landed) !== JSON.stringify(op.value)) {
-        return { ok: false, filePath, before, after: before, error: `Verification failed: value at ${formatPath(op.path)} did not land` }
-      }
-    } else if (landed !== undefined) {
-      return { ok: false, filePath, before, after: before, error: `Verification failed: value at ${formatPath(op.path)} still present after delete` }
-    }
+  // Batch verification: replay the ops on the parsed original and compare.
+  // (Per-pointer checks cannot express array deletions, where indices shift.)
+  const beforeData = before.trim().length > 0 ? parseJsonc(before).data : {}
+  const expected = applyOpsToData(beforeData, ops)
+  if (JSON.stringify(expected) !== JSON.stringify(verify.data)) {
+    return { ok: false, filePath, before, after: before, error: "Verification failed: edits did not land as expected" }
   }
 
   let backupId: string | undefined
@@ -365,7 +395,14 @@ export function applyOpsToData<T>(data: T, ops: EditOp[]): T {
     if (op.path.length === 0) continue
     const last = op.path[op.path.length - 1]!
     if (typeof last === "number") {
-      const container = getAtPath(root, op.path.slice(0, -1))
+      const containerPath = op.path.slice(0, -1)
+      let container = getAtPath(root, containerPath)
+      if (container === undefined && op.op === "set") {
+        // Mirror jsonc modify: setting an index on a missing array creates it.
+        const fresh: unknown[] = []
+        setAtPath(root, containerPath, fresh)
+        container = fresh
+      }
       if (!Array.isArray(container)) continue
       if (op.op === "set") container[last] = deepClone(op.value)
       else container.splice(last, 1)
@@ -401,6 +438,28 @@ export function applyOpsToData<T>(data: T, ops: EditOp[]): T {
     if (isPlainObject(container)) delete container[last]
   }
   return root as T
+}
+
+/** Writes a value at a JSON pointer, creating intermediate objects. */
+function setAtPath(root: Record<string, unknown>, path: JSONPath, value: unknown): void {
+  let current: Record<string, unknown> = root
+  for (const segment of path.slice(0, -1)) {
+    if (typeof segment === "number") return
+    const next = current[segment]
+    if (isPlainObject(next)) {
+      current = next
+      continue
+    }
+    if (next === undefined || next === null) {
+      const created: Record<string, unknown> = {}
+      current[segment] = created
+      current = created
+      continue
+    }
+    return
+  }
+  const last = path[path.length - 1]!
+  if (typeof last !== "number") current[last] = value
 }
 
 export function stableStringify(value: unknown): string {
