@@ -3,10 +3,10 @@
 import { existsSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import type { TuiPlugin, TuiPluginApi, TuiDialogSelectOption } from "@opencode-ai/plugin/tui"
-import type { ScrollBoxRenderable } from "@opentui/core"
+import type { RGBA, ScrollBoxRenderable } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js"
-import { createConfigFile, deleteBackup, editConfigFile, loadBackupJournal, readBackupContent, writeTextAtomic, type EditOp, type JSONPath } from "./jsonc.js"
+import { createConfigFile, deleteBackup, editConfigFile, formatPath, getAtPath, applyOpsToData, isPlainObject, loadBackupJournal, parseJsonc, readBackupContent, writeTextAtomic, type EditOp, type JSONPath } from "./jsonc.js"
 import {
   discoverConfigFiles,
   editableFiles,
@@ -36,6 +36,7 @@ import { runCapture, diffBodies, type CaptureRunResult } from "./sink.js"
 import { ensureTuiRegistration, ourRootDir } from "./selfwire.js"
 import { FIELD_DOCS } from "./docs.js"
 import { rankOptions } from "./search.js"
+import { DEFAULT_HIDDEN_SECTIONS, loadSettings, saveSettings, settingsPath } from "./settings.js"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -51,6 +52,13 @@ type WizardSelectOption<Value = unknown> = TuiDialogSelectOption<Value> & {
 type DialogSize = "medium" | "large" | "xlarge"
 type KeyContext = { event?: { preventDefault?: () => void; stopPropagation?: () => void } }
 
+interface StagedChange {
+  id: number
+  targetPath: string
+  ops: EditOp[]
+  reason: string
+}
+
 interface StudioState {
   files: ConfigFileEntry[]
   merge: ProvenancedMerge
@@ -60,6 +68,8 @@ interface StudioState {
   modelsDevError?: string
   providersSource: "provider-list" | "config-providers" | "state"
   targetFilePath: string | undefined
+  /** Queued edits, written only on Save & exit (agent-variants save model). */
+  pending: StagedChange[]
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +674,157 @@ function showBusy(api: TuiPluginApi, title: string, work: Promise<void>): Promis
 }
 
 // ---------------------------------------------------------------------------
+// Paged content dialog (large output: capture bodies, diagnostics, diffs)
+// ---------------------------------------------------------------------------
+
+export type PagedSection = { title: string; lines: string[] }
+
+function showPagedInfo(api: TuiPluginApi, props: { title: string; sections: PagedSection[] }): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = () => {
+      if (settled) return
+      settled = true
+      resolve()
+      api.ui.dialog.clear()
+    }
+    api.ui.dialog.replace(
+      () => <PagedDialog api={api} title={props.title} sections={props.sections} onDone={done} />,
+      done,
+    )
+  })
+}
+
+type ThemePalette = { accent: RGBA; error: RGBA; success: RGBA; textMuted: RGBA }
+
+function renderContentLines(lines: string[], theme: () => ThemePalette) {
+  return (
+    <box flexDirection="column" gap={0}>
+      <For each={lines}>
+        {(line) => {
+          const heading = line.length > 0 && !line.startsWith(" ") && (line.endsWith(":") || /^[A-Z][A-Za-z0-9 ._-]+$/.test(line))
+          const warning = /error|failed|refus|invalid|delete|danger|restart required/i.test(line)
+          const positive = /config|edited|saved|applied|catalog|success/i.test(line)
+          return line.length === 0
+            ? <text> </text>
+            : <text fg={warning ? theme().error : positive && !heading ? theme().success : heading ? theme().accent : theme().textMuted} wrapMode="word">{heading ? <b>{line}</b> : line}</text>
+        }}
+      </For>
+    </box>
+  )
+}
+
+function PagedDialog(props: { api: TuiPluginApi; title: string; sections: PagedSection[]; onDone: () => void }) {
+  const theme = () => props.api.theme.current
+  useWizardDialogSize(props.api)
+  useHidePromptCursor(props.api)
+  const dimensions = useTerminalDimensions()
+  const popMode = props.api.mode.push("config-studio.dialog")
+  const width = dialogContentWidth(props.api)
+  const rowsPerPage = createMemo(() => Math.max(6, wizardMaxRows(props.api, dimensions().height, 14, 6)))
+
+  type Page = { sectionIndex: number; lines: string[] }
+  const pages = createMemo<Page[]>(() => {
+    const result: Page[] = []
+    const perPage = rowsPerPage()
+    props.sections.forEach((section, sectionIndex) => {
+      let current: string[] = []
+      let used = 0
+      const flush = () => {
+        if (current.length > 0) result.push({ sectionIndex, lines: current })
+        current = []
+        used = 0
+      }
+      for (const line of section.lines) {
+        const rows = Math.max(1, Math.ceil(line.length / Math.max(1, width)))
+        if (used + rows > perPage && current.length > 0) flush()
+        current.push(line)
+        used += rows
+      }
+      flush()
+    })
+    return result.length > 0 ? result : [{ sectionIndex: 0, lines: ["(empty)"] }]
+  })
+
+  const [pageIndex, setPageIndex] = createSignal(0)
+  const page = createMemo(() => pages()[Math.min(pageIndex(), pages().length - 1)]!)
+  const sectionTitle = createMemo(() => props.sections[page().sectionIndex]?.title ?? "")
+  const jumpKeys = createMemo(() => props.sections.slice(0, 9).map((section, index) => ({ section, key: String(index + 1) })))
+
+  const commandPrefix = `config-studio.paged.${Math.random().toString(36).slice(2)}`
+  const unregister = props.api.keymap.registerLayer({
+    priority: 10000,
+    commands: [
+      { name: `${commandPrefix}.close`, title: "Close", run: (ctx: KeyContext) => { blockKey(ctx); props.onDone() } },
+      { name: `${commandPrefix}.next`, title: "Next page", run: (ctx: KeyContext) => { blockKey(ctx); setPageIndex(Math.min(pageIndex() + 1, pages().length - 1)) } },
+      { name: `${commandPrefix}.prev`, title: "Previous page", run: (ctx: KeyContext) => { blockKey(ctx); setPageIndex(Math.max(pageIndex() - 1, 0)) } },
+      { name: `${commandPrefix}.first`, title: "First page", run: (ctx: KeyContext) => { blockKey(ctx); setPageIndex(0) } },
+      { name: `${commandPrefix}.last`, title: "Last page", run: (ctx: KeyContext) => { blockKey(ctx); setPageIndex(pages().length - 1) } },
+      ...jumpKeys().map(({ key }) => ({
+        name: `${commandPrefix}.jump${key}`,
+        title: "Jump to section",
+        run: (ctx: KeyContext) => {
+          blockKey(ctx)
+          const target = pages().find((item) => item.sectionIndex === Number(key) - 1)
+          if (target) setPageIndex(pages().indexOf(target))
+        },
+      })),
+      { name: `${commandPrefix}.shield`, title: "Block background input", run: blockKey },
+    ],
+    bindings: [
+      { key: "enter", cmd: `${commandPrefix}.close`, desc: "Close" },
+      { key: "escape", cmd: `${commandPrefix}.close`, desc: "Close" },
+      { key: "n", cmd: `${commandPrefix}.next`, desc: "Next page" },
+      { key: "right", cmd: `${commandPrefix}.next`, desc: "Next page" },
+      { key: "pagedown", cmd: `${commandPrefix}.next`, desc: "Next page" },
+      { key: "p", cmd: `${commandPrefix}.prev`, desc: "Previous page" },
+      { key: "left", cmd: `${commandPrefix}.prev`, desc: "Previous page" },
+      { key: "pageup", cmd: `${commandPrefix}.prev`, desc: "Previous page" },
+      { key: "home", cmd: `${commandPrefix}.first`, desc: "First page" },
+      { key: "end", cmd: `${commandPrefix}.last`, desc: "Last page" },
+      ...jumpKeys().map(({ key }) => ({ key, cmd: `${commandPrefix}.jump${key}`, desc: "Jump to section" })),
+      ...shieldBindings(`${commandPrefix}.shield`, ["home", "end"]),
+    ],
+  })
+  onCleanup(() => {
+    unregister()
+    popMode()
+  })
+
+  const footerHint = createMemo(() => {
+    const sections = jumpKeys().map(({ key, section }) => `${key}=${truncate(section.title, 12)}`).join("  ")
+    return [
+      `p < ${pageIndex() + 1}/${pages().length} > n`,
+      props.sections.length > 1 ? sections : "",
+    ].filter(Boolean).join("   ")
+  })
+
+  return (
+    <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
+      <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
+        <text fg={theme().accent}><b>{props.title}</b></text>
+        <text fg={theme().textMuted} onMouseUp={props.onDone}>esc</text>
+      </box>
+      {props.sections.length > 1 ? (
+        <box marginBottom={1}>
+          <text fg={theme().textMuted}>section: </text>
+          <text fg={theme().accent}><b>{sectionTitle()}</b></text>
+        </box>
+      ) : undefined}
+      <box flexDirection="column" height={rowsPerPage()}>
+        {renderContentLines(page().lines, theme)}
+      </box>
+      <box flexDirection="row" justifyContent="space-between" width="100%" marginTop={1}>
+        <text fg={theme().textMuted}>{footerHint()}</text>
+        <box paddingLeft={3} paddingRight={3} backgroundColor={theme().primary} onMouseUp={props.onDone}>
+          <text fg={theme().background}><b>ok</b></text>
+        </box>
+      </box>
+    </box>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Studio state
 // ---------------------------------------------------------------------------
 
@@ -720,6 +881,14 @@ async function refreshStudio(api: TuiPluginApi, previous?: StudioState): Promise
   const globalConfigDir = api.state.path.config
   const envConfigFile = process.env["OPENCODE_CONFIG"]
   const files = discoverConfigFiles({ globalConfigDir, envConfigFile, directory: api.state.path.directory, worktree: api.state.path.worktree })
+  const pending = previous?.pending ?? []
+  // Staged overlay: pending ops are reflected in parsed file data so every
+  // view (provenance, browsers, detail screens) renders the post-save world.
+  for (const change of pending) {
+    const file = files.find((item) => item.path === change.targetPath)
+    if (!file) continue
+    file.data = applyOpsToData(file.data, change.ops)
+  }
   const merge = mergeWithProvenance(files)
   const [providerResult, modelsDevResult] = await Promise.all([
     fetchProviders(api),
@@ -734,6 +903,7 @@ async function refreshStudio(api: TuiPluginApi, previous?: StudioState): Promise
     modelsDevError: modelsDevResult.error,
     providersSource: providerResult.source,
     targetFilePath: previous?.targetFilePath,
+    pending,
   }
 }
 
@@ -859,6 +1029,14 @@ async function resolveTargetFile(write: WriteContext, pointer: JSONPath, suggest
   return target
 }
 
+let stagedChangeCounter = 0
+
+/**
+ * Stages edits instead of writing them (agent-variants save model): ops are
+ * recorded in state.pending and overlaid onto the parsed file data, so all
+ * views already render the post-save values. The single disk write happens
+ * on Save & exit (saveStagedChanges), followed by exactly one config reload.
+ */
 async function applyEdits(
   write: WriteContext,
   ops: EditOp[],
@@ -867,21 +1045,34 @@ async function applyEdits(
   const pointer = ops[0]?.path ?? []
   const target = await resolveTargetFile(write, pointer, reason)
   if (!target) return false
-  const result = editConfigFile(target, ops, { stateDir: studioDataDir(write.api), reason })
-  if (!result.ok) {
-    await showAlert(write.api.ui, { title: "Edit failed", message: result.error ?? "Unknown error" })
-    return false
-  }
-  const reloaded = await reloadOpenCode(write.api)
-  write.api.ui.toast({
-    variant: "info",
-    title: "Config saved",
-    message: `${target}${reloaded ? " - OpenCode config reloaded" : " - restart OpenCode to apply"}`,
-  })
-  // refresh in-place so follow-up screens see the new world
+  write.state.pending.push({ id: ++stagedChangeCounter, targetPath: target, ops, reason })
   const updated = await refreshStudio(write.api, write.state)
   Object.assign(write.state, updated)
+  write.api.ui.toast({
+    variant: "info",
+    title: "Staged",
+    message: `${reason} - ${write.state.pending.length} pending. Save & exit writes to disk.`,
+  })
   return true
+}
+
+/** Writes all staged changes; the single config reload happens in saveAndExit. */
+async function saveStagedChanges(api: TuiPluginApi, state: StudioState): Promise<{ saved: number; failed?: { change: StagedChange; error: string } }> {
+  const byPath = new Map<string, { ops: EditOp[]; reasons: string[] }>()
+  for (const change of state.pending) {
+    const entry = byPath.get(change.targetPath) ?? { ops: [], reasons: [] }
+    entry.ops.push(...change.ops)
+    entry.reasons.push(change.reason)
+    byPath.set(change.targetPath, entry)
+  }
+  let saved = 0
+  for (const [targetPath, entry] of byPath) {
+    const result = editConfigFile(targetPath, entry.ops, { stateDir: studioDataDir(api), reason: entry.reasons.join("; ") })
+    if (!result.ok) return { saved, failed: { change: state.pending.find((change) => change.targetPath === targetPath)!, error: result.error ?? "unknown error" } }
+    saved++
+  }
+  state.pending = []
+  return { saved }
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,6 +1224,22 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
       help: "Dialog sizing for Config Studio screens.",
     },
   ]
+  if (state.pending.length > 0) {
+    opts.push({
+      title: `Review staged changes (${state.pending.length})`,
+      value: "review",
+      description: "Diff view, then save or discard",
+      edited: true,
+      help: "Edits are queued in memory. Nothing is written until Save & exit; review the diff, discard single changes, or drop everything.",
+    })
+    opts.push({
+      title: "Save & exit",
+      value: "save",
+      description: `Write ${state.pending.length} staged change(s) to disk`,
+      edited: true,
+      help: "Writes every staged change to its target file (with backups), reloads OpenCode config once, and closes the studio.",
+    })
+  }
 
   const action = await showMenu(api, { title: "Config Studio", options: opts })
   switch (action) {
@@ -1051,9 +1258,162 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
       return mainMenu(api, state)
     case "ui":
       return uiScreen(api, state)
-    default:
+    case "review":
+      return reviewChangesScreen(api, state)
+    case "save":
+      return saveAndExit(api, state)
+    default: {
+      if (state.pending.length > 0) {
+        const discard = await showConfirm(api.ui, {
+          title: "Discard staged changes?",
+          message: `${state.pending.length} staged change(s) have not been written to disk.\n\nDiscard them and exit?`,
+          confirmLabel: "Discard & exit",
+        })
+        if (!discard) return mainMenu(api, state)
+        state.pending = []
+      }
       return
+    }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Review staged changes / Save & exit
+// ---------------------------------------------------------------------------
+
+function stagedChangeSummary(change: StagedChange): string {
+  return change.ops
+    .map((op) => `${op.op === "set" ? "set" : "delete"} ${formatPath(op.path)}`)
+    .join(", ")
+}
+
+function diskDataAt(state: StudioState, targetPath: string, pointer: JSONPath): unknown {
+  // Truth from disk (not the staged overlay): used for old-value display.
+  const file = state.files.find((item) => item.path === targetPath)
+  const overlay = file ? applyOpsToData(file.data, []) : undefined
+  if (overlay === undefined) {
+    try {
+      const text = readFileSync(targetPath, "utf8")
+      return getAtPath(parseJsonc(text).data, pointer)
+    } catch {
+      return undefined
+    }
+  }
+  // Re-parse from disk for truth; fall back to reversing the overlay via ops.
+  try {
+    const text = readFileSync(targetPath, "utf8")
+    return getAtPath(parseJsonc(text).data, pointer)
+  } catch {
+    return getAtPath(file!.data, pointer)
+  }
+}
+
+async function reviewChangesScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
+  if (state.pending.length === 0) return mainMenu(api, state)
+  const options: WizardSelectOption<string>[] = state.pending.map((change) => ({
+    title: change.reason,
+    value: `view:${change.id}`,
+    description: `${fileByPath(state, change.targetPath)?.kind ?? "file"}:${fileByPath(state, change.targetPath)?.label ?? change.targetPath} - ${stagedChangeSummary(change)}`,
+    edited: true,
+    help: "Select to inspect the full diff for this staged change (old value from disk, new value from the staged edit).",
+  }))
+  options.push(
+    { title: "Save all & exit", value: "__save__", description: `${state.pending.length} change(s), ${new Set(state.pending.map((change) => change.targetPath)).size} file(s)`, edited: true, help: "Writes every staged change with backup, reloads OpenCode config once, then closes the studio." },
+    { title: "Discard all", value: "__discard_all__", description: "Drop every staged change", danger: true, help: "Clears the queue; nothing has been written to disk." },
+    { title: "< Back", value: "__back__", description: "Keep changes staged" },
+  )
+  const picked = await showMenu(api, { title: `Staged changes (${state.pending.length})`, options })
+  if (!picked) return mainMenu(api, state)
+  if (picked === "__back__") return mainMenu(api, state)
+  if (picked === "__save__") return saveAndExit(api, state)
+  if (picked === "__discard_all__") {
+    const confirmed = await showConfirm(api.ui, { title: "Discard all staged changes?", message: "Nothing has been written to disk. Drop all staged edits?" })
+    if (!confirmed) return reviewChangesScreen(api, state)
+    state.pending = []
+    const updated = await refreshStudio(api, state)
+    Object.assign(state, updated)
+    return mainMenu(api, state)
+  }
+  if (picked.startsWith("view:")) {
+    const id = Number(picked.slice("view:".length))
+    const change = state.pending.find((item) => item.id === id)
+    if (change) return stagedChangeDetail(api, state, change)
+    return reviewChangesScreen(api, state)
+  }
+  return mainMenu(api, state)
+}
+
+async function stagedChangeDetail(api: TuiPluginApi, state: StudioState, change: StagedChange): Promise<void> {
+  const sections: PagedSection[] = change.ops.map((op) => {
+    const old = diskDataAt(state, change.targetPath, op.path)
+    const isNew = old === undefined
+    return {
+      title: truncate(op.path[op.path.length - 1] !== undefined ? String(op.path[op.path.length - 1]) : formatPath(op.path), 18),
+      lines: [
+        `${op.op === "set" ? "Set" : "Delete"} ${formatPath(op.path)}`,
+        `File: ${change.targetPath}`,
+        `Reason: ${change.reason}`,
+        "",
+        op.op === "set"
+          ? isNew ? "New value (key does not exist on disk yet):" : "Old value (disk):"
+          : "Value being deleted (disk):",
+        ...prettyJSON(old).split(/\r?\n/).map((line) => `  ${line}`),
+        ...(op.op === "set" ? ["", "New value (staged):", ...prettyJSON(op.value).split(/\r?\n/).map((line) => `  ${line}`)] : []),
+      ],
+    }
+  })
+  await showPagedInfo(api, { title: `Staged: ${change.reason}`, sections })
+  const action = await showMenu(api, {
+    title: `Staged change - ${change.reason}`,
+    options: [
+      { title: "Discard this change", value: "discard", danger: true, description: "Remove from the queue" },
+      { title: "< Back", value: "__back__", description: "Return to staged changes" },
+    ],
+  })
+  if (action === "discard") {
+    state.pending = state.pending.filter((item) => item.id !== change.id)
+    const updated = await refreshStudio(api, state)
+    Object.assign(state, updated)
+    api.ui.toast({ variant: "info", title: "Staged change discarded", message: change.reason })
+    return reviewChangesScreen(api, state)
+  }
+  return reviewChangesScreen(api, state)
+}
+
+async function saveAndExit(api: TuiPluginApi, state: StudioState): Promise<void> {
+  if (state.pending.length === 0) return
+  const confirmed = await showConfirm(api.ui, {
+    title: "Save staged changes",
+    message: `Write ${state.pending.length} staged change(s) to ${new Set(state.pending.map((change) => change.targetPath)).size} file(s)?\nEach write creates a backup first.`,
+    confirmLabel: "Save & reload",
+  })
+  if (!confirmed) return mainMenu(api, state)
+  const result = await saveStagedChanges(api, state)
+  if (result.failed) {
+    await showAlert(api.ui, {
+      title: "Save failed",
+      message: [
+        `Failed writing ${result.failed.change.targetPath}:`,
+        result.failed.error,
+        "",
+        `${result.saved} file(s) saved before the failure. Remaining changes stay staged.`,
+      ].join("\n"),
+    })
+    return mainMenu(api, state)
+  }
+  api.ui.toast({ variant: "success", title: "Config saved", message: `${result.saved} file(s) written` })
+  // Summary dialog BEFORE the config reload: dispose reloads plugins and
+  // would tear this dialog down mid-display otherwise.
+  await showInfo(api, {
+    title: "Saved",
+    message: [
+      `Wrote staged changes to ${result.saved} file(s).`,
+      "",
+      "OpenCode config reloads now; running sessions keep their previous settings.",
+      "Restart OpenCode if anything looks stale.",
+    ].join("\n"),
+  })
+  await reloadOpenCode(api)
 }
 
 function overviewText(): string {
@@ -1550,23 +1910,22 @@ async function captureFlow(api: TuiPluginApi, state: StudioState, analysis: Mode
     const defaultBody = defaultResult.requests[0]?.body
     const variantBody = variantResult!.requests[0]?.body
     const diff = diffBodies(defaultBody, variantBody)
-    const lines: string[] = [
-      `A/B diff - default vs variant ${variantPick} on ${analysis.providerID}/${analysis.modelID}`,
-      "",
-      "Default body:",
-      prettyJSON(defaultBody),
-      "",
-      `Variant ${variantPick} body:`,
-      prettyJSON(variantBody),
-      "",
-      diff.length === 0 ? "The two requests send identical bodies." : `Differences (${diff.length}):`,
+    const sections: PagedSection[] = [
+      {
+        title: "Differences",
+        lines:
+          diff.length === 0
+            ? ["The two requests send identical bodies."]
+            : [`Differences (${diff.length}):`, ...diff.flatMap((entry) => [
+                `  ${entry.pointer}:`,
+                `    default: ${truncate(formatValue(entry.a), 90)}`,
+                `    ${variantPick}: ${truncate(formatValue(entry.b), 90)}`,
+              ])],
+      },
+      { title: "Default body", lines: prettyJSON(defaultBody).split(/\r?\n/) },
+      { title: `Variant ${variantPick}`, lines: prettyJSON(variantBody).split(/\r?\n/) },
     ]
-    for (const entry of diff) {
-      lines.push(`  ${entry.pointer}:`)
-      lines.push(`    default: ${truncate(formatValue(entry.a), 90)}`)
-      lines.push(`    ${variantPick}: ${truncate(formatValue(entry.b), 90)}`)
-    }
-    await showInfo(api, { title: `A/B diff - ${variantPick}`, message: lines.join("\n") })
+    await showPagedInfo(api, { title: `A/B diff - default vs ${variantPick}`, sections })
     return modelDetail(api, state, analysis.providerID, analysis.modelID)
   }
 
@@ -1584,6 +1943,132 @@ function captureTargetFor(analysis: ModelAnalysis, provider: RuntimeProviderLike
     providerNpm: npm,
     variant,
   }
+}
+
+// ---------------------------------------------------------------------------
+// Capture viewer (sectioned, toggleable, persisted)
+// ---------------------------------------------------------------------------
+
+type CaptureView = {
+  label: string
+  url: string
+  kind: string
+  streamed: boolean
+  body: unknown
+  bodyText?: string
+}
+
+function captureSections(view: CaptureView): PagedSection[] {
+  let source: unknown = view.body
+  if (source === undefined && view.bodyText !== undefined) {
+    try {
+      source = JSON.parse(view.bodyText)
+    } catch {
+      source = undefined
+    }
+  }
+  if (!isPlainObject(source)) {
+    return [{ title: "Body", lines: prettyJSON(source ?? view.bodyText ?? "").split(/\r?\n/) }]
+  }
+  const params: string[] = []
+  const sections: PagedSection[] = []
+  for (const [key, value] of Object.entries(source)) {
+    if (isPlainObject(value) || Array.isArray(value)) {
+      const text = prettyJSON(value)
+      const count = Array.isArray(value) ? value.length : Object.keys(value).length
+      sections.push({
+        title: key,
+        lines: [`${key} - ${count} ${Array.isArray(value) ? "item" : "key"}${count === 1 ? "" : "s"}`, ...text.split(/\r?\n/)],
+      })
+    } else {
+      params.push(`${key}: ${formatValue(value)}`)
+    }
+  }
+  if (params.length > 0) sections.unshift({ title: "Parameters", lines: params })
+  return sections
+}
+
+async function captureViewerScreen(api: TuiPluginApi, view: CaptureView, background: CaptureView[]): Promise<void> {
+  const dataDir = studioDataDir(api)
+  const settings = loadSettings(dataDir)
+  while (true) {
+    const hidden = new Set(settings.capture.hiddenSections)
+    const sections = captureSections(view)
+    const toggleable = sections.filter((section) => section.title !== "Parameters")
+    const options: WizardSelectOption<string>[] = [
+      {
+        title: "View captured body",
+        value: "__view__",
+        description: `${sections.filter((section) => !hidden.has(section.title)).length}/${sections.length} section(s) shown`,
+        help: "Shows parameters plus every section not hidden. Heavy sections (messages, tools) are hidden by default so the body stays readable.",
+      },
+      ...toggleable.map((section) => ({
+        title: `${hidden.has(section.title) ? "Show" : "Hide"}: ${section.title}`,
+        value: `toggle:${section.title}`,
+        description: hidden.has(section.title) ? "hidden - enable for this and future captures" : "shown - hide for this and future captures",
+        help: `Toggles the ${section.title} section of captured request bodies. The setting is stored in ${settingsPath(dataDir)} and applies to all capture views.`,
+      })),
+      {
+        title: "Reset sections to defaults",
+        value: "__reset__",
+        description: "Unhide everything, then apply default hidden sections",
+        help: "Restores the default hidden-section list (messages, tools, and other large payloads stay hidden).",
+      },
+      ...(background.length > 0
+        ? [{
+            title: `Background requests (${background.length})`,
+            value: "__bg__",
+            description: "Small-model requests (titles, summaries)",
+            help: "OpenCode fires extra requests with the small model for session titles and similar background work. Inspect what they send.",
+          }]
+        : []),
+      { title: "< Done", value: "__done__", description: "Return" },
+    ]
+    const picked = await showMenu(api, { title: `Captured request - ${view.label}`, options })
+    if (!picked || picked === "__done__") return
+    if (picked === "__view__") {
+      const visible = sections.filter((section) => !hidden.has(section.title))
+      await showPagedInfo(api, {
+        title: `${view.label} - ${view.kind} ${view.streamed ? "streamed" : "non-streamed"}`,
+        sections: [
+          { title: "Request", lines: [`POST ${view.url}`] },
+          ...visible,
+        ],
+      })
+      continue
+    }
+    if (picked === "__reset__") {
+      settings.capture.hiddenSections = [...DEFAULT_HIDDEN_SECTIONS]
+      saveSettings(dataDir, settings)
+      continue
+    }
+    if (picked === "__bg__") {
+      await backgroundViewer(api, background)
+      continue
+    }
+    if (picked.startsWith("toggle:")) {
+      const name = picked.slice("toggle:".length)
+      const set = new Set(settings.capture.hiddenSections)
+      if (set.has(name)) set.delete(name)
+      else set.add(name)
+      settings.capture.hiddenSections = [...set]
+      saveSettings(dataDir, settings)
+      continue
+    }
+  }
+}
+
+async function backgroundViewer(api: TuiPluginApi, background: CaptureView[]): Promise<void> {
+  const sections: PagedSection[] = background.map((request, index) => ({
+    title: `BG ${index + 1}`,
+    lines: [
+      `Background request ${index + 1} - ${request.kind} ${request.streamed ? "streamed" : "non-streamed"}`,
+      `POST ${request.url}`,
+      "",
+      ...captureSections(request).filter((section) => section.title === "Parameters").flatMap((section) => section.lines),
+    ],
+  }))
+  await showPagedInfo(api, { title: `Background requests (${background.length})`, sections })
 }
 
 async function runAndShowCapture(api: TuiPluginApi, analysis: ModelAnalysis, provider: RuntimeProviderLike, variant: string | undefined): Promise<void> {
@@ -1604,23 +2089,19 @@ async function runAndShowCapture(api: TuiPluginApi, analysis: ModelAnalysis, pro
     })
     return
   }
+  const toView = (request: NonNullable<typeof result>["requests"][number], index: number): CaptureView => ({
+    label: index === 0
+      ? `${variant ? `Variant ${variant}` : "Default (no variant)"} on ${analysis.providerID}/${analysis.modelID}`
+      : `BG ${index}`,
+    url: request.url,
+    kind: request.kind,
+    streamed: request.streamed,
+    body: request.body,
+    bodyText: request.bodyText,
+  })
   const primary = result.requests[0]!
-  const background = result.requests.slice(1)
-  const lines: string[] = [
-    `${variant ? `Variant ${variant}` : "Default (no variant)"} on ${analysis.providerID}/${analysis.modelID}`,
-    `Captured ${result.requests.length} request(s) in ${result.durationMs}ms - ${primary.kind} shape, ${primary.streamed ? "streamed" : "non-streamed"}`,
-    "",
-    `POST ${primary.url}`,
-    "Body:",
-    prettyJSON(primary.body ?? primary.bodyText),
-  ]
-  if (background.length > 0) {
-    lines.push("", `Background requests (small-model titles etc.): ${background.length}`)
-    for (const request of background.slice(0, 3)) {
-      lines.push(`- POST ${request.url}: ${truncate(prettyJSON(request.body ?? request.bodyText), 160)}`)
-    }
-  }
-  await showInfo(api, { title: `Captured request - ${variant ?? "default"}`, message: lines.join("\n") })
+  const background = result.requests.slice(1).map((request, index) => toView(request, index + 1))
+  await captureViewerScreen(api, toView(primary, 0), background)
 }
 
 // ---------------------------------------------------------------------------
@@ -2059,33 +2540,38 @@ async function diagnosticsScreen(api: TuiPluginApi, state: StudioState): Promise
   const resolved = safeStateConfig(api)
   const uneditable = findUneditableLayers(state.merge.merged, resolved)
   const parseErrors = state.files.filter((file) => file.parseErrors.length > 0)
-  const lines: string[] = [
-    "Merge report:",
-    `  layers discovered: ${state.files.length}`,
-    `  editable (exist + parse ok): ${editableFiles(state.files).length}`,
-    `  provider catalog source: ${state.providersSource}`,
-    `  models.dev metadata: ${state.modelsDevError ? `error - ${state.modelsDevError}` : `${Object.keys(state.modelsDev).length} providers`}`,
-    "",
+  const mergeLines = [
+    `layers discovered: ${state.files.length}`,
+    `editable (exist + parse ok): ${editableFiles(state.files).length}`,
+    `provider catalog source: ${state.providersSource}`,
+    `models.dev metadata: ${state.modelsDevError ? `error - ${state.modelsDevError}` : `${Object.keys(state.modelsDev).length} providers`}`,
+    `write target: ${state.targetFilePath ?? "(picked per edit)"}`,
+    `staged changes: ${state.pending.length}`,
+  ]
+  const sections: PagedSection[] = [
+    { title: "Merge report", lines: mergeLines },
   ]
   if (parseErrors.length > 0) {
-    lines.push("Parse errors (editing blocked for these files):")
-    for (const file of parseErrors) {
-      lines.push(`  ${file.kind}:${file.label} - ${file.parseErrors[0]}`)
-    }
-    lines.push("")
+    sections.push({
+      title: "Parse errors",
+      lines: [
+        "Editing is blocked for these files until the syntax error is fixed:",
+        ...parseErrors.flatMap((file) => [`  ${file.kind}:${file.label} - ${file.parseErrors[0]}`]),
+      ],
+    })
   }
   if (uneditable.length > 0) {
-    lines.push(`Values from non-file layers (${uneditable.length}, first 15):`)
-    lines.push("  These come from env content, remote, or managed config and cannot be edited here.")
-    for (const finding of uneditable.slice(0, 15)) {
-      lines.push(`  ${finding.pointer} = ${truncate(formatValue(finding.resolvedValue), 60)}`)
-    }
+    sections.push({
+      title: "Non-file layers",
+      lines: [
+        `${uneditable.length} value(s) come from env content, remote, or managed config and cannot be edited here:`,
+        ...uneditable.slice(0, 40).map((finding) => `  ${finding.pointer} = ${truncate(formatValue(finding.resolvedValue), 60)}`),
+      ],
+    })
   } else {
-    lines.push("No values detected from non-file layers.")
+    sections.push({ title: "Non-file layers", lines: ["No values detected from non-file layers."] })
   }
-  lines.push("")
-  lines.push("Write target: " + (state.targetFilePath ?? "(picked per edit)"))
-  await showInfo(api, { title: "Diagnostics", message: lines.join("\n") })
+  await showPagedInfo(api, { title: "Diagnostics", sections })
   return mainMenu(api, state)
 }
 

@@ -31,6 +31,7 @@ const required = [
   "dist/selfwire.js",
   "dist/server.js",
   "dist/search.js",
+  "dist/settings.js",
   "src/tui.tsx",
   "src/jsonc.ts",
   "src/discovery.ts",
@@ -40,6 +41,7 @@ const required = [
   "src/selfwire.ts",
   "src/server.ts",
   "src/search.ts",
+  "src/settings.ts",
   "tsconfig.json",
 ]
 

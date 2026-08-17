@@ -342,6 +342,67 @@ export function formatPath(path: JSONPath): string {
     .join("")
 }
 
+/** Reads a JSON pointer from parsed data (no text round-trip). */
+export function getAtPath(data: unknown, path: JSONPath): unknown {
+  let current: unknown = data
+  for (const segment of path) {
+    if (typeof segment === "number") {
+      if (!Array.isArray(current)) return undefined
+      current = current[segment]
+      continue
+    }
+    if (!isPlainObject(current)) return undefined
+    current = current[segment]
+  }
+  return current
+}
+
+/** Applies EditOps to parsed data, returning a new tree (staged-save overlay). */
+export function applyOpsToData<T>(data: T, ops: EditOp[]): T {
+  const root = deepClone(data) as Record<string, unknown> | unknown
+  if (!isPlainObject(root)) return root as T
+  for (const op of ops) {
+    if (op.path.length === 0) continue
+    const last = op.path[op.path.length - 1]!
+    if (typeof last === "number") {
+      const container = getAtPath(root, op.path.slice(0, -1))
+      if (!Array.isArray(container)) continue
+      if (op.op === "set") container[last] = deepClone(op.value)
+      else container.splice(last, 1)
+      continue
+    }
+    if (op.op === "set") {
+      // Ensure intermediate containers exist (mirrors jsonc modify on text).
+      let current: Record<string, unknown> = root
+      let ok = true
+      for (const segment of op.path.slice(0, -1)) {
+        if (typeof segment === "number") {
+          ok = false
+          break
+        }
+        const next = current[segment]
+        if (isPlainObject(next)) {
+          current = next
+          continue
+        }
+        if (next === undefined || next === null) {
+          const created: Record<string, unknown> = {}
+          current[segment] = created
+          current = created
+          continue
+        }
+        ok = false
+        break
+      }
+      if (ok) current[last] = deepClone(op.value)
+      continue
+    }
+    const container = getAtPath(root, op.path.slice(0, -1))
+    if (isPlainObject(container)) delete container[last]
+  }
+  return root as T
+}
+
 export function stableStringify(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`
   if (value && typeof value === "object") {

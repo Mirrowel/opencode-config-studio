@@ -17,6 +17,8 @@ const { deriveVariantsFromMeta, reasoningEffortBody, reasoningBudgetBody, comput
 const { diffBodies, buildInlineConfig } = await import(dist("sink"))
 const { isOwnSpec, ensureTuiRegistration, ourRootDir, PLUGIN_NPM_NAME } = await import(dist("selfwire"))
 const { fuzzyScore, rankOptions } = await import(dist("search"))
+const { loadSettings, saveSettings, settingsPath, moduleEnabled, setModuleEnabled, setModuleOption, moduleOption, DEFAULT_HIDDEN_SECTIONS } = await import(dist("settings"))
+const { applyOpsToData, getAtPath } = await import(dist("jsonc"))
 
 function assert(condition, message) {
   if (!condition) throw new Error(`assert failed: ${message}`)
@@ -492,6 +494,65 @@ function section(name) {
   const options = [{ title: "GLM-5.2", value: "a", category: "Z.AI" }]
   if (rankOptions(options, "glm")[0]?.value !== "a") throw new Error("lowercase query vs uppercase title failed")
   if (rankOptions(options, "z.ai")[0]?.value !== "a") throw new Error("category case-insensitive failed")
+}
+
+// ---------------------------------------------------------------------------
+// settings
+// ---------------------------------------------------------------------------
+
+{
+  section("settings: defaults, persistence, module toggles")
+  const dir = mkdtempSync(path.join(tmpdir(), "config-studio-test-"))
+  try {
+    const initial = loadSettings(dir)
+    assert(JSON.stringify(initial.capture.hiddenSections) === JSON.stringify(DEFAULT_HIDDEN_SECTIONS), "default hidden sections should match")
+    assert(moduleEnabled(initial, "agent-variants"), "modules default to enabled")
+
+    initial.capture.hiddenSections = ["messages"]
+    setModuleEnabled(dir, initial, "agent-variants", false)
+    setModuleOption(dir, initial, "agent-variants", "ownMenu", true)
+    assert(existsSync(settingsPath(dir)), "settings file should be written")
+
+    const reloaded = loadSettings(dir)
+    assert(JSON.stringify(reloaded.capture.hiddenSections) === JSON.stringify(["messages"]), "capture settings should persist")
+    assert(!moduleEnabled(reloaded, "agent-variants"), "disabled module should stay disabled")
+    assert(moduleOption(reloaded, "agent-variants", "ownMenu", false) === true, "module option should persist")
+    assert(moduleOption(reloaded, "agent-variants", "missing", "fallback") === "fallback", "missing option should fall back")
+    assert(moduleEnabled(reloaded, "unknown-module"), "unknown modules default to enabled")
+
+    writeFileSync(settingsPath(dir), "{ broken json !!!", "utf8")
+    const corrupt = loadSettings(dir)
+    assert(JSON.stringify(corrupt.capture.hiddenSections) === JSON.stringify(DEFAULT_HIDDEN_SECTIONS), "corrupt settings fall back to defaults")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// jsonc: applyOpsToData + getAtPath (staged-save overlay)
+// ---------------------------------------------------------------------------
+
+{
+  section("jsonc: applyOpsToData and getAtPath")
+  const data = { provider: { zai: { models: { "glm-5.2": { options: { temperature: 0.2 } } } } }, model: "a/b" }
+  const overlay = applyOpsToData(data, [
+    { op: "set", path: ["provider", "zai", "models", "glm-5.2", "options", "reasoningEffort"], value: "high" },
+    { op: "delete", path: ["model"] },
+  ])
+  assert(overlay.provider.zai.models["glm-5.2"].options.reasoningEffort === "high", "set op should apply")
+  assert(overlay.model === undefined, "delete op should apply")
+  assert(data.model === "a/b" && data.provider.zai.models["glm-5.2"].options.reasoningEffort === undefined, "source data must not be mutated")
+  assert(getAtPath(overlay, ["provider", "zai", "models", "glm-5.2", "options", "temperature"]) === 0.2, "getAtPath should read nested values")
+  assert(getAtPath(overlay, ["provider", "nope"]) === undefined, "getAtPath missing key = undefined")
+
+  const created = applyOpsToData({}, [{ op: "set", path: ["agent", "build", "temperature"], value: 0.7 }])
+  assert(created.agent.build.temperature === 0.7, "set should create intermediate objects")
+
+  const arr = applyOpsToData({ plugin: ["a", "b"] }, [{ op: "set", path: ["plugin", 2], value: "c" }])
+  assert(JSON.stringify(arr.plugin) === JSON.stringify(["a", "b", "c"]), "array index set should append")
+
+  const removed = applyOpsToData({ plugin: ["a", "b"] }, [{ op: "delete", path: ["plugin", 0] }])
+  assert(JSON.stringify(removed.plugin) === JSON.stringify(["b"]), "array index delete should splice")
 }
 
 console.log("all unit tests passed")
