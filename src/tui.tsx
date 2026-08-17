@@ -251,6 +251,8 @@ type UI = TuiPluginApi["ui"]
 const DEBOUNCE_THRESHOLD = 100
 /** How long the filter input must settle before the query runs once. */
 const DEBOUNCE_MS = 1200
+/** Clearing the input swaps back to the full list sooner, but still settled. */
+const CLEAR_DEBOUNCE_MS = 350
 
 function showSelect<Value>(
   ui: UI,
@@ -304,14 +306,13 @@ function showSelect<Value>(
                 if (query === lastQuery) return
                 lastQuery = query
                 if (timer) clearTimeout(timer)
-                if (query.trim() === "") {
-                  applyQuery(query)
-                  return
-                }
-                timer = setTimeout(() => {
-                  timer = undefined
-                  applyQuery(query)
-                }, DEBOUNCE_MS)
+                timer = setTimeout(
+                  () => {
+                    timer = undefined
+                    applyQuery(query)
+                  },
+                  query.trim() === "" ? CLEAR_DEBOUNCE_MS : DEBOUNCE_MS,
+                )
               },
             }
           : {}),
