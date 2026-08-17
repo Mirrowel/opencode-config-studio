@@ -1,0 +1,43 @@
+name: npm OIDC probe 2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  probe:
+    name: Auth-only publish probe
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      - name: Versions
+        run: node --version && npm --version
+
+      - name: Auth-only publish probe
+        run: |
+          set +e
+          OUTPUT="$(npm publish --ignore-scripts --provenance --access public --tag dev --loglevel verbose 2>&1)"
+          STATUS=$?
+          echo "$OUTPUT" | grep -iE 'oidc|provenance|ENEEDAUTH|E403|E409|EPUBLISHCONFLICT|auth|registry' | grep -vE 'npm verb (adduser|login)' | tail -30
+          echo "---"
+          echo "exit status: $STATUS"
+          echo "EPUBLISHCONFLICT/E409 = trusted publisher auth OK"
+          echo "ENEEDAUTH/E403 = auth still failing"
+
+      - name: Never fail the workflow
+        if: always()
+        run: exit 0
