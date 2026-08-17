@@ -1391,6 +1391,8 @@ function setModuleEnabledInSettings(api: TuiPluginApi, dataDir: string, id: stri
 
 let studioSettings: StudioSettings = loadSettingsDefaultPlaceholder()
 let duplicateCheckDone = false
+/** Startup duplicate-check delay: lets the initial TUI render settle first. */
+const STARTUP_CHECK_DELAY_MS = 1500
 
 function loadSettingsDefaultPlaceholder(): StudioSettings {
   // Replaced at command start; safe default before that.
@@ -2959,6 +2961,18 @@ const tui: TuiPlugin = async (api) => {
       })),
     }),
   )
+  studioSettings = loadSettings(studioDataDir(api))
+
+  // Startup duplicate check: the TUI entry runs at OpenCode startup, so this
+  // shows the same interactive removal dialog the studio command uses, without
+  // the user having to open the studio first. Delayed briefly so the initial
+  // TUI render settles; opening the studio re-checks (duplicateCheckDone is
+  // reset per command run), which is fine - users should be warned twice
+  // rather than never.
+  const startupCheckTimer = setTimeout(() => {
+    void checkStandaloneDuplicates(api).catch(() => {})
+  }, STARTUP_CHECK_DELAY_MS)
+  ;(startupCheckTimer as { unref?: () => void }).unref?.()
 
   const unregister = registerStudioCommand(api, async () => {
     studioSettings = loadSettings(studioDataDir(api))
@@ -2972,6 +2986,7 @@ const tui: TuiPlugin = async (api) => {
   })
 
   api.lifecycle.onDispose(() => {
+    clearTimeout(startupCheckTimer)
     unregister?.()
   })
 }

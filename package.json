@@ -58,7 +58,7 @@
     "build:tui": "bun scripts/build-tui.mjs",
     "typecheck": "tsc --noEmit",
     "check:deps": "node scripts/check-deps.mjs",
-    "ci:package": "npm run typecheck && npm run build && npm run test:unit && npm run test:tui-reactivity && npm run pack:dry-run && npm run test:tui-package",
+    "ci:package": "npm run typecheck && npm run build && npm run test:unit && npm run test:tui-reactivity && npm run test:tui-startup && npm run pack:dry-run && npm run test:tui-package",
     "ci": "npm run release:intent:check && node scripts/check-deps.mjs && npm run ci:package",
     "commit:check": "npm run ci",
     "hooks:install": "node scripts/install-git-hooks.mjs",
@@ -67,6 +67,7 @@
     "release:intent:check": "node scripts/check-release-intent.mjs",
     "test:unit": "node scripts/unit-tests.mjs",
     "test:tui-reactivity": "bun --conditions=browser scripts/tui-reactivity-smoke.mjs",
+    "test:tui-startup": "bun --conditions=browser scripts/tui-startup-smoke.mjs silent && bun --conditions=browser scripts/tui-startup-smoke.mjs duplicate",
     "test:tui-package": "node scripts/tui-package-smoke.mjs",
     "prepublishOnly": "npm run typecheck && npm run build"
   },
