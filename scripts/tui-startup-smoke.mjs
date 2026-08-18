@@ -51,11 +51,10 @@ function makeMockApi(globalDir) {
       toast: () => {},
       dialog: {
         setSize: () => {},
-        replace: (render) => {
+        replace: (render, onCancel) => {
           dialogCalls.push(render)
-          const element = render()
-          const props = element?.__confirmProps ?? confirmProps
-          if (props?.onCancel) setTimeout(() => props.onCancel(), 10)
+          render()
+          setTimeout(() => onCancel?.(), 10)
         },
         clear: () => {},
       },

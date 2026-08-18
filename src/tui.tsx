@@ -45,7 +45,8 @@ import { CLEANUP_RULES, TUI_KEYS, keybindGroupsMatching, toolsToPermission, type
 import { fieldEditor as kitFieldEditor, permissionEditor as kitPermissionEditor, providerEntryScreen, providerModelsScreen, settingsGroupDirect as kitDrillSettingsGroup, settingsFieldDirect as kitDrillSettings, settingsScreen as kitSettingsScreen, type EditorKit } from "./editors.js"
 import { providerCacheKey, getCachedProviders, setCachedProviders, providerCacheState, detectOutsideChanges, type OutsideChange } from "./providercache.js"
 import { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } from "./migration.js"
-import { DEFAULT_HIDDEN_SECTIONS, loadSettings, saveSettings, settingsPath, PINNABLE_SCREENS, screenTitle, type StudioSettings } from "./settings.js"
+import { DEFAULT_HIDDEN_SECTIONS, loadSettings, moduleOption, saveSettings, setModuleOption, settingsPath, PINNABLE_SCREENS, screenTitle, type StudioSettings } from "./settings.js"
+import { avOrigin, refreshAvSource } from "./av-source.js"
 import { enabledModules, moduleUsesOwnMenu, getModules, type ModuleContext } from "./modules.js"
 import { agentVariantsModuleId, setModulePickImplementation } from "./modules/agent-variants.js"
 import { findStandaloneAgentVariants, removeStandaloneHits } from "./standalone.js"
@@ -2487,10 +2488,12 @@ async function modulesScreen(api: TuiPluginApi, state: StudioState): Promise<voi
       options: [
         { title: "Toggle enabled", value: "enabled", description: "Show/hide this module everywhere" },
         { title: `Toggle ${module.ownMenuOption.title}`, value: "layout", description: studioSettings.modules.options[module.id]?.[module.ownMenuOption.key] === true ? "currently: own menu" : "currently: integrated" },
+        ...(module.id === "agent-variants" ? [{ title: "Source & channel", value: "source", description: `${moduleOption<"embedded" | "standalone">(studioSettings, "agent-variants", "source", "embedded")} - ${avOrigin()}`, help: "Use the standalone agent-variants install (any channel) or the studio's bundled copy, and pin the standalone channel (@latest/@dev/exact)." } satisfies WizardSelectOption<string>] : []),
         { title: "< Back", value: "__back__", description: "Return to modules" },
       ],
     })
     if (!choice || choice === "__back__") return modulesScreen(api, state)
+    if (choice === "source") return agentVariantsSourceScreen(api, state)
     if (choice === "enabled") {
       const nowEnabled = studioSettings.modules.enabled[module.id] !== false || studioSettings.modules.enabled[module.id] === undefined
       setModuleEnabledInSettings(api, dataDir, module.id, !nowEnabled)
@@ -2519,6 +2522,147 @@ function setModuleEnabledInSettings(api: TuiPluginApi, dataDir: string, id: stri
     title: enabled ? "Module enabled" : "Module disabled",
     message: enabled ? "Its menus are back." : "Its menus disappear; server parts stop at the next restart.",
   })
+}
+
+/** Strongest editable file (last in precedence order) for new entries. */
+function strongestEditableFile(state: StudioState): { path: string; data: Record<string, unknown> } | undefined {
+  const editable = editableFiles(state.files)
+  return editable.length > 0 ? editable[editable.length - 1] : undefined
+}
+
+/** Plugin specs from every discovered file's plugin array (deduped, in order). */
+function allPluginSpecs(state: StudioState): string[] {
+  const specs: string[] = []
+  for (const file of state.files) {
+    const plugin = getAtPath(file.data, ["plugin"])
+    if (!Array.isArray(plugin)) continue
+    for (const entry of plugin) {
+      const spec = Array.isArray(entry) ? String(entry[0]) : String(entry)
+      if (spec && !specs.includes(spec)) specs.push(spec)
+    }
+  }
+  return specs
+}
+
+/** Re-resolves the AV implementation (embedded vs standalone) per command run. */
+async function refreshAgentVariantsSource(api: TuiPluginApi, state: StudioState): Promise<void> {
+  const source = moduleOption<"embedded" | "standalone">(studioSettings, "agent-variants", "source", "embedded")
+  const result = await refreshAvSource(source, allPluginSpecs(state))
+  if (!result.ok) {
+    api.ui.toast({ variant: "warning", title: "Agent Variants source", message: result.error ?? "Falling back to the embedded copy." })
+  }
+}
+
+/** Standalone agent-variants entries across files, with file + array index. */
+function standalonePluginEntries(state: StudioState): Array<{ file: string; index: number; spec: string; tuple: boolean }> {
+  const hits: Array<{ file: string; index: number; spec: string; tuple: boolean }> = []
+  for (const file of state.files) {
+    const plugin = getAtPath(file.data, ["plugin"])
+    if (!Array.isArray(plugin)) continue
+    plugin.forEach((entry, index) => {
+      const tuple = Array.isArray(entry)
+      const spec = String(tuple ? entry[0] : entry)
+      if (spec.includes("opencode-agent-variants") && !spec.includes("opencode-config-studio")) hits.push({ file: file.path, index, spec, tuple })
+    })
+  }
+  return hits
+}
+
+function avChannelOf(spec: string): string {
+  const at = spec.indexOf("@", 1)
+  return at === -1 ? "latest" : spec.slice(at + 1)
+}
+
+/**
+ * Agent Variants source + channel picker: embedded vs standalone, and (when
+ * standalone) which pinned channel the standalone spec uses. Channel changes
+ * stage a plugin-array edit through the normal review/save pipeline.
+ */
+async function agentVariantsSourceScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
+  const dataDir = studioDataDir(api)
+  while (true) {
+    const source = moduleOption<"embedded" | "standalone">(studioSettings, "agent-variants", "source", "embedded")
+    const hits = standalonePluginEntries(state)
+    const channelOptions: WizardSelectOption<string>[] = [
+      {
+        title: source === "standalone" ? "* Use standalone install" : "Use standalone install",
+        value: "standalone",
+        description: hits.length > 0 ? hits.map((hit) => `${hit.spec} (${fileLabel(state, hit.file)})`).join(", ") : "no standalone entry found yet",
+        help: "Loads the wizard from your standalone agent-variants plugin install instead of the studio's bundled copy - the studio then drives exactly the version you pinned. Requires a standalone plugin entry (added below or by installing the plugin).",
+      },
+      {
+        title: source === "embedded" ? "* Use embedded copy" : "Use embedded copy",
+        value: "embedded",
+        description: avOrigin(),
+        help: "Uses the agent-variants version bundled with this studio build (declared in package.json). Always available.",
+      },
+      { title: "Set standalone channel/version", value: "channel", description: hits.length > 0 ? `current: ${hits.map((hit) => avChannelOf(hit.spec)).join(", ")}` : "no standalone entry yet", help: "Pins the standalone plugin spec to @latest, @dev, or an exact version (e.g. 0.9.0-dev.1). Stages a plugin-array edit; takes effect after Save & exit + restart." },
+      { title: "Add standalone plugin entry", value: "add", description: "adds @mirrowel/opencode-agent-variants@dev", help: "Adds the standalone plugin to the strongest config file's plugin array so its channel can be managed here. Staged like any other edit." },
+      { title: "< Back", value: "__back__", description: "" },
+    ]
+    const picked = await showMenu(api, { title: "Agent Variants source", options: channelOptions })
+    if (!picked || picked === "__back__") return modulesScreen(api, state)
+    if (picked === "standalone" || picked === "embedded") {
+      setModuleOption(dataDir, studioSettings, "agent-variants", "source", picked)
+      await refreshAgentVariantsSource(api, state)
+      api.ui.toast({
+        variant: "info",
+        title: "Agent Variants source",
+        message: picked === "standalone" ? `Now using the standalone install (${avOrigin()}).` : "Now using the embedded copy.",
+      })
+      continue
+    }
+    if (picked === "channel") {
+      if (hits.length === 0) {
+        await showAlert(api.ui, { title: "No standalone entry", message: "Add the standalone plugin entry first (option below), then pick its channel." })
+        continue
+      }
+      const target = hits.length === 1 ? hits[0]! : await showMenu(api, {
+        title: "Which entry?",
+        options: [...hits.map((hit) => ({ title: hit.spec, value: String(hit.index), description: fileLabel(state, hit.file) })), { title: "< Cancel", value: "__cancel__", description: "" }],
+      })
+      if (!target || target === "__cancel__") continue
+      const hit = hits.find((item) => String(item.index) === target)!
+      const channel = await showMenu(api, {
+        title: `Channel for ${hit.spec}`,
+        options: [
+          { title: "latest (stable)", value: "latest", description: avChannelOf(hit.spec) === "latest" ? "current" : "" },
+          { title: "dev (prerelease)", value: "dev", description: avChannelOf(hit.spec) === "dev" ? "current" : "" },
+          { title: "Exact version...", value: "__exact__", description: "type e.g. 0.9.0-dev.1" },
+          { title: "< Cancel", value: "__cancel__", description: "" },
+        ],
+      })
+      if (!channel || channel === "__cancel__") continue
+      const nextChannel = channel === "__exact__" ? (await showPrompt(api.ui, { title: "Exact version", placeholder: "e.g. 0.9.0-dev.1" }))?.trim() : channel
+      if (!nextChannel) continue
+      const newSpec = `@mirrowel/opencode-agent-variants@${nextChannel}`
+      if (newSpec === hit.spec) continue
+      const write: WriteContext = { api, state }
+      const path: JSONPath = hit.tuple ? ["plugin", hit.index, 0] : ["plugin", hit.index]
+      const ok = await applyEdits(write, [{ op: "set", path, value: newSpec }], `agent-variants standalone channel -> @${nextChannel}`)
+      if (ok) {
+        api.ui.toast({ variant: "info", title: "Channel staged", message: `${newSpec} - review and Save & exit, then restart OpenCode to install the new version.` })
+        return modulesScreen(api, state)
+      }
+      continue
+    }
+    if (picked === "add") {
+      const write: WriteContext = { api, state }
+      const target = strongestEditableFile(state)
+      if (!target) {
+        await showAlert(api.ui, { title: "No editable file", message: "No editable config file was discovered." })
+        continue
+      }
+      const pluginArray = getAtPath(target.data, ["plugin"])
+      const ok = await applyEdits(write, [{ op: "set", path: pluginArray ? ["plugin", Array.isArray(pluginArray) ? pluginArray.length : 0] : ["plugin", 0], value: "@mirrowel/opencode-agent-variants@dev" }], "add agent-variants standalone entry")
+      if (ok) {
+        setModuleOption(dataDir, studioSettings, "agent-variants", "source", "standalone")
+        api.ui.toast({ variant: "info", title: "Standalone entry staged", message: `@mirrowel/opencode-agent-variants@dev added to ${fileLabel(state, target.path)} - Save & exit, then restart OpenCode.` })
+        return modulesScreen(api, state)
+      }
+      continue
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2557,6 +2701,9 @@ async function checkStandaloneDuplicates(api: TuiPluginApi): Promise<void> {
   duplicateCheckDone = true
   const moduleIdEnabled = studioSettings.modules.enabled[agentVariantsModuleId] !== false
   if (!moduleIdEnabled) return
+  // Standalone-source mode: the standalone install is intentional - it does
+  // the routing and feeds the studio its wizard. Nothing to clean up.
+  if (moduleOption<"embedded" | "standalone">(studioSettings, "agent-variants", "source", "embedded") === "standalone") return
   let hits: ReturnType<typeof findStandaloneAgentVariants> = []
   try {
     hits = findStandaloneAgentVariants({
@@ -2571,18 +2718,29 @@ async function checkStandaloneDuplicates(api: TuiPluginApi): Promise<void> {
   if (hits.length === 0) return
 
   const files = [...new Set(hits.map((hit) => hit.file))]
-  const remove = await showConfirm(api.ui, {
+  const choice = await showMenu(api, {
     title: "Standalone Agent Variants detected",
-    message: [
-      `${hits.length} standalone registration(s) found:`,
-      ...files.map((file) => `  - ${file}`),
-      "",
-      "Config Studio embeds Agent Variants. Keeping both would run the routing logic twice.",
-      "Remove the standalone registration(s)? Until you restart, the studio's embedded router stays dormant and the standalone plugin keeps handling routing.",
-    ].join("\n"),
-    confirmLabel: "Remove standalone",
+    options: [
+      { title: "Remove standalone", value: "remove", description: "embedded module takes over after restart", help: "Removes the standalone registration(s) from the config files. Until you restart, the studio's embedded router stays dormant and the standalone plugin keeps handling routing." },
+      { title: "Keep standalone, use it in the studio", value: "use", description: "standalone plugin routes + feeds the studio its wizard", help: "Sets the Agent Variants module source to the standalone install: the standalone plugin keeps handling routing, and the studio loads the wizard from its exact version (any channel you pin). No duplicate routing." },
+      { title: "Decide later", value: "later", description: "keep both; embedded router stays dormant", help: "Nothing changes now. The duplicate dialog returns at the next startup." },
+    ],
   })
-  if (!remove) return
+  if (choice === "use") {
+    setModuleOption(studioDataDir(api), studioSettings, "agent-variants", "source", "standalone")
+    await showInfo(api, {
+      title: "Standalone source enabled",
+      message: [
+        "Agent Variants module now uses your standalone install.",
+        "",
+        "The standalone plugin keeps handling routing; the studio loads its wizard",
+        "from the pinned version (manage the channel under Modules > Agent",
+        "Variants > Source & channel).",
+      ].join("\n"),
+    })
+    return
+  }
+  if (choice !== "remove") return
   const results = removeStandaloneHits(hits, studioDataDir(api))
   const failures = results.filter((result) => result.error)
   const removed = results.filter((result) => !result.error)
@@ -4376,6 +4534,7 @@ const tui: TuiPlugin = async (api) => {
     }
     if (busyDone) await busyDone
     if (!state) return
+    await refreshAgentVariantsSource(api, state)
     await mainMenu(api, state)
   })
 

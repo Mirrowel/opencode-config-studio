@@ -24,6 +24,7 @@ const cache = await import(dist("providercache"))
 const { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } = await import(dist("migration"))
 const palette = await import(dist("palette-category"))
 const keymeta = await import(dist("keymeta"))
+const { resolveStandaloneDirIn, avOrigin, avSourceKind } = await import(dist("av-source"))
 function assert(condition, message) {
   if (!condition) throw new Error(`assert failed: ${message}`)
 }
@@ -882,7 +883,33 @@ async function testCleanupScanner() {
   assert(clean.length === 0, "no false positives on a clean config")
 }
 
+async function testAvSource() {
+  const dir = mkdtempSync(path.join(tmpdir(), "av-source-"))
+  const family = path.join(dir, "@mirrowel")
+  mkdirSync(path.join(family, "opencode-agent-variants@dev"), { recursive: true })
+  mkdirSync(path.join(family, "opencode-agent-variants@latest"), { recursive: true })
+  mkdirSync(path.join(family, "opencode-agent-variants@0.9.0-dev.1"), { recursive: true })
+  mkdirSync(path.join(family, "unrelated-pkg@dev"), { recursive: true })
+  for (const name of ["opencode-agent-variants@dev", "opencode-agent-variants@latest", "opencode-agent-variants@0.9.0-dev.1"]) {
+    writeFileSync(path.join(family, name, "package.json"), JSON.stringify({ name: "@mirrowel/opencode-agent-variants", version: name.split("@").pop() }), "utf8")
+  }
+  const local = path.join(dir, "local-av")
+  mkdirSync(local, { recursive: true })
+  writeFileSync(path.join(local, "package.json"), JSON.stringify({ name: "@mirrowel/opencode-agent-variants", version: "file-local" }), "utf8")
+
+  assert(resolveStandaloneDirIn(dir, "@mirrowel/opencode-agent-variants@dev")?.endsWith("opencode-agent-variants@dev"), "exact @dev tag resolves")
+  assert(resolveStandaloneDirIn(dir, "@mirrowel/opencode-agent-variants@0.9.0-dev.1")?.endsWith("opencode-agent-variants@0.9.0-dev.1"), "exact version resolves")
+  assert(resolveStandaloneDirIn(dir, "@mirrowel/opencode-agent-variants")?.endsWith("opencode-agent-variants@latest"), "bare spec resolves @latest")
+  assert(resolveStandaloneDirIn(dir, "@mirrowel/opencode-agent-variants@beta")?.endsWith("opencode-agent-variants@dev"), "unknown tag falls back to @dev")
+  const fileSpec = pathToFileURL(local).href
+  assert(resolveStandaloneDirIn(dir, fileSpec) === local, "file:// spec resolves to its directory")
+  assert(resolveStandaloneDirIn(path.join(dir, "empty-cache"), "@mirrowel/opencode-agent-variants@dev") === undefined, "empty cache resolves nothing")
+  assert(avSourceKind() === "embedded", "studio starts on the embedded implementation")
+  assert(avOrigin().includes("embedded"), "origin reports embedded by default")
+}
+
 testKeyMeta()
+await testAvSource()
 
 async function testSuggestionsAndMetrics() {
   const { SDK_PACKAGES, PROVIDER_FIELDS, MODEL_FIELDS } = keymeta

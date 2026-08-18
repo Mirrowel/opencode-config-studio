@@ -16,32 +16,11 @@
  */
 
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
-import {
-  defaultSidecarPath,
-  diagnoseConfig,
-  loadSidecar,
-  saveSidecar,
-  type SidecarConfig,
-} from "@mirrowel/opencode-agent-variants/config"
-import {
-  addVariantFor,
-  agentModes,
-  clearDebugLog,
-  configBackupsMenu,
-  deleteVariantFor,
-  editParentFields,
-  editVariantFor,
-  generatedAliasSet,
-  manageModelPresets,
-  newWizardSettings,
-  pickParentAgent,
-  toggleEntryFor,
-  variantCount,
-  viewDebugLog,
-  wizardInfoText,
-  type WizardSettings,
-} from "@mirrowel/opencode-agent-variants/wizard"
+import type { SidecarConfig } from "@mirrowel/opencode-agent-variants/config"
+import type { WizardSettings } from "@mirrowel/opencode-agent-variants/wizard"
+import type * as EmbeddedWizard from "@mirrowel/opencode-agent-variants/wizard"
 import { registerModule, type ModuleContext, type StudioModule } from "../modules.js"
+import { av } from "../av-source.js"
 import { buildMigrationPlan, savableParentFields } from "../migration.js"
 
 /** Parent-patch fields that stay in the sidecar (config hosts the rest). */
@@ -51,13 +30,13 @@ let draft: SidecarConfig | undefined
 let wizardSettings: WizardSettings | undefined
 
 function ensureDraft(): SidecarConfig {
-  draft ??= loadSidecar(defaultSidecarPath())
-  wizardSettings ??= newWizardSettings(true)
+  draft ??= av().config.loadSidecar(av().config.defaultSidecarPath())
+  wizardSettings ??= av().wizard.newWizardSettings(true)
   return draft
 }
 
 function settingsOf(): WizardSettings {
-  wizardSettings ??= newWizardSettings(true)
+  wizardSettings ??= av().wizard.newWizardSettings(true)
   return wizardSettings
 }
 
@@ -67,7 +46,7 @@ function assign(next: SidecarConfig): void {
 
 function sidecarChanged(): boolean {
   if (!draft) return false
-  return JSON.stringify(draft) !== JSON.stringify(loadSidecar(defaultSidecarPath()))
+  return JSON.stringify(draft) !== JSON.stringify(av().config.loadSidecar(av().config.defaultSidecarPath()))
 }
 
 /** Agents the sidecar knows (parents with variants or parent overrides). */
@@ -141,11 +120,11 @@ async function variantsSubmenu(ctx: ModuleContext, agent: string): Promise<void>
       continue
     }
     if (picked === "__parent_toggle__") {
-      assign(await toggleEntryFor(avApi(ctx.api), config, settingsOf(), { agent }))
+      assign(await av().wizard.toggleEntryFor(avApi(ctx.api), config, settingsOf(), { agent }))
       continue
     }
     if (picked === "__add__") {
-      assign(await addVariantFor(avApi(ctx.api), config, settingsOf(), agent))
+      assign(await av().wizard.addVariantFor(avApi(ctx.api), config, settingsOf(), agent))
       continue
     }
     assign(await variantActions(ctx, agent, picked))
@@ -163,16 +142,16 @@ async function variantActions(ctx: ModuleContext, agent: string, key: string): P
   ]
   const picked = await ctxPick(ctx, { title: `${agent} / ${key}`, options })
   if (!picked || picked === "__back__") return config
-  if (picked === "edit") return editVariantFor(avApi(ctx.api), config, settingsOf(), agent, key)
-  if (picked === "toggle") return toggleEntryFor(avApi(ctx.api), config, settingsOf(), { agent, variant: key })
-  return deleteVariantFor(avApi(ctx.api), config, settingsOf(), agent, key)
+  if (picked === "edit") return av().wizard.editVariantFor(avApi(ctx.api), config, settingsOf(), agent, key)
+  if (picked === "toggle") return av().wizard.toggleEntryFor(avApi(ctx.api), config, settingsOf(), { agent, variant: key })
+  return av().wizard.deleteVariantFor(avApi(ctx.api), config, settingsOf(), agent, key)
 }
 
 // The wizard library is compiled inside the agent-variants package, whose
 // TuiPluginApi type may come from a different @opencode-ai/plugin copy than
 // the studio's (guaranteed identical shape). Derive the exact parameter type
 // from a wizard entry point and cast once at this boundary.
-type AVApi = Parameters<typeof pickParentAgent>[0]
+type AVApi = Parameters<typeof EmbeddedWizard.pickParentAgent>[0]
 
 function avApi(api: TuiPluginApi): AVApi {
   return api as unknown as AVApi
@@ -254,8 +233,8 @@ async function ownMenuSubmenu(ctx: ModuleContext): Promise<void> {
     if (!action || action === "__back__") return
 
     if (action === "add") {
-      const agent = await pickParentAgent(avApi(ctx.api), config, settingsOf(), "Add variant - pick parent agent")
-      if (agent) assign(await addVariantFor(avApi(ctx.api), ensureDraft(), settingsOf(), agent))
+      const agent = await av().wizard.pickParentAgent(avApi(ctx.api), config, settingsOf(), "Add variant - pick parent agent")
+      if (agent) assign(await av().wizard.addVariantFor(avApi(ctx.api), ensureDraft(), settingsOf(), agent))
       continue
     }
     if (action === "edit" || action === "delete") {
@@ -263,8 +242,8 @@ async function ownMenuSubmenu(ctx: ModuleContext): Promise<void> {
       if (!agent) continue
       const key = await pickVariantOf(ctx, agent, `${action} variant of "${agent}"`)
       if (!key) continue
-      if (action === "edit") assign(await editVariantFor(avApi(ctx.api), ensureDraft(), settingsOf(), agent, key))
-      else assign(await deleteVariantFor(avApi(ctx.api), ensureDraft(), settingsOf(), agent, key))
+      if (action === "edit") assign(await av().wizard.editVariantFor(avApi(ctx.api), ensureDraft(), settingsOf(), agent, key))
+      else assign(await av().wizard.deleteVariantFor(avApi(ctx.api), ensureDraft(), settingsOf(), agent, key))
       continue
     }
     if (action === "toggle") {
@@ -286,16 +265,16 @@ async function ownMenuSubmenu(ctx: ModuleContext): Promise<void> {
       const [kind, agent, key] = picked.split(":")
       void kind
       const target = key !== undefined ? { agent: agent!, variant: key } : { agent: agent! }
-      assign(await toggleEntryFor(avApi(ctx.api), config2, settingsOf(), target))
+      assign(await av().wizard.toggleEntryFor(avApi(ctx.api), config2, settingsOf(), target))
       continue
     }
     if (action === "parent") {
-      const agent = await pickParentAgent(avApi(ctx.api), config, settingsOf(), "Edit parent fields - pick agent")
-      if (agent) assign(await editParentFields(avApi(ctx.api), ensureDraft(), agent, settingsOf()))
+      const agent = await av().wizard.pickParentAgent(avApi(ctx.api), config, settingsOf(), "Edit parent fields - pick agent")
+      if (agent) assign(await av().wizard.editParentFields(avApi(ctx.api), ensureDraft(), agent, settingsOf()))
       continue
     }
     if (action === "presets") {
-      assign(await manageModelPresets(avApi(ctx.api), ensureDraft()))
+      assign(await av().wizard.manageModelPresets(avApi(ctx.api), ensureDraft()))
       continue
     }
   }
@@ -366,7 +345,7 @@ const agentVariantsModule: StudioModule = {
   hasPendingChanges: () => sidecarChanged(),
   mainMenuEntry: (ctx) => ({
     title: "Agent Variants",
-    description: `${variantCount(ensureDraft())} variant(s), ${sidecarAgents().length} agent(s)`,
+    description: `${av().wizard.variantCount(ensureDraft())} variant(s), ${sidecarAgents().length} agent(s)`,
     help: "Variant management in one menu: add/edit/toggle/delete variants, parent fields, presets. Saves stage into the studio queue - use the studio's Save & exit.",
     run: async (context) => {
       await ownMenuSubmenu(context)
@@ -381,7 +360,7 @@ const agentVariantsModule: StudioModule = {
         description: "Reusable model shortcuts",
         help: "Create reusable model presets (light, heavy, ...) that variant and parent fields can reference.",
         run: async (context) => {
-          assign(await manageModelPresets(avApi(context.api), ensureDraft()))
+          assign(await av().wizard.manageModelPresets(avApi(context.api), ensureDraft()))
         },
       },
     ]
@@ -416,20 +395,20 @@ const agentVariantsModule: StudioModule = {
       description: "Prepend/append prompt & description patches",
       help: "Agent Variants parent patches that stay sidecar-only: relative prompt/description prepend+append (config cannot express them).",
       run: async (context: ModuleContext) => {
-        assign(await editParentFields(avApi(context.api), ensureDraft(), agent, settingsOf(), SIDECAR_PARENT_FIELDS))
+        assign(await av().wizard.editParentFields(avApi(context.api), ensureDraft(), agent, settingsOf(), SIDECAR_PARENT_FIELDS))
       },
     })
     return entries
   },
   diagnosticsSections: async (ctx) => {
     const config = ensureDraft()
-    const generatedAliases = generatedAliasSet(config)
+    const generatedAliases = av().wizard.generatedAliasSet(config)
     const agents = agentsFromState(avApi(ctx.api)).filter((agent) => !generatedAliases.has(agent))
-    const diagnostics = diagnoseConfig(config, {
+    const diagnostics = av().config.diagnoseConfig(config, {
       agents,
       providers: avApi(ctx.api).state.provider,
       pluginEntries: avApi(ctx.api).state.config.plugin as unknown[] | undefined,
-      agentModes: agentModes(avApi(ctx.api)),
+      agentModes: av().wizard.agentModes(avApi(ctx.api)),
     })
     const errors = diagnostics.filter((item) => item.level === "error").length
     const warnings = diagnostics.filter((item) => item.level === "warning").length
@@ -446,9 +425,9 @@ const agentVariantsModule: StudioModule = {
       {
         title: "AV summary",
         lines: [
-          `sidecar: ${defaultSidecarPath()}`,
+          `sidecar: ${av().config.defaultSidecarPath()}`,
           `agents configured: ${Object.keys(config.agents).length}`,
-          `variants configured: ${variantCount(config)}`,
+          `variants configured: ${av().wizard.variantCount(config)}`,
           `debug mode: ${config.debug ? "enabled" : "disabled"}`,
           `prompt route markers: ${config.routing.prompt_markers ? "enabled" : "disabled"}`,
           `summary: ${errors} error(s), ${warnings} warning(s), ${infos} info`,
@@ -468,7 +447,7 @@ const agentVariantsModule: StudioModule = {
         : []),
     ]
   },
-  infoSections: () => [{ title: "Agent Variants", lines: wizardInfoText().split("\n") }],
+  infoSections: () => [{ title: "Agent Variants", lines: av().wizard.wizardInfoText().split("\n") }],
   advancedEntries: (ctx) => {
     void ctx
     const config = ensureDraft()
@@ -502,7 +481,7 @@ const agentVariantsModule: StudioModule = {
         description: "Recent agent-variants.debug.log entries",
         help: "Shows the tail of the debug log written while the sidecar debug flag is on.",
         run: async (context) => {
-          await viewDebugLog(avApi(context.api))
+          await av().wizard.viewDebugLog(avApi(context.api))
         },
       },
       {
@@ -510,7 +489,7 @@ const agentVariantsModule: StudioModule = {
         description: "Empty agent-variants.debug.log",
         help: "Clears the debug log file immediately (not staged).",
         run: async (context) => {
-          await clearDebugLog(avApi(context.api))
+          await av().wizard.clearDebugLog(avApi(context.api))
         },
       },
       {
@@ -518,7 +497,7 @@ const agentVariantsModule: StudioModule = {
         description: "Preview, restore, and snapshot the agent-variants config",
         help: "Browse the sidecar backup journal (reverse patches and full snapshots). Restoring replaces the staged draft.",
         run: async (context) => {
-          assign(await configBackupsMenu(avApi(context.api), ensureDraft()))
+          assign(await av().wizard.configBackupsMenu(avApi(context.api), ensureDraft()))
         },
       },
       {
@@ -534,7 +513,7 @@ const agentVariantsModule: StudioModule = {
   },
   pendingSummary: () => {
     if (!sidecarChanged() || !draft) return undefined
-    const disk = loadSidecar(defaultSidecarPath())
+    const disk = av().config.loadSidecar(av().config.defaultSidecarPath())
     const changedSections: string[] = []
     for (const key of ["agents", "models", "routing", "ui", "debug"] as const) {
       if (JSON.stringify(draft[key]) !== JSON.stringify(disk[key])) changedSections.push(key)
@@ -543,7 +522,7 @@ const agentVariantsModule: StudioModule = {
       title: "Agent Variants sidecar",
       lines: [
         `Changed sections: ${changedSections.join(", ") || "(unknown)"}`,
-        `Variants: ${variantCount(draft)} (disk: ${variantCount(disk)})`,
+        `Variants: ${av().wizard.variantCount(draft)} (disk: ${av().wizard.variantCount(disk)})`,
         ...settingsOf().restartReasons.map((reason) => `restart: ${reason}`),
       ],
       restartReasons: [...settingsOf().restartReasons],
@@ -551,14 +530,14 @@ const agentVariantsModule: StudioModule = {
   },
   save: async () => {
     if (!draft || !sidecarChanged()) return { restartReasons: [] }
-    saveSidecar(draft, defaultSidecarPath())
+    av().config.saveSidecar(draft, av().config.defaultSidecarPath())
     const restartReasons = [...new Set(settingsOf().restartReasons)]
-    wizardSettings = newWizardSettings(true)
+    wizardSettings = av().wizard.newWizardSettings(true)
     return { restartReasons }
   },
   discard: () => {
-    draft = loadSidecar(defaultSidecarPath())
-    wizardSettings = newWizardSettings(true)
+    draft = av().config.loadSidecar(av().config.defaultSidecarPath())
+    wizardSettings = av().wizard.newWizardSettings(true)
   },
 }
 
