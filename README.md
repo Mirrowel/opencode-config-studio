@@ -48,28 +48,19 @@ A few problems this exists to solve:
 
 ## What It Looks Like
 
-<!-- TODO screenshot: main menu — docs/screenshots/main-menu.png -->
 The main menu, with the Quick access section and staged-change counter:
+<img width="1065" height="485" alt="image" src="https://github.com/user-attachments/assets/da3e2834-43e5-49a7-93e3-975956d41312" />
 
-```txt
-┌ Config Studio ─────────────────────────────────────────┐
-│ Providers & models          14 provider(s), 2 edited   │
-│ Agents                      model, variant, params     │
-│ ─ main ─                                                │
-│ Settings                    All root config keys by…   │
-│ TUI settings                tui.json - theme, keys…    │
-│ Plugins                     Manage plugin entries      │
-│ Cleanup & migrations        Deprecated keys: detect…   │
-│ ...                                                     │
-│ Save & exit (3)             Review staged changes      │
-└─────────────────────────────────────────────────────────┘
-```
-
-<!-- TODO screenshot: model detail — docs/screenshots/model-detail.png -->
 A model's page shows its variants with source badges (catalog / config / hidden), the default-options view (base defaults ⊕ your overrides), which agents use it, and the capture actions:
 
-<!-- TODO screenshot: settings group — docs/screenshots/settings-group.png -->
+<img width="1060" height="352" alt="image" src="https://github.com/user-attachments/assets/1c857b5f-2669-4ad9-bace-86111c305da6" />
+<img width="1063" height="313" alt="image" src="https://github.com/user-attachments/assets/46319848-1562-4512-85e3-ef68f35a87aa" />
+<img width="1054" height="298" alt="image" src="https://github.com/user-attachments/assets/1b92a3df-4d32-4598-9b89-b297be7882d6" />
+<img width="1049" height="452" alt="image" src="https://github.com/user-attachments/assets/1e5e9d75-3d7a-43e7-b8e1-51dded3ab063" />
+
 Settings groups present every root key as a field row — current value, provenance, timing badge, `[i]` docs:
+
+<img width="1045" height="368" alt="image" src="https://github.com/user-attachments/assets/31765eb3-5768-457c-b44a-b0c74806cea2" />
 
 ## Editing Safety
 
@@ -87,7 +78,10 @@ The capture button spawns a temporary headless `opencode serve` in a temp direct
 - Heavy sections (`messages`, `tools`, ...) are collapsed by default; toggles persist.
 - **A/B mode** captures two configurations and diffs the bodies — the empirical answer to "what does this variant actually change?"
 
-<!-- TODO screenshot: capture diff — docs/screenshots/capture-diff.png -->
+<img width="717" height="152" alt="image" src="https://github.com/user-attachments/assets/56134c71-7c86-4fa4-b07c-ee3ea66cb09a" />
+<img width="1051" height="310" alt="image" src="https://github.com/user-attachments/assets/7777b63e-32b9-4aa9-9a5a-d99afe4b4dd1" />
+<img width="1041" height="702" alt="image" src="https://github.com/user-attachments/assets/5fd5744f-271f-47f5-b1b2-c00ea22c9e7b" />
+
 
 ## Fast Navigation
 
@@ -177,6 +171,12 @@ npm run ci:package   # typecheck + build + unit tests + menu-tree/startup/reacti
 The TUI is precompiled with OpenTUI's Solid transform (`npm run build:tui`) — raw TSX exports don't repaint reactively in npm-installed plugins.
 
 Developing against a local agent-variants checkout: `node scripts/dev-link.mjs link && npm install` (switch back with `unlink <version>`; releases refuse `file:` dependencies).
+
+## Additional Screenshots
+
+<img width="1056" height="323" alt="image" src="https://github.com/user-attachments/assets/4b1eb7f9-a9a7-4371-8714-1272f714ee71" />
+<img width="1051" height="366" alt="image" src="https://github.com/user-attachments/assets/ba05823f-b3a9-47af-889e-e20bc63a5b0c" />
+
 
 ## License
 
