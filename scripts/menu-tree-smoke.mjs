@@ -199,3 +199,39 @@ if (failures.length > 0) {
   process.exit(1)
 }
 console.log("menu-tree smoke passed")
+
+// Cleanup scanner checks (runs here because it lives in the TUI bundle).
+{
+  const scan = T.scanCleanupFindings
+  if (typeof scan !== "function") throw new Error("scanCleanupFindings not exported")
+  const fakeState = (data) => ({
+    files: [{ path: "C:/fake/opencode.json", data, exists: true, parseErrors: [] }],
+    tuiFiles: [],
+    markdownAgents: [],
+  })
+  const findings = scan(
+    fakeState({
+      mode: { reviewer: { prompt: "review" } },
+      tools: { bash: true, read: false },
+      autoshare: true,
+      reference: { docs: "owner/repo" },
+      layout: "auto",
+      logLevel: "INFO",
+      theme: "dracula",
+      agent: { general: { tools: { edit: true }, maxSteps: 40 } },
+    }),
+  )
+  const rules = findings.map((finding) => finding.rule)
+  for (const expected of ["mode", "tools", "autoshare", "reference", "layout", "logLevel", "tui-migrate", "agent.tools", "agent.maxSteps"]) {
+    if (!rules.includes(expected)) throw new Error(`cleanup finds ${expected} (got ${rules.join(",")})`)
+  }
+  const modeFinding = findings.find((finding) => finding.rule === "mode")
+  const modeSet = modeFinding.ops.find((op) => op.path.join(".") === "agent.reviewer")
+  if (!modeSet || modeSet.value.mode !== "primary") throw new Error("mode migration forces primary")
+  const toolsFinding = findings.find((finding) => finding.rule === "tools")
+  const permSet = toolsFinding.ops.find((op) => op.path.join(".") === "permission")
+  if (!permSet || permSet.value.bash !== "allow" || permSet.value.read !== "deny") throw new Error("tools migration converts actions")
+  const clean = scan(fakeState({ model: "zai-coding-plan/glm-5.2", share: "auto" }))
+  if (clean.length !== 0) throw new Error("no false positives on a clean config")
+  console.log("cleanup scanner checks passed")
+}

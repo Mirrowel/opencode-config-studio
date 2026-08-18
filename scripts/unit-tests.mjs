@@ -23,6 +23,7 @@ const { isStandaloneAgentVariantsSpec, findStandaloneAgentVariants, removeStanda
 const cache = await import(dist("providercache"))
 const { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } = await import(dist("migration"))
 const palette = await import(dist("palette-category"))
+const keymeta = await import(dist("keymeta"))
 
 function assert(condition, message) {
   if (!condition) throw new Error(`assert failed: ${message}`)
@@ -773,5 +774,69 @@ function section(name) {
   palette.__resetPaletteRegistry()
   assert(palette.currentPaletteCategory() === "", "reset clears the registry")
 }
+
+async function testKeyMeta() {
+  const { ROOT_KEYS, TUI_KEYS, toolsToPermission, keybindGroupsMatching, ALL_KEYBIND_NAMES, PERMISSION_TOOL_KEYS } = keymeta
+  assert(ROOT_KEYS.length >= 30, `root key registry covers the schema (got ${ROOT_KEYS.length})`)
+  const rootKeyNames = new Set(ROOT_KEYS.map((meta) => meta.key))
+  for (const required of ["model", "small_model", "default_agent", "share", "autoupdate", "permission", "mcp", "command", "instructions", "provider", "agent", "plugin", "experimental", "server", "compaction", "tool_output", "attachment", "formatter", "lsp", "skills", "references", "watcher", "snapshot", "subagent_depth", "username", "disabled_providers", "enabled_providers", "shell", "mode", "tools", "autoshare", "reference", "layout", "logLevel", "enterprise"]) {
+    assert(rootKeyNames.has(required), `ROOT_KEYS covers "${required}"`)
+  }
+  for (const meta of ROOT_KEYS) {
+    assert(typeof meta.doc === "string" && meta.doc.length > 10, `key ${meta.key} has documentation`)
+    assert(["live", "reload", "restart"].includes(meta.timing), `key ${meta.key} has a timing badge`)
+  }
+  assert(new Set(ROOT_KEYS.map((meta) => meta.key)).size === ROOT_KEYS.length, "no duplicate root keys")
+  assert(new Set(TUI_KEYS.map((meta) => meta.key)).size === TUI_KEYS.length, "no duplicate tui keys")
+
+  const converted = toolsToPermission({ bash: true, read: false })
+  assert(converted["bash"] === "allow" && converted["read"] === "deny", "tools -> permission actions")
+  const folded = toolsToPermission({ write: false })
+  assert(folded["edit"] === "deny" && folded["write"] === undefined, "write/edit/patch fold into edit")
+
+  assert(keybindGroupsMatching("").length > 5, "empty keybind query returns all groups")
+  const sessionHits = keybindGroupsMatching("session_delete")
+  assert(sessionHits.length === 1 && sessionHits[0].names.includes("session_delete"), "keybind name search")
+  assert(ALL_KEYBIND_NAMES.length >= 150, `keybind catalog is large (got ${ALL_KEYBIND_NAMES.length})`)
+  assert(PERMISSION_TOOL_KEYS.includes("bash") && PERMISSION_TOOL_KEYS.includes("doom_loop"), "permission tool list")
+}
+
+async function testCleanupScanner() {
+  const { __testInternals } = await import(dist("tui"))
+  const scan = __testInternals.scanCleanupFindings
+  const fakeState = (data) => ({
+    files: [{ path: "C:/fake/opencode.json", data, exists: true, parseErrors: [] }],
+    tuiFiles: [],
+    markdownAgents: [],
+  })
+  const findings = scan(
+    fakeState({
+      mode: { reviewer: { prompt: "review" } },
+      tools: { bash: true, read: false },
+      autoshare: true,
+      reference: { docs: "owner/repo" },
+      layout: "auto",
+      logLevel: "INFO",
+      theme: "dracula",
+      agent: { general: { tools: { edit: true }, maxSteps: 40 } },
+    }),
+  )
+  const rules = findings.map((finding) => finding.rule)
+  for (const expected of ["mode", "tools", "autoshare", "reference", "layout", "logLevel", "tui-migrate", "agent.tools", "agent.maxSteps"]) {
+    assert(rules.includes(expected), `cleanup finds ${expected} (got ${rules.join(",")})`)
+  }
+  const modeFinding = findings.find((finding) => finding.rule === "mode")
+  const modeSet = modeFinding.ops.find((op) => op.path.join(".") === "agent.reviewer")
+  assert(modeSet && modeSet.value.mode === "primary", "mode migration forces primary")
+  const toolsFinding = findings.find((finding) => finding.rule === "tools")
+  const permSet = toolsFinding.ops.find((op) => op.path.join(".") === "permission")
+  assert(permSet && permSet.value.bash === "allow" && permSet.value.read === "deny", "tools migration converts actions")
+  assert(findings.every((finding) => finding.file === "C:/fake/opencode.json"), "findings carry their file")
+
+  const clean = scan(fakeState({ model: "zai-coding-plan/glm-5.2", share: "auto" }))
+  assert(clean.length === 0, "no false positives on a clean config")
+}
+
+testKeyMeta()
 
 console.log("all unit tests passed")

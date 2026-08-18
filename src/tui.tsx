@@ -38,6 +38,9 @@ import { agentMode as avAgentMode, showFieldList as avShowFieldList, type FieldL
 import { FIELD_DOCS } from "./docs.js"
 import { rankOptions } from "./search.js"
 import { currentPaletteCategory, declarePaletteCategory, schedulePaletteReconcile } from "./palette-category.js"
+import { discoverMarkdownAgents, discoverTuiFiles, type MarkdownAgent } from "./discovery.js"
+import { CLEANUP_RULES, TUI_KEYS, keybindGroupsMatching, toolsToPermission, type ObjectFieldSpec } from "./keymeta.js"
+import { fieldEditor as kitFieldEditor, permissionEditor as kitPermissionEditor, providerEntryScreen, providerModelsScreen, settingsScreen as kitSettingsScreen, type EditorKit } from "./editors.js"
 import { providerCacheKey, getCachedProviders, setCachedProviders, providerCacheState, detectOutsideChanges, type OutsideChange } from "./providercache.js"
 import { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } from "./migration.js"
 import { DEFAULT_HIDDEN_SECTIONS, loadSettings, saveSettings, settingsPath, type StudioSettings } from "./settings.js"
@@ -46,11 +49,534 @@ import { agentVariantsModuleId, setModulePickImplementation } from "./modules/ag
 import { findStandaloneAgentVariants, removeStandaloneHits } from "./standalone.js"
 
 // ---------------------------------------------------------------------------
-// Types
+// Editor kit: dialog primitives + staging for the value-editors module
 // ---------------------------------------------------------------------------
 
+function makeEditorKit(api: TuiPluginApi, state: StudioState): EditorKit {
+  return {
+    state,
+    showMenu: (props) => showMenu(api, props),
+    showPrompt: (props) => showPrompt(api.ui, props),
+    showConfirm: (props) => showConfirm(api.ui, props),
+    showAlert: (props) => showAlert(api.ui, props),
+    showInfo: (props) => showInfo(api, props),
+    showJSONEditor: (title, value) => showJSONEditor(api, title, value),
+    pickModel: (title) => pickAnyModel(api, state, title),
+    stage: (ops, reason) => applyEdits({ api, state }, ops, reason),
+    valueAt: (pointer) => getAtPath(state.merge.merged, pointer),
+    sourceLabel: (pointer) => {
+      const { winner } = provenanceAt(state.merge, pointer)
+      return winner ? fileLabel(state, winner) : "OpenCode default"
+    },
+    agentNames: () => {
+      const names = new Set<string>(["build", "plan", "general"])
+      for (const name of Object.keys((state.merge.merged as { agent?: Record<string, unknown> })["agent"] ?? {})) names.add(name)
+      for (const agent of state.markdownAgents) names.add(agent.name)
+      return [...names].sort()
+    },
+    openPlugins: () => pluginManagerScreen(api, state),
+    openAgents: () => agentsScreen(api, state),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// tui.json staging + TUI settings
+// ---------------------------------------------------------------------------
+
+async function applyTuiEdits(write: WriteContext, ops: EditOp[], reason: string): Promise<boolean> {
+  let target = write.state.tuiTargetFilePath
+  const existing = write.state.tuiFiles.filter((file) => file.exists && file.parseErrors.length === 0)
+  if (!target || !existing.some((file) => file.path === target)) {
+    const globalTui = existing.find((file) => file.label === "global tui.json") ?? existing.find((file) => file.path.includes("tui.json"))
+    const options: WizardSelectOption<string>[] = existing.map((file) => ({
+      title: file.label,
+      value: file.path,
+      description: file.path,
+      edited: true,
+    }))
+    if (existing.length === 0) {
+      options.push({ title: "+ Create global tui.json", value: "__create__", description: join(write.api.state.path.config, "tui.json"), edited: true })
+    }
+    options.push({ title: "< Cancel", value: "__cancel__", description: "" })
+    const picked = await showMenu(write.api, { title: `tui.json - ${reason}`, options, current: target ?? globalTui?.path })
+    if (!picked || picked === "__cancel__") return false
+    if (picked === "__create__") {
+      const created = createConfigFile(join(write.api.state.path.config, "tui.json"))
+      if (!created.ok) {
+        await showAlert(write.api.ui, { title: "Could not create tui.json", message: created.error ?? "unknown error" })
+        return false
+      }
+      target = join(write.api.state.path.config, "tui.json")
+      const updated = await refreshStudio(write.api, write.state)
+      Object.assign(write.state, updated)
+    } else {
+      target = picked
+    }
+    write.state.tuiTargetFilePath = target
+  }
+  if (!stagedBases.has(target)) {
+    try {
+      stagedBases.set(target, existsSync(target) ? readFileSync(target, "utf8") : "")
+    } catch {
+      stagedBases.set(target, "")
+    }
+  }
+  write.state.pending.push({ id: ++stagedChangeCounter, targetPath: target, ops, reason })
+  const updated = await refreshStudio(write.api, write.state)
+  Object.assign(write.state, updated)
+  write.api.ui.toast({ variant: "info", title: "Staged", message: `${reason} - ${write.state.pending.length} pending. Save & exit writes to disk.` })
+  return true
+}
+
+function makeTuiEditorKit(api: TuiPluginApi, state: StudioState): EditorKit {
+  const kit = makeEditorKit(api, state)
+  return {
+    ...kit,
+    stage: (ops, reason) => applyTuiEdits({ api, state }, ops, reason),
+    valueAt: (pointer) => {
+      const target = state.tuiTargetFilePath ?? state.tuiFiles.find((file) => file.exists)?.path
+      const file = state.tuiFiles.find((item) => item.path === target)
+      return getAtPath(file?.data ?? {}, pointer)
+    },
+    sourceLabel: (pointer) => {
+      for (const file of state.tuiFiles) {
+        if (getAtPath(file.data, pointer) !== undefined) return file.label
+      }
+      return "TUI default"
+    },
+  }
+}
+
+async function tuiSettingsScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
+  const kit = makeTuiEditorKit(api, state)
+  const target = state.tuiTargetFilePath ?? state.tuiFiles.find((file) => file.exists)?.path
+  const targetFile = state.tuiFiles.find((item) => item.path === target)
+  const keybinds = kit.valueAt(["keybinds"])
+
+  const options: WizardSelectOption<string>[] = [
+    {
+      title: "Target file",
+      value: "__target__",
+      description: targetFile ? `${targetFile.label} - ${targetFile.path}` : "none - pick on first edit",
+      help: "tui.json layers merge like opencode.json (global lowest, closest project file wins). Pick which layer receives your edits.",
+    },
+  ]
+  for (const meta of TUI_KEYS) {
+    if (meta.key === "keybinds") {
+      options.push({
+        title: "Keybinds",
+        value: "keybinds",
+        description: `${Object.keys(typeof keybinds === "object" && keybinds !== null ? (keybinds as Record<string, unknown>) : {}).length} override(s) - browser`,
+        help: meta.doc,
+      })
+      continue
+    }
+    const spec: ObjectFieldSpec = { key: meta.key, title: meta.title, kind: meta.kind, options: meta.options, placeholder: meta.placeholder, doc: meta.doc, fields: meta.fields }
+    const value = kit.valueAt([meta.key])
+    options.push({
+      title: meta.title,
+      value: `key:${meta.key}`,
+      description: `${value === undefined ? "(default)" : String(value)} (${kit.sourceLabel([meta.key])})`,
+      help: meta.doc,
+      edited: value !== undefined,
+    })
+    void spec
+  }
+  options.push({ title: "! Restart note", value: "__restart__", description: "ALL tui.json changes need a TUI restart", danger: true })
+  options.push({ title: "< Back", value: "__back__", description: "" })
+
+  const picked = await showMenu(api, { title: "TUI settings (tui.json)", options })
+  if (!picked || picked === "__back__") return mainMenu(api, state)
+  if (picked === "__restart__") {
+    await showInfo(api, {
+      title: "RESTART REQUIRED",
+      message: "TUI config is read once at process start. Every tui.json change (theme, keybinds, cursor, sounds, ...) takes effect only after OpenCode restarts.",
+    })
+    return tuiSettingsScreen(api, state)
+  }
+  if (picked === "__target__") {
+    const existing = state.tuiFiles.filter((file) => file.exists && file.parseErrors.length === 0)
+    const targetOptions: WizardSelectOption<string>[] = existing.map((file) => ({ title: file.label, value: file.path, description: file.path, edited: true }))
+    targetOptions.push({ title: "< Cancel", value: "__cancel__", description: "" })
+    const chosen = await showMenu(api, { title: "Edit which tui.json?", options: targetOptions, current: state.tuiTargetFilePath })
+    if (chosen && chosen !== "__cancel__") {
+      state.tuiTargetFilePath = chosen
+    }
+    return tuiSettingsScreen(api, state)
+  }
+  if (picked === "keybinds") {
+    await keybindBrowser(api, state)
+    return tuiSettingsScreen(api, state)
+  }
+  if (picked.startsWith("key:")) {
+    const key = picked.slice(4)
+    const meta = TUI_KEYS.find((item) => item.key === key)
+    if (!meta) return tuiSettingsScreen(api, state)
+    const spec: ObjectFieldSpec = { key: meta.key, title: meta.title, kind: meta.kind, options: meta.options, placeholder: meta.placeholder, doc: meta.doc, fields: meta.fields }
+    await kitFieldEditor(kit, spec, [meta.key])
+    return tuiSettingsScreen(api, state)
+  }
+  return tuiSettingsScreen(api, state)
+}
+
+async function keybindBrowser(api: TuiPluginApi, state: StudioState): Promise<void> {
+  const write: WriteContext = { api, state }
+  const query = await showPrompt(api.ui, { title: "Keybind search (empty = browse all)", placeholder: "e.g. session, diff, input" })
+  if (query === undefined) return
+  const groups = keybindGroupsMatching(query)
+  if (groups.length === 0) {
+    await showAlert(api.ui, { title: "No matches", message: `No keybind names match "${query}".` })
+    return
+  }
+  const groupPick = await showMenu(api, {
+    title: "Keybind groups",
+    options: [...groups.map((group) => ({ title: group.group, value: group.group, description: `${group.names.length} binding(s)` })), { title: "< Cancel", value: "__cancel__", description: "" }],
+  })
+  if (!groupPick || groupPick === "__cancel__") return
+  const group = groups.find((item) => item.group === groupPick)!
+  const currentMap = (() => {
+    const target = state.tuiTargetFilePath ?? state.tuiFiles.find((file) => file.exists)?.path
+    const file = state.tuiFiles.find((item) => item.path === target)
+    const value = getAtPath(file?.data ?? {}, ["keybinds"])
+    return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {}
+  })()
+
+  const options: WizardSelectOption<string>[] = group.names.map((name) => ({
+    title: name,
+    value: name,
+    description: currentMap[name] === undefined ? "(built-in default)" : String(currentMap[name]),
+    edited: currentMap[name] !== undefined,
+    help: "Binding value: combo string (\"ctrl+x,ctrl+d\"), \"none\" or false to unbind, or a key-stroke object via JSON.",
+  }))
+  options.push({ title: "< Back", value: "__back__", description: "" })
+  const picked = await showMenu(api, { title: `${groupPick} bindings`, options })
+  if (!picked || picked === "__back__") return
+  const current = currentMap[picked]
+
+  const action = await showMenu(api, {
+    title: picked,
+    options: [
+      { title: "Set binding", value: "set", description: current === undefined ? "(built-in default)" : `current: ${String(current)}` },
+      { title: "Clear override", value: "clear", description: "remove - fall back to built-in default", danger: current !== undefined },
+      { title: "Unbind (none)", value: "none", description: "disable this key entirely" },
+      { title: "Edit as JSON", value: "json", description: "key-stroke / binding objects" },
+      { title: "< Cancel", value: "__cancel__", description: "" },
+    ],
+  })
+  if (!action || action === "__cancel__") return
+  if (action === "clear") {
+    await applyTuiEdits(write, [{ op: "delete", path: ["keybinds", picked] }], `keybind ${picked} cleared`)
+    return
+  }
+  if (action === "none") {
+    await applyTuiEdits(write, [{ op: "set", path: ["keybinds", picked], value: "none" }], `keybind ${picked} = none`)
+    return
+  }
+  if (action === "set") {
+    const binding = await showPrompt(api.ui, { title: `Binding for ${picked}`, placeholder: "e.g. ctrl+alt+d, <leader>r", value: typeof current === "string" ? current : "" })
+    if (binding === undefined || binding.trim() === "") return
+    await applyTuiEdits(write, [{ op: "set", path: ["keybinds", picked], value: binding.trim() }], `keybind ${picked} = ${binding.trim()}`)
+    return
+  }
+  const body = await showJSONEditor(api, `Binding object - ${picked}`, typeof current === "object" && current !== null ? current : {})
+  if (body === undefined) return
+  if (body === "__delete__") {
+    await applyTuiEdits(write, [{ op: "delete", path: ["keybinds", picked] }], `keybind ${picked} cleared`)
+    return
+  }
+  await applyTuiEdits(write, [{ op: "set", path: ["keybinds", picked], value: body }], `keybind ${picked} set`)
+}
+
+// ---------------------------------------------------------------------------
+// Plugin manager (unified opencode.json + tui.json arrays)
+// ---------------------------------------------------------------------------
+
+async function pluginManagerScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
+  const write: WriteContext = { api, state }
+  while (true) {
+    const rows: Array<{ spec: string; file: string; isTui: boolean; index: number; hasOptions: boolean }> = []
+    for (const file of state.files) {
+      if (!file.exists || file.parseErrors.length > 0) continue
+      const plugins = file.data["plugin"]
+      if (!Array.isArray(plugins)) continue
+      plugins.forEach((entry, index) => {
+        if (typeof entry === "string") rows.push({ spec: entry, file: file.path, isTui: false, index, hasOptions: false })
+        else if (Array.isArray(entry) && typeof entry[0] === "string") rows.push({ spec: entry[0], file: file.path, isTui: false, index, hasOptions: true })
+      })
+    }
+    for (const file of state.tuiFiles) {
+      if (!file.exists || file.parseErrors.length > 0) continue
+      const plugins = file.data["plugin"]
+      if (!Array.isArray(plugins)) continue
+      plugins.forEach((entry, index) => {
+        if (typeof entry === "string") rows.push({ spec: entry, file: file.path, isTui: true, index, hasOptions: false })
+        else if (Array.isArray(entry) && typeof entry[0] === "string") rows.push({ spec: entry[0], file: file.path, isTui: true, index, hasOptions: true })
+      })
+    }
+
+    const options: WizardSelectOption<string>[] = rows.map((row, i) => ({
+      title: row.spec + (row.hasOptions ? " [options]" : ""),
+      value: `row:${i}`,
+      description: `${row.isTui ? "tui.json" : "opencode.json"} - ${row.file}`,
+      edited: true,
+      help: "Plugin entry. Restart required after add/remove.",
+    }))
+    options.push({ title: "+ Add plugin", value: "add", description: "npm spec or file:// path" })
+    options.push({ title: "< Back", value: "__back__", description: rows.length === 0 ? "(no plugins configured in any file)" : "" })
+
+    const picked = await showMenu(api, { title: "Plugins", options })
+    if (!picked || picked === "__back__") return mainMenu(api, state)
+
+    if (picked === "add") {
+      const spec = await showPrompt(api.ui, { title: "Plugin spec", placeholder: "package@version or file:///C:/path (or package@tag)" })
+      if (spec === undefined || spec.trim() === "") continue
+      const withOptions = await showConfirm(api.ui, { title: "Plugin options", message: "Attach an options object? (the [spec, options] tuple form)", confirmLabel: "Add options" })
+      let entry: unknown = spec.trim()
+      if (withOptions) {
+        const body = await showJSONEditor(api, `Options - ${spec.trim()}`, {})
+        if (body === undefined || body === "__delete__") continue
+        entry = [spec.trim(), body]
+      }
+      const targetFiles: WizardSelectOption<string>[] = [
+        ...state.files.filter((file) => file.exists && file.parseErrors.length === 0).map((file) => ({ title: `opencode.json - ${file.label}`, value: `oc:${file.path}`, description: file.path, edited: true })),
+        ...state.tuiFiles.filter((file) => file.exists && file.parseErrors.length === 0).map((file) => ({ title: `tui.json - ${file.label}`, value: `tui:${file.path}`, description: `${file.path} (TUI-side plugins only)`, edited: true })),
+      ]
+      targetFiles.push({ title: "< Cancel", value: "__cancel__", description: "" })
+      const chosen = await showMenu(api, { title: "Add to which file?", options: targetFiles })
+      if (!chosen || chosen === "__cancel__") continue
+      const isTui = chosen.startsWith("tui:")
+      const path = chosen.slice(4)
+      const current = (() => {
+        const entry = (isTui ? state.tuiFiles : state.files).find((file) => file.path === path)
+        return Array.isArray(entry?.data["plugin"]) ? entry!.data["plugin"] as unknown[] : []
+      })()
+      const next = [...current, entry]
+      const ok = isTui
+        ? await applyTuiEdits(write, [{ op: "set", path: ["plugin"], value: next }], `plugin add ${spec.trim()}`)
+        : await stageInFile(api, state, path, [{ op: "set", path: ["plugin"], value: next }], `plugin add ${spec.trim()}`)
+      if (ok) {
+        await showInfo(api, { title: "RESTART REQUIRED", message: `Plugin "${spec.trim()}" staged.\n\nNew plugins load only after OpenCode restarts.` })
+      }
+      continue
+    }
+
+    if (picked.startsWith("row:")) {
+      const row = rows[Number(picked.slice(4))]!
+      const action = await showMenu(api, {
+        title: row.spec,
+        options: [
+          ...(row.hasOptions ? [{ title: "Edit options", value: "options", description: "the [spec, options] tuple" } as WizardSelectOption<string>] : []),
+          { title: "Remove", value: "remove", description: "", danger: true },
+          { title: "< Cancel", value: "__cancel__", description: "" },
+        ],
+      })
+      if (!action || action === "__cancel__") continue
+      if (action === "remove") {
+        if (!(await showConfirm(api.ui, { title: "Remove plugin", message: `Remove ${row.spec} from\n${row.file}\n\nand restart?`, confirmLabel: "Remove" }))) continue
+        const ok = row.isTui
+          ? await applyTuiEdits(write, [{ op: "delete", path: ["plugin", row.index] }], `plugin remove ${row.spec}`)
+          : await stageInFile(api, state, row.file, [{ op: "delete", path: ["plugin", row.index] }], `plugin remove ${row.spec}`)
+        if (ok) {
+          await showInfo(api, { title: "RESTART REQUIRED", message: `Plugin "${row.spec}" removal staged.\n\nOpenCode must restart to unload it.` })
+        }
+        continue
+      }
+      if (action === "options") {
+        const fileEntry = (row.isTui ? state.tuiFiles : state.files).find((file) => file.path === row.file)
+        const list = fileEntry?.data["plugin"] as unknown[] | undefined
+        const tuple = list?.[row.index] as [string, Record<string, unknown>] | undefined
+        const body = await showJSONEditor(api, `Options - ${row.spec}`, tuple?.[1] ?? {})
+        if (body === undefined) continue
+        if (body === "__delete__") {
+          const ok = row.isTui
+            ? await applyTuiEdits(write, [{ op: "set", path: ["plugin", row.index], value: row.spec }], `plugin options removed ${row.spec}`)
+            : await stageInFile(api, state, row.file, [{ op: "set", path: ["plugin", row.index], value: row.spec }], `plugin options removed ${row.spec}`)
+          void ok
+          continue
+        }
+        const ok = row.isTui
+          ? await applyTuiEdits(write, [{ op: "set", path: ["plugin", row.index], value: [row.spec, body] }], `plugin options updated ${row.spec}`)
+          : await stageInFile(api, state, row.file, [{ op: "set", path: ["plugin", row.index], value: [row.spec, body] }], `plugin options updated ${row.spec}`)
+        void ok
+        continue
+      }
+    }
+  }
+}
+
+/** Stage ops against one explicit file (bypasses the generic target picker). */
+async function stageInFile(api: TuiPluginApi, state: StudioState, filePath: string, ops: EditOp[], reason: string): Promise<boolean> {
+  if (!stagedBases.has(filePath)) {
+    try {
+      stagedBases.set(filePath, existsSync(filePath) ? readFileSync(filePath, "utf8") : "")
+    } catch {
+      stagedBases.set(filePath, "")
+    }
+  }
+  state.pending.push({ id: ++stagedChangeCounter, targetPath: filePath, ops, reason })
+  const updated = await refreshStudio(api, state)
+  Object.assign(state, updated)
+  api.ui.toast({ variant: "info", title: "Staged", message: `${reason} - ${state.pending.length} pending. Save & exit writes to disk.` })
+  return true
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup & migrations
+// ---------------------------------------------------------------------------
+
+interface CleanupFinding {
+  rule: string
+  file: string
+  detail: string
+  ops: EditOp[]
+}
+
+function scanCleanupFindings(state: StudioState): CleanupFinding[] {
+  const findings: CleanupFinding[] = []
+  for (const file of state.files) {
+    if (!file.exists || file.parseErrors.length > 0) continue
+    const data = file.data
+
+    const mode = data["mode"]
+    if (isPlainObjectData(mode)) {
+      const ops: EditOp[] = []
+      for (const [name, entry] of Object.entries(mode)) {
+        const existingAgentEntry = (data["agent"] as Record<string, unknown> | undefined)?.[name]
+        const merged = { ...(isPlainObjectData(existingAgentEntry) ? existingAgentEntry : {}), ...(isPlainObjectData(entry) ? entry : {}), mode: "primary" as const }
+        ops.push({ op: "set", path: ["agent", name], value: merged })
+      }
+      ops.push({ op: "delete", path: ["mode"] })
+      findings.push({ rule: "mode", file: file.path, detail: `${Object.keys(mode).length} mode entrie(s) -> agent`, ops })
+    }
+
+    const tools = data["tools"]
+    if (isPlainObjectData(tools) && Object.keys(tools).length > 0) {
+      const existingPermission = isPlainObjectData(data["permission"]) ? (data["permission"] as Record<string, unknown>) : {}
+      const converted = toolsToPermission(tools as Record<string, unknown>)
+      findings.push({
+        rule: "tools",
+        file: file.path,
+        detail: `${Object.keys(tools).length} tool toggle(s) -> permission`,
+        ops: [
+          { op: "set", path: ["permission"], value: { ...converted, ...existingPermission } },
+          { op: "delete", path: ["tools"] },
+        ],
+      })
+    }
+
+    if (data["autoshare"] !== undefined) {
+      const ops: EditOp[] = data["autoshare"] === true ? [{ op: "set", path: ["share"], value: "auto" }] : []
+      ops.push({ op: "delete", path: ["autoshare"] })
+      findings.push({ rule: "autoshare", file: file.path, detail: `autoshare: ${String(data["autoshare"])} -> share: "auto"`, ops })
+    }
+
+    const reference = data["reference"]
+    if (isPlainObjectData(reference)) {
+      const existingReferences = isPlainObjectData(data["references"]) ? (data["references"] as Record<string, unknown>) : {}
+      findings.push({
+        rule: "reference",
+        file: file.path,
+        detail: `${Object.keys(reference).length} reference entrie(s) -> references`,
+        ops: [
+          { op: "set", path: ["references"], value: { ...reference, ...existingReferences } },
+          { op: "delete", path: ["reference"] },
+        ],
+      })
+    }
+
+    if (data["layout"] !== undefined) findings.push({ rule: "layout", file: file.path, detail: `layout: ${String(data["layout"])} (dead)`, ops: [{ op: "delete", path: ["layout"] }] })
+    if (data["logLevel"] !== undefined) findings.push({ rule: "logLevel", file: file.path, detail: `logLevel: ${String(data["logLevel"])} (dead in files)`, ops: [{ op: "delete", path: ["logLevel"] }] })
+
+    // theme/keybinds/tui in opencode.json -> migrate to tui.json
+    const tuiKeysPresent = (["theme", "keybinds", "tui"] as const).filter((key) => data[key] !== undefined)
+    if (tuiKeysPresent.length > 0) {
+      findings.push({
+        rule: "tui-migrate",
+        file: file.path,
+        detail: `${tuiKeysPresent.join(", ")} stripped at load - OpenCode auto-migrates them to tui.json`,
+        ops: tuiKeysPresent.map((key) => ({ op: "delete" as const, path: [key] })),
+      })
+    }
+
+    const agent = data["agent"]
+    if (isPlainObjectData(agent)) {
+      for (const [name, entry] of Object.entries(agent)) {
+        if (!isPlainObjectData(entry)) continue
+        const agentTools = entry["tools"]
+        if (isPlainObjectData(agentTools) && Object.keys(agentTools).length > 0) {
+          const existingPermission = isPlainObjectData(entry["permission"]) ? (entry["permission"] as Record<string, unknown>) : {}
+          findings.push({
+            rule: "agent.tools",
+            file: file.path,
+            detail: `agent "${name}": ${Object.keys(agentTools).length} tool toggle(s) -> permission`,
+            ops: [
+              { op: "set", path: ["agent", name, "permission"], value: { ...toolsToPermission(agentTools as Record<string, unknown>), ...existingPermission } },
+              { op: "delete", path: ["agent", name, "tools"] },
+            ],
+          })
+        }
+        if (entry["maxSteps"] !== undefined) {
+          findings.push({
+            rule: "agent.maxSteps",
+            file: file.path,
+            detail: `agent "${name}": maxSteps -> steps`,
+            ops: [
+              { op: "set", path: ["agent", name, "steps"], value: entry["maxSteps"] },
+              { op: "delete", path: ["agent", name, "maxSteps"] },
+            ],
+          })
+        }
+      }
+    }
+  }
+  return findings
+}
+
+function isPlainObjectData(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+async function cleanupScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
+  const findings = scanCleanupFindings(state)
+  const byRule = new Map(CLEANUP_RULES.map((rule) => [rule.target, rule]))
+  while (true) {
+    if (findings.length === 0) {
+      await showInfo(api, {
+        title: "Cleanup",
+        message: "No deprecated keys found in any config file.\n\nThe scanner checks: mode, tools, autoshare, reference, layout, logLevel, per-agent tools/maxSteps, and theme/keybinds/tui misplaced in opencode.json.",
+      })
+      return mainMenu(api, state)
+    }
+    const options: WizardSelectOption<string>[] = findings.map((finding, i) => ({
+      title: `${byRule.get(finding.rule)?.title ?? finding.rule} - ${fileLabel(state, state.files.find((file) => file.path === finding.file)?.id)}`,
+      value: `fix:${i}`,
+      description: finding.detail,
+      danger: true,
+      help: `${finding.file}\n\n${byRule.get(finding.rule)?.detail ?? ""}`,
+    }))
+    options.push({ title: "Apply all", value: "apply-all", description: `${findings.length} migration(s)` })
+    options.push({ title: "< Back", value: "__back__", description: "" })
+    const picked = await showMenu(api, { title: "Cleanup & migrations", options })
+    if (!picked || picked === "__back__") return mainMenu(api, state)
+    if (picked === "apply-all") {
+      for (const finding of findings) {
+        await stageInFile(api, state, finding.file, finding.ops, `cleanup ${finding.rule}`)
+      }
+      await showInfo(api, { title: "Staged", message: `${findings.length} migration(s) staged.\n\nReview them in Save & exit before writing.` })
+      return mainMenu(api, state)
+    }
+    if (picked.startsWith("fix:")) {
+      const finding = findings[Number(picked.slice(4))]!
+      await stageInFile(api, state, finding.file, finding.ops, `cleanup ${finding.rule}`)
+      findings.splice(Number(picked.slice(4)), 1)
+      continue
+    }
+  }
+}
+
+
 type DisplayColor = string | TuiPluginApi["theme"]["current"]["text"]
-type WizardSelectOption<Value = unknown> = TuiDialogSelectOption<Value> & {
+export type WizardSelectOption<Value = unknown> = TuiDialogSelectOption<Value> & {
   color?: DisplayColor
   danger?: boolean
   help?: string
@@ -77,6 +603,12 @@ export interface StudioState {
   targetFilePath: string | undefined
   /** Queued edits, written only on Save & exit (agent-variants save model). */
   pending: StagedChange[]
+  /** tui.json layers (own precedence family; never merged into opencode.json). */
+  tuiFiles: ConfigFileEntry[]
+  /** Selected tui.json write target for the TUI settings screens. */
+  tuiTargetFilePath: string | undefined
+  /** Markdown-defined agents (.opencode/agent and agents dirs, recursive md). */
+  markdownAgents: MarkdownAgent[]
 }
 
 // ---------------------------------------------------------------------------
@@ -1184,6 +1716,12 @@ async function refreshStudio(api: TuiPluginApi, previous?: StudioState): Promise
   const envConfigFile = process.env["OPENCODE_CONFIG"]
   const files = discoverConfigFiles({ globalConfigDir, envConfigFile, directory: api.state.path.directory, worktree: api.state.path.worktree })
   const pending = previous?.pending ?? []
+  // tui.json layers: own discovery + staged overlay (never in the opencode merge).
+  const tuiFiles = discoverTuiFiles({ globalConfigDir, envConfigFile, envTuiFile: process.env["OPENCODE_TUI_CONFIG"], directory: api.state.path.directory, worktree: api.state.path.worktree })
+  for (const change of pending) {
+    const file = tuiFiles.find((item) => item.path === change.targetPath)
+    if (file) file.data = applyOpsToData(file.data, change.ops)
+  }
   // Staged overlay: pending ops are reflected in parsed file data so every
   // view (provenance, browsers, detail screens) renders the post-save world.
   for (const change of pending) {
@@ -1208,6 +1746,7 @@ async function refreshStudio(api: TuiPluginApi, previous?: StudioState): Promise
     setCachedProviders(cacheKey, providerResult)
   }
   const modelsDevResult = await modelsDevPromise
+  const markdownAgents = discoverMarkdownAgents({ globalConfigDir, envConfigFile, directory: api.state.path.directory, worktree: api.state.path.worktree })
   return {
     files,
     merge,
@@ -1218,6 +1757,9 @@ async function refreshStudio(api: TuiPluginApi, previous?: StudioState): Promise
     providersSource: providerResult.source,
     targetFilePath: previous?.targetFilePath,
     pending,
+    tuiFiles,
+    tuiTargetFilePath: previous?.tuiTargetFilePath && tuiFiles.some((file) => file.path === previous.tuiTargetFilePath) ? previous.tuiTargetFilePath : undefined,
+    markdownAgents,
   }
 }
 
@@ -1565,6 +2107,30 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
       help: docText("root.model") + "\n\n" + docText("root.small_model"),
     },
     {
+      title: "Settings",
+      value: "settings",
+      description: "All root config keys by group",
+      help: "Every opencode.json root key - sharing, updates, provider toggles, instructions, skills, references, MCP, commands, permissions, attachments, compaction, server, experimental flags, and deprecated keys.",
+    },
+    {
+      title: "TUI settings",
+      value: "tui-settings",
+      description: "tui.json - theme, keybinds, cursor, sounds",
+      help: "Everything editable in tui.json: theme, keybind browser (184 commands), diff style, cursor, mouse, scroll, attention sounds, prompt sizing, plugin enable toggles. TUI changes always need a restart.",
+    },
+    {
+      title: "Plugins",
+      value: "plugins",
+      description: "Manage plugin entries in both config families",
+      help: "Add/remove plugins (npm specs or file:// paths, with optional options tuples) across opencode.json and tui.json layers. Restart required after changes.",
+    },
+    {
+      title: "Cleanup & migrations",
+      value: "cleanup",
+      description: "Deprecated keys: detect and migrate",
+      help: "Scans every config file for deprecated or dead keys (mode, tools, autoshare, reference, layout, logLevel, agent tools/maxSteps, misplaced tui keys) and stages migrations to their modern equivalents.",
+    },
+    {
       title: "Agents",
       value: "agents",
       description: "Agent model, variant, temperature, top_p",
@@ -1640,6 +2206,15 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
   switch (action) {
     case "browse":
       return providerBrowser(api, state)
+    case "settings":
+      await kitSettingsScreen(makeEditorKit(api, state))
+      return mainMenu(api, state)
+    case "tui-settings":
+      return tuiSettingsScreen(api, state)
+    case "plugins":
+      return pluginManagerScreen(api, state)
+    case "cleanup":
+      return cleanupScreen(api, state)
     case "root-model":
       return rootModelScreen(api, state)
     case "agents":
@@ -2057,6 +2632,7 @@ function overviewText(): string {
 // ---------------------------------------------------------------------------
 
 async function providerBrowser(api: TuiPluginApi, state: StudioState): Promise<void> {
+  const kit = makeEditorKit(api, state)
   const analyses = analyzeProviders(state.providers, state.defaults, state.merge)
   const options: WizardSelectOption<string>[] = analyses.map((provider) => ({
     title: provider.providerID,
@@ -2076,10 +2652,22 @@ async function providerBrowser(api: TuiPluginApi, state: StudioState): Promise<v
       provider.edited ? "This provider has config-file edits." : "No config-file edits for this provider.",
     ].filter(Boolean).join("\n"),
   }))
+  options.push({ title: "! New custom provider...", value: "__new_provider__", description: "api base, SDK package, connection options, models", help: "Define a provider.<id> config entry from scratch: API family, npm SDK, baseURL/apiKey, model entries with limits and modalities." })
   options.push({ title: "< Back", value: "__back__", description: "Return to main menu" })
 
   const picked = await showMenu(api, { title: "Providers - edited first", options })
   if (!picked || picked === "__back__") return mainMenu(api, state)
+  if (picked === "__new_provider__") {
+    const id = await showPrompt(api.ui, { title: "Provider id", placeholder: "e.g. my-gateway (lowercase, no slashes)" })
+    if (id === undefined || id.trim() === "") return providerBrowser(api, state)
+    if (getAtPath(state.merge.merged, ["provider", id.trim()]) !== undefined) {
+      await showAlert(api.ui, { title: "Exists", message: `Provider "${id.trim()}" already has a config entry.` })
+      return providerBrowser(api, state)
+    }
+    const ok = await applyEdits({ api, state }, [{ op: "set", path: ["provider", id.trim()], value: {} }], `provider add ${id.trim()}`)
+    if (ok) await providerEntryScreen(kit, id.trim())
+    return providerBrowser(api, state)
+  }
   return modelBrowser(api, state, picked)
 }
 
@@ -2115,10 +2703,20 @@ async function modelBrowser(api: TuiPluginApi, state: StudioState, providerID: s
     if (a.edited !== b.edited) return a.edited ? -1 : 1
     return a.title.localeCompare(b.title)
   })
+  options.push({ title: "! Provider settings...", value: "__provider_settings__", description: "api base, SDK package, options, env, filters", help: "Full provider entry editor (provider.<id> in config): API family, npm SDK, connection options incl. baseURL/apiKey/timeouts, model whitelist/blacklist, and raw model entries.", danger: false })
+  options.push({ title: "+ Model entries (config)...", value: "__model_entries__", description: "custom models and overrides", help: "Manage provider.<id>.models entries directly: add custom models, edit limits, cost, modalities, status, default options." })
   options.push({ title: "< Back", value: "__back__", description: "Return to provider list" })
 
   const picked = await showMenu(api, { title: `Models - ${providerID}`, options })
   if (!picked || picked === "__back__") return providerBrowser(api, state)
+  if (picked === "__provider_settings__") {
+    await providerEntryScreen(makeEditorKit(api, state), providerID)
+    return modelBrowser(api, state, providerID)
+  }
+  if (picked === "__model_entries__") {
+    await providerModelsScreen(makeEditorKit(api, state), providerID)
+    return modelBrowser(api, state, providerID)
+  }
   return modelDetail(api, state, providerID, picked)
 }
 
@@ -2817,19 +3415,28 @@ async function agentsScreen(api: TuiPluginApi, state: StudioState): Promise<void
       agents.set(name, entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {})
     }
   }
+  for (const markdownAgent of state.markdownAgents) {
+    if (!agents.has(markdownAgent.name)) agents.set(markdownAgent.name, { __markdown: markdownAgent.path })
+  }
   const options: WizardSelectOption<string>[] = [...agents.entries()].map(([name, entry]) => {
     const hasEdits = state.files.some((file) => fileAgentEdits(file).some((agent) => agent.agentID === name))
+    const markdown = state.markdownAgents.find((agent) => agent.name === name)
+    const markdownWins = markdown !== undefined && entry["__markdown"] !== undefined
     return {
-      title: name,
+      title: markdown ? `${name} [md]` : name,
       value: name,
       description: [
+        markdownWins ? "markdown-defined agent" : undefined,
         typeof entry["model"] === "string" ? entry["model"] : "session model",
         typeof entry["variant"] === "string" ? `variant ${entry["variant"]}` : "default variant",
         entry["temperature"] !== undefined ? `temp ${entry["temperature"]}` : undefined,
         entry["top_p"] !== undefined ? `top_p ${entry["top_p"]}` : undefined,
       ].filter(Boolean).join(" - "),
       edited: hasEdits,
-      help: agentHelpText(state, name, entry),
+      help: [
+        agentHelpText(state, name, entry["__markdown"] === undefined ? entry : {}),
+        markdown ? `\nMarkdown agent: ${markdown.path}\nMarkdown agents override same-name config entries - edit the file there.` : undefined,
+      ].filter(Boolean).join("\n"),
     }
   })
   for (const module of enabledModuleList()) {
@@ -2838,10 +3445,31 @@ async function agentsScreen(api: TuiPluginApi, state: StudioState): Promise<void
       options.push({ title: entry.title, value: `module-agents:${module.id}:${entry.title}`, description: entry.description, help: entry.help, edited: entry.edited })
     }
   }
+  options.push({ title: "+ New agent...", value: "__new_agent__", description: "add agent.<name> to the config", help: "Creates a config agent entry you can then configure (model, permissions, prompt, mode...)." })
   options.push({ title: "< Back", value: "__back__", description: "Return to main menu" })
 
   const picked = await showMenu(api, { title: "Agents", options })
   if (!picked || picked === "__back__") return mainMenu(api, state)
+  if (picked === "__new_agent__") {
+    const name = await showPrompt(api.ui, { title: "Agent name", placeholder: "e.g. reviewer (letters, numbers, dashes)" })
+    if (name === undefined || name.trim() === "" || !/^[\w.-]+$/.test(name.trim())) return agentsScreen(api, state)
+    if (agents.has(name.trim())) {
+      await showAlert(api.ui, { title: "Exists", message: `Agent "${name.trim()}" already exists.` })
+      return agentsScreen(api, state)
+    }
+    const markdown = state.markdownAgents.find((agent) => agent.name === name.trim())
+    if (markdown) {
+      const proceed = await showConfirm(api.ui, {
+        title: "Markdown collision",
+        message: `A markdown agent "${name.trim()}" exists at\n${markdown.path}\n\nMarkdown overrides config entries for the same name. Create the config entry anyway?`,
+        confirmLabel: "Create anyway",
+      })
+      if (!proceed) return agentsScreen(api, state)
+    }
+    await applyEdits({ api, state }, [{ op: "set", path: ["agent", name.trim()], value: {} }], `agent add ${name.trim()}`)
+    configRestartReasons.push(`${name.trim()}: new agent requires restart to appear in the agent list.`)
+    return agentDetail(api, state, name.trim())
+  }
   if (picked.startsWith("module-agents:")) {
     const rest = picked.slice("module-agents:".length)
     const [moduleId, ...titleParts] = rest.split(":")
@@ -2871,13 +3499,17 @@ function agentHelpText(state: StudioState, name: string, entry: Record<string, u
 
 // Config-savable agent fields edited AV-style (FieldList): values stage into
 // opencode.json through the unified queue.
-const AGENT_CONFIG_FIELDS: Array<{ key: string; label: string; type: "model" | "variant" | "number" | "string" | "json" | "color"; doc: string; restart?: boolean }> = [
+const AGENT_CONFIG_FIELDS: Array<{ key: string; label: string; type: "model" | "variant" | "number" | "string" | "json" | "color" | "enum" | "boolean" | "permission"; doc: string; restart?: boolean; options?: string[] }> = [
   { key: "model", label: "Model", type: "model", doc: "agent.model" },
   { key: "variant", label: "Model variant", type: "variant", doc: "agent.variant" },
   { key: "temperature", label: "Temperature", type: "number", doc: "agent.temperature" },
   { key: "top_p", label: "Top P", type: "number", doc: "agent.top_p" },
   { key: "prompt", label: "Prompt", type: "string", doc: "agent.prompt" },
+  { key: "permission", label: "Permissions", type: "permission", doc: "root.permission" },
   { key: "options", label: "Options", type: "json", doc: "agent.options" },
+  { key: "mode", label: "Mode", type: "enum", options: ["subagent", "primary", "all"], doc: "agent.mode", restart: true },
+  { key: "hidden", label: "Hidden", type: "boolean", doc: "agent.hidden", restart: true },
+  { key: "steps", label: "Max steps", type: "number", doc: "agent.steps" },
   { key: "description", label: "Description", type: "string", doc: "agent.description", restart: true },
   { key: "color", label: "Color", type: "color", doc: "agent.color", restart: true },
 ]
@@ -3069,6 +3701,33 @@ async function agentDetail(api: TuiPluginApi, state: StudioState, agent: string)
       } else {
         await applyEdits(write, [{ op: "set", path: pointer, value: body }], `agent ${agent} ${def.key}`)
       }
+      continue
+    }
+
+    if (def.type === "permission") {
+      await kitPermissionEditor(makeEditorKit(api, state), {
+        title: `Agent ${agent} permissions`,
+        pointer: ["agent", agent, "permission"],
+        doc: "Agent-level permission rules override the root permission set for this agent (ask/allow/deny with wildcard patterns).",
+      })
+      continue
+    }
+
+    if (def.type === "enum" || def.type === "boolean") {
+      const current = agentConfigValue(state, agent, def.key)
+      const options: WizardSelectOption<string>[] = [
+        { title: "(not set - remove)", value: "__remove__", description: "uses the default", danger: true },
+        ...(def.type === "boolean" ? [{ title: "true", value: "true", description: "" }, { title: "false", value: "false", description: "" }] : (def.options ?? []).map((option) => ({ title: option, value: option, description: String(current) === option ? "current" : "" }))),
+        { title: "< Cancel", value: "__cancel__", description: "" },
+      ]
+      const pickedValue = await showMenu(api, { title: `Agent ${agent} - ${def.label}`, options })
+      if (!pickedValue || pickedValue === "__cancel__") continue
+      if (pickedValue === "__remove__") {
+        await applyEdits(write, [{ op: "delete", path: pointer }], `agent ${agent} ${def.key} remove`)
+      } else {
+        await applyEdits(write, [{ op: "set", path: pointer, value: pickedValue === "true" ? true : pickedValue === "false" ? false : pickedValue }], `agent ${agent} ${def.key}`)
+      }
+      if (def.restart) configRestartReasons.push(`${agent}: ${def.label.toLowerCase()} change requires restart.`)
       continue
     }
 
@@ -3311,8 +3970,26 @@ async function diagnosticsScreen(api: TuiPluginApi, state: StudioState): Promise
   const resolved = safeStateConfig(api)
   const uneditable = findUneditableLayers(state.merge.merged, resolved)
   const parseErrors = state.files.filter((file) => file.parseErrors.length > 0)
+  const cleanupFindings = scanCleanupFindings(state)
+  const markdownCollisions = state.markdownAgents.filter((agent) => resolved["agent"] && typeof resolved["agent"] === "object" && (resolved["agent"] as Record<string, unknown>)[agent.name] !== undefined)
+  const bothProviderFilters = Array.isArray(getAtPath(state.merge.merged, ["enabled_providers"])) && getAtPath(state.merge.merged, ["enabled_providers"]) !== undefined && getAtPath(state.merge.merged, ["disabled_providers"]) !== undefined
+  const defaultAgent = typeof resolved["default_agent"] === "string" ? resolved["default_agent"] : undefined
+  const defaultAgentProblem = defaultAgent
+    ? (() => {
+        const agentMap = resolved["agent"] as Record<string, unknown> | undefined
+        const entry = agentMap && typeof agentMap === "object" ? agentMap[defaultAgent] : undefined
+        if (entry === undefined && !["build", "plan", "general"].includes(defaultAgent)) return `"${defaultAgent}" is not defined anywhere - falls back to build`
+        const mode = entry && typeof entry === "object" ? (entry as Record<string, unknown>)["mode"] : undefined
+        if (mode === "subagent") return `"${defaultAgent}" is a subagent - OpenCode rejects it as default`
+        const hidden = entry && typeof entry === "object" ? (entry as Record<string, unknown>)["hidden"] : undefined
+        if (hidden === true) return `"${defaultAgent}" is hidden - OpenCode rejects it as default`
+        return undefined
+      })()
+    : undefined
   const mergeLines = [
     `layers discovered: ${state.files.length}`,
+    `tui.json layers: ${state.tuiFiles.filter((file) => file.exists).length}`,
+    `markdown agents: ${state.markdownAgents.length}`,
     `editable (exist + parse ok): ${editableFiles(state.files).length}`,
     `provider catalog source: ${state.providersSource}`,
     `models.dev metadata: ${state.modelsDevError ? `error - ${state.modelsDevError}` : `${Object.keys(state.modelsDev).length} providers`}`,
@@ -3322,6 +3999,30 @@ async function diagnosticsScreen(api: TuiPluginApi, state: StudioState): Promise
   const sections: PagedSection[] = [
     { title: "Merge report", lines: mergeLines },
   ]
+  if (cleanupFindings.length > 0) {
+    sections.push({
+      title: "Deprecated keys",
+      lines: [
+        `${cleanupFindings.length} deprecated/dead key finding(s) - Cleanup & migrations stages the fixes:`,
+        ...cleanupFindings.flatMap((finding) => [`  ${finding.rule}: ${finding.detail} (${finding.file})`]),
+      ],
+    })
+  }
+  if (markdownCollisions.length > 0) {
+    sections.push({
+      title: "Markdown/config collisions",
+      lines: [
+        "Markdown agents override same-name config entries - config edits to these names have no effect:",
+        ...markdownCollisions.flatMap((agent) => [`  ${agent.name} - ${agent.path}`]),
+      ],
+    })
+  }
+  if (bothProviderFilters) {
+    sections.push({ title: "Provider filter conflict", lines: ["Both enabled_providers and disabled_providers are set - only the allowlist (enabled_providers) takes effect."] })
+  }
+  if (defaultAgentProblem) {
+    sections.push({ title: "Default agent", lines: [defaultAgentProblem] })
+  }
   if (parseErrors.length > 0) {
     sections.push({
       title: "Parse errors",
@@ -3529,6 +4230,7 @@ export const __testInternals = {
   __setMenuProbe,
   SizeSliderDialog,
   PagedDialog,
+  scanCleanupFindings,
   setStudioSettings: (settings: StudioSettings) => {
     studioSettings = settings
   },

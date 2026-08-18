@@ -9,11 +9,12 @@
  * resolved value comes from.
  */
 
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync } from "node:fs"
+import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { deepClone, isPlainObject, parseJsonc, stableStringify } from "./jsonc.js"
 
-export type ConfigLayerKind = "global" | "env" | "project" | "opencode-dir"
+export type ConfigLayerKind = "global" | "env" | "project" | "opencode-dir" | "tui"
 
 export interface ConfigFileEntry {
   id: string
@@ -40,6 +41,8 @@ export interface DiscoveryInput {
   envConfigFile: string | undefined
   directory: string
   worktree: string
+  /** OPENCODE_TUI_CONFIG env-pointed file. */
+  envTuiFile?: string | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +138,113 @@ export function discoverConfigFiles(input: DiscoveryInput): ConfigFileEntry[] {
 
 export function editableFiles(entries: ConfigFileEntry[]): ConfigFileEntry[] {
   return entries.filter((entry) => entry.exists && entry.parseErrors.length === 0)
+}
+
+// ---------------------------------------------------------------------------
+// tui.json layer discovery (mirrors the opencode.json walk with its own
+// precedence family; these files never feed the opencode.json merge)
+// ---------------------------------------------------------------------------
+
+export function discoverTuiFiles(input: DiscoveryInput): ConfigFileEntry[] {
+  const entries: ConfigFileEntry[] = []
+  let precedence = 0
+  for (const name of ["tui.json", "tui.jsonc"]) {
+    entries.push(makeEntry("tui", `global ${name}`, join(input.globalConfigDir, name), precedence++))
+  }
+  if (input.envTuiFile) {
+    entries.push(makeEntry("tui", "OPENCODE_TUI_CONFIG", input.envTuiFile, precedence++))
+  }
+  if (input.directory && input.worktree && input.directory.startsWith(input.worktree)) {
+    const chain = walkUpChain(input.directory, input.worktree).reverse()
+    for (const dir of chain) {
+      for (const name of ["tui.json", "tui.jsonc"]) {
+        const path = join(dir, name)
+        if (existsSync(path)) {
+          const relative = dir === input.worktree ? "." : dir.slice(input.worktree.length + 1)
+          entries.push(makeEntry("tui", `${relative}/${name}`, path, precedence++))
+        }
+      }
+    }
+    for (const dir of chain) {
+      for (const name of ["tui.json", "tui.jsonc"]) {
+        const path = join(dir, ".opencode", name)
+        if (existsSync(path)) entries.push(makeEntry("tui", name, path, precedence++))
+      }
+    }
+  }
+  return entries
+}
+
+// ---------------------------------------------------------------------------
+// Markdown agent discovery (.opencode/agent|agents/**/*.md)
+// ---------------------------------------------------------------------------
+
+export interface MarkdownAgent {
+  name: string
+  path: string
+  source: string
+}
+
+function collectMarkdownAgents(root: string, source: string, out: Map<string, MarkdownAgent>): void {
+  for (const sub of ["agent", "agents"]) {
+    const dir = join(root, sub)
+    if (!existsSync(dir)) continue
+    visitAgentDir(dir, dir, source, out)
+  }
+}
+
+function visitAgentDir(root: string, dir: string, source: string, out: Map<string, MarkdownAgent>): void {
+  let dirents: import("node:fs").Dirent[]
+  try {
+    dirents = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const dirent of dirents) {
+    if (dirent.name === "node_modules" || dirent.name === ".git") continue
+    const full = join(dir, dirent.name)
+    if (dirent.isDirectory()) {
+      visitAgentDir(root, full, source, out)
+      continue
+    }
+    if (!dirent.isFile() || !dirent.name.endsWith(".md")) continue
+    let text = ""
+    try {
+      text = readFileSync(full, "utf8")
+    } catch {
+      continue
+    }
+    let relative = full.slice(root.length + 1).replace(/\\/g, "/")
+    relative = relative.replace(/\.md$/, "")
+    let name = relative
+    const frontmatterName = parseFrontmatterName(text)
+    if (frontmatterName) name = frontmatterName
+    out.set(name, { name, path: full, source })
+  }
+}
+
+function parseFrontmatterName(text: string): string | undefined {
+  if (!text.startsWith("---")) return undefined
+  const end = text.indexOf("\n---", 3)
+  if (end < 0) return undefined
+  for (const line of text.slice(3, end).split(/\r?\n/)) {
+    const match = /^name:\s*(.+)$/.exec(line)
+    if (match) return match[1]!.trim().replace(/^["']|["']$/g, "")
+  }
+  return undefined
+}
+
+export function discoverMarkdownAgents(input: DiscoveryInput): MarkdownAgent[] {
+  const out = new Map<string, MarkdownAgent>()
+  collectMarkdownAgents(input.globalConfigDir, "global config", out)
+  if (input.directory && input.worktree && input.directory.startsWith(input.worktree)) {
+    const chain = walkUpChain(input.directory, input.worktree)
+    for (const dir of chain) {
+      collectMarkdownAgents(join(dir, ".opencode"), `.opencode (${dir})`, out)
+    }
+  }
+  collectMarkdownAgents(join(homedir(), ".opencode"), "~/.opencode", out)
+  return [...out.values()]
 }
 
 // ---------------------------------------------------------------------------
