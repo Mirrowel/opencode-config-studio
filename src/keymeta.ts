@@ -61,6 +61,10 @@ export interface FieldSuggestion {
   value: string
   label: string
   detail: string
+  /** Row color override for the suggestion picker (e.g. "gray" for inactive providers). */
+  color?: string
+  /** Render the row as edited (green) in the suggestion picker. */
+  edited?: boolean
 }
 
 export interface RootKeyMeta {

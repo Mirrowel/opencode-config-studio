@@ -112,7 +112,8 @@ async function stringFieldEditor(kit: EditorKit, spec: { key: string; title: str
       value: suggestion.value,
       description: String(current) === suggestion.value ? "current" : suggestion.value,
       help: suggestion.detail,
-      edited: String(current) === suggestion.value,
+      edited: String(current) === suggestion.value || suggestion.edited === true,
+      color: suggestion.color,
     }))
     options.push({ title: "Custom...", value: "__custom__", description: "enter a raw value", help: spec.doc })
     if (current !== undefined && !spec.suggestions.some((suggestion) => suggestion.value === String(current))) {
@@ -176,7 +177,17 @@ export async function stringListEditor(kit: EditorKit, title: string, pointer: J
     const inverse = new Set(Array.isArray(kit.valueAt([suggestionsFrom === "providersNotEnabled" ? "enabled_providers" : "disabled_providers"])) ? (kit.valueAt([suggestionsFrom === "providersNotEnabled" ? "enabled_providers" : "disabled_providers"]) as unknown[]).map(String) : [])
     suggestions = kit.providerUniverse()
       .filter((row) => !inverse.has(row.providerID))
-      .map((row) => ({ value: row.providerID, label: row.providerID, detail: row.connected ? "active provider" : (row as { isDisabled?: boolean }).isDisabled ? "disabled" : "known provider" }))
+      .map((row) => ({
+        value: row.providerID,
+        label: row.providerID,
+        detail: [
+          row.name !== row.providerID ? `${row.name} (${row.providerID})` : row.providerID,
+          row.connected ? "Active: OpenCode can use it (has auth, not filtered)." : (row as { isDisabled?: boolean }).isDisabled ? "Disabled via disabled_providers." : "Known but not currently active.",
+          "Legend: green = edited (has a config entry), white = enabled, gray = inactive.",
+        ].join("\n"),
+        color: row.connected ? undefined : "gray",
+        edited: row.edited === true,
+      }))
   }
   while (true) {
     const list = kit.valueAt(pointer)
@@ -393,7 +404,13 @@ export async function objectEditor(
         title: field.title,
         value: `field:${field.key}`,
         description: `${preview(value)} (${kit.sourceLabel([...props.pointer, field.key])})`,
-        help: field.doc,
+        help: [
+          field.doc,
+          "",
+          `Current value: ${value === undefined ? "(not set)" : preview(value)}`,
+          `Source: ${kit.sourceLabel([...props.pointer, field.key])}`,
+          field.options ? `Allowed: ${field.options.join(", ")}` : undefined,
+        ].filter(Boolean).join("\n"),
       })
     }
     for (const key of extraKeys) {
@@ -402,6 +419,14 @@ export async function objectEditor(
         value: `extra:${key}`,
         description: `${preview(data[key])} (extra key)`,
         edited: true,
+        help: [
+          `"${key}" is not a known field of this section (OpenCode may ignore it).`,
+          "",
+          `Current value: ${preview(data[key])}`,
+          `Source: ${kit.sourceLabel([...props.pointer, key])}`,
+          "",
+          "Selecting opens a raw JSON editor; the key can be removed by clearing it.",
+        ].join("\n"),
       })
     }
     if (props.allowExtraKeys) {
@@ -476,6 +501,15 @@ export async function settingsScreen(kit: EditorKit): Promise<void> {
           title: group,
           value: group,
           description: `${ROOT_KEYS.filter((meta) => meta.group === group).length} key(s)`,
+          help: [
+            `Settings group "${group}".`,
+            "",
+            ...ROOT_KEYS.filter((meta) => meta.group === group).map((meta) => {
+              const value = kit.valueAt([meta.key])
+              const state = value === undefined ? "unset (default)" : `set: ${preview(value)}`
+              return `${meta.dead ? "[dead] " : meta.deprecated ? "[deprecated] " : ""}${meta.title} - ${state} (${kit.sourceLabel([meta.key])})`
+            }),
+          ].join("\n"),
         })),
         { title: "< Back", value: "__back__", description: "" },
       ],
@@ -503,14 +537,24 @@ export async function settingsFieldDirect(kit: EditorKit, group: string, key: st
 async function settingsGroupScreen(kit: EditorKit, group: string): Promise<void> {
   while (true) {
     const metas = ROOT_KEYS.filter((meta) => meta.group === group)
-    const options: WizardSelectOption<string>[] = metas.map((meta) => ({
-      title: meta.dead ? `${meta.title} [dead]` : meta.deprecated ? `${meta.title} [deprecated]` : meta.title,
-      value: meta.key,
-      description: `${timingBadge(meta.timing)}${meta.concat ? "concat" : ""} ${preview(kit.valueAt([meta.key]))} (${kit.sourceLabel([meta.key])})`.trim(),
-      help: meta.doc + (meta.deprecated ? `\n\nDeprecated: ${meta.deprecated}` : ""),
-      danger: meta.dead === true,
-      edited: kit.valueAt([meta.key]) !== undefined,
-    }))
+    const options: WizardSelectOption<string>[] = metas.map((meta) => {
+      const current = kit.valueAt([meta.key])
+      return {
+        title: meta.dead ? `${meta.title} [dead]` : meta.deprecated ? `${meta.title} [deprecated]` : meta.title,
+        value: meta.key,
+        description: `${timingBadge(meta.timing)}${meta.concat ? "concat" : ""} ${preview(current)} (${kit.sourceLabel([meta.key])})`.trim(),
+        help: [
+          meta.doc + (meta.deprecated ? `\n\nDeprecated: ${meta.deprecated}` : ""),
+          "",
+          `Current value: ${current === undefined ? "(not set - OpenCode default)" : preview(current)}`,
+          `Source: ${kit.sourceLabel([meta.key])}`,
+          `Effect: ${timingLabel(meta.timing)}`,
+          meta.options ? `Allowed: ${meta.options.join(", ")}` : undefined,
+        ].filter(Boolean).join("\n"),
+        danger: meta.dead === true,
+        edited: current !== undefined,
+      }
+    })
     options.push({ title: "< Back", value: "__back__", description: "" })
     const picked = await kit.showMenu({ title: group, options, pinId: `settings:${group}` })
     if (!picked || picked === "__back__") return
@@ -533,6 +577,12 @@ function timingBadge(timing: RootKeyMeta["timing"]): string {
   if (timing === "restart") return "[restart]"
   if (timing === "reload") return "[reload]"
   return ""
+}
+
+function timingLabel(timing: RootKeyMeta["timing"]): string {
+  if (timing === "restart") return "requires an OpenCode restart to take effect"
+  if (timing === "reload") return "applies after Save & exit reloads the config (no restart)"
+  return "applies immediately"
 }
 
 function rootSpecToFieldSpec(meta: RootKeyMeta): ObjectFieldSpec {
@@ -774,12 +824,26 @@ export async function mcpScreen(kit: EditorKit): Promise<void> {
       const object = isPlainObject(entry) ? entry : {}
       const type = object["type"] === "remote" ? "remote" : object["type"] === "local" ? "local" : "overlay"
       const enabled = object["enabled"] === false ? "disabled" : "enabled"
+      const typeHelp = type === "local" ? "Local stdio server: command + args array." : type === "remote" ? "Remote HTTP server." : "Partial entry (usually an enabled:false overlay of a lower layer)."
+      const detail = type === "local"
+        ? Array.isArray(object["command"]) ? `command: ${object["command"].join(" ")}` : "command: (unset)"
+        : type === "remote"
+          ? typeof object["url"] === "string" ? `url: ${object["url"]}` : "url: (unset)"
+          : Object.keys(object).length > 0 ? `keys: ${Object.keys(object).join(", ")}` : "empty"
       return {
         title: name,
         value: `server:${name}`,
         description: `[${type}] ${enabled} (${kit.sourceLabel(["mcp", name])})`,
         edited: true,
-        help: type === "local" ? "Local stdio server: command + args array." : type === "remote" ? "Remote HTTP server." : "Partial entry (usually an enabled:false overlay of a lower layer).",
+        help: [
+          `MCP server "${name}"`,
+          typeHelp,
+          "",
+          detail,
+          `Source: ${kit.sourceLabel(["mcp", name])}`,
+          "",
+          "Restart-required: MCP servers connect at OpenCode startup; changes apply after restart.",
+        ].join("\n"),
       }
     })
     options.push({ title: "+ Add local server", value: "add-local", description: "stdio command" })
@@ -926,12 +990,29 @@ export async function commandScreen(kit: EditorKit): Promise<void> {
   while (true) {
     const commandMap = kit.valueAt(["command"])
     const map = isPlainObject(commandMap) ? commandMap : {}
-    const options: WizardSelectOption<string>[] = Object.keys(map).map((name) => ({
-      title: `/${name}`,
-      value: `cmd:${name}`,
-      description: `${preview(isPlainObject(map[name]) ? map[name]["description"] : undefined, 40)} (${kit.sourceLabel(["command", name])})`,
-      edited: true,
-    }))
+    const options: WizardSelectOption<string>[] = Object.keys(map).map((name) => {
+      const entry = isPlainObject(map[name]) ? map[name] : {}
+      const summary = [
+        typeof entry["description"] === "string" && entry["description"] !== "" ? entry["description"] : undefined,
+        typeof entry["model"] === "string" ? entry["model"] : undefined,
+        entry["subtask"] === true ? "subtask" : undefined,
+      ].filter(Boolean).join(" - ")
+      return {
+        title: `/${name}`,
+        value: `cmd:${name}`,
+        description: `${preview(entry["description"], 40)} (${kit.sourceLabel(["command", name])})`,
+        edited: true,
+        help: [
+          `Slash command "/${name}"`,
+          "",
+          summary || "No description set.",
+          typeof entry["template"] === "string" ? `Template: ${preview(entry["template"], 80)}` : "Template: (unset - required)",
+          `Source: ${kit.sourceLabel(["command", name])}`,
+          "",
+          "Placeholders in the template: $1..$N, $ARGUMENTS; !`cmd` shell segments; @file mentions.",
+        ].join("\n"),
+      }
+    })
     options.push({ title: "+ Add command", value: "add", description: "" })
     options.push({ title: "< Back", value: "__back__", description: Object.keys(map).length === 0 ? "(no custom commands)" : "" })
 
@@ -1074,28 +1155,42 @@ export async function providerListScreen(kit: EditorKit, pointer: JSONPath): Pro
     const universe = kit.providerUniverse?.() ?? Object.keys(map).map((id) => ({ providerID: id, name: id, connected: false, edited: true, known: true }))
     const options: WizardSelectOption<string>[] = universe.map((row) => {
       const hasEntry = isPlainObject(map[row.providerID])
+      const entry: Record<string, unknown> | undefined = hasEntry ? (map[row.providerID] as Record<string, unknown>) : {}
+      const models = isPlainObject(entry["models"]) ? (entry["models"] as Record<string, unknown>) : {}
+      const modelCount = hasEntry ? Object.keys(models).length : (row as { modelCount?: number }).modelCount ?? 0
       const tags: string[] = []
-      if (hasEntry) tags.push("edited")
+      if (hasEntry && Object.keys(models).length > 0) tags.push(`${Object.keys(models).length} edited`)
+      else if (hasEntry) tags.push("edited")
       if (row.connected) tags.push("enabled")
       else if ((row as { isDisabled?: boolean }).isDisabled) tags.push("disabled")
-      else if ((row as { isExcluded?: boolean }).isExcluded) tags.push("excluded")
-      else tags.push(row.known ? "unused" : "catalog")
-      const entry: Record<string, unknown> | undefined = hasEntry ? (map[row.providerID] as Record<string, unknown>) : undefined
-      const models = isPlainObject(entry?.["models"]) ? (entry!["models"] as Record<string, unknown>) : {}
-      const modelCount = hasEntry ? Object.keys(models).length : (row as { modelCount?: number }).modelCount ?? 0
+      else if ((row as { isExcluded?: boolean }).isExcluded) tags.push("allowlist-excluded")
+      else if (!row.known) tags.push("catalog-only")
+      else tags.push("unused")
+      const row_ = row as { npm?: string; source?: string; isDefaultProvider?: boolean }
+      if (row_.isDefaultProvider) tags.push("default provider")
+      if (row_.source) tags.push(`source: ${row_.source}`)
+      const inactive = !row.connected
       return {
         title: row.providerID,
         value: `provider:${row.providerID}`,
-        description: `${row.name}${row.name !== row.providerID ? ` (${row.providerID})` : ""} - ${modelCount} model(s), ${tags.join(", ")}`,
-        edited: row.connected === true,
-        color: row.connected ? undefined : "white",
-        help: `Provider ${row.providerID}${hasEntry ? " has a config entry - selecting opens the full editor." : " has no config entry yet - selecting stages an empty entry and opens the editor."} Green rows are active providers; white rows are disabled, allowlist-excluded, or catalog-only.`,
+        description: `${row.name !== row.providerID ? `${row.name} - ` : ""}${modelCount} model(s)${tags.length > 0 ? ` - ${tags.join(", ")}` : ""}`,
+        edited: hasEntry,
+        color: hasEntry ? undefined : inactive ? "gray" : undefined,
+        help: [
+          `Provider ${row.providerID}${row.name !== row.providerID ? ` (${row.name})` : ""}`,
+          row_.npm ? `Runtime package: ${row_.npm}` : "Runtime package: unknown",
+          row_.source ? `Catalog source: ${row_.source}` : undefined,
+          hasEntry ? "This provider has config-file edits - selecting opens the full editor." : "No config entry - selecting stages an empty entry and opens the editor.",
+          inactive ? "Gray rows are inactive: disabled, allowlist-excluded, or catalog-only." : undefined,
+          "",
+          "Legend: green = edited/custom (has a config entry), white = enabled, gray = disabled/inactive.",
+        ].filter(Boolean).join("\n"),
       }
     })
     options.push({ title: "+ Add provider", value: "add", description: "new custom provider id (api base, npm SDK, models)" })
     options.push({ title: "< Back", value: "__back__", description: universe.length === 0 ? "(no providers found)" : "" })
 
-    const picked = await kit.showMenu({ title: "Providers - all (green = enabled)", options, pinId: "settings:Providers:provider" })
+    const picked = await kit.showMenu({ title: "Providers", options, pinId: "settings:Providers:provider" })
     if (!picked || picked === "__back__") return
     if (picked === "add") {
       const id = await kit.showPrompt({ title: "Provider id", placeholder: "e.g. my-gateway (lowercase, no slashes)" })

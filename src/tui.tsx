@@ -2302,7 +2302,7 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
       help: `Jump straight to ${screenTitle(id)}. (Pinned - press f on that screen's menu to unpin; f on any deep screen's menu to pin it.)`,
     })
   }
-  opts.push({ title: "─ main ─", value: "__qa_divider__", description: "", divider: true })
+  opts.push({ title: "─".repeat(60), value: "__qa_divider__", description: "", divider: true })
   opts.push(
     {
       title: "Settings",
