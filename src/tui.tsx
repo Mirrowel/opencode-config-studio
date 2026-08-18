@@ -1179,10 +1179,11 @@ function MenuDialog<Value>(props: {
   const dimensions = useTerminalDimensions()
   const [filtering, setFiltering] = createSignal(false)
   const [query, setQuery] = createSignal("")
-  const [filterApplied, setFilterApplied] = createSignal(false)
   const visibleOptions = createMemo(() => {
     const text = query().trim()
-    if (!filtering() || text === "") return props.options
+    // Filter on the QUERY, not the input-mode flag: Enter saves the query and
+    // unlocks shortcuts while the list stays filtered; Esc clears it.
+    if (text === "") return props.options
     return rankOptions(
       props.options.map((option) => ({ title: String(option.title), description: option.description ?? "", value: option.value, option })),
       text,
@@ -1235,7 +1236,7 @@ function MenuDialog<Value>(props: {
         }
         props.onDone(undefined)
       } },
-      { name: `${commandPrefix}.filter`, title: "Search list", run: (ctx: KeyContext) => { blockKey(ctx); setFiltering(true); setFilterApplied(true) } },
+      { name: `${commandPrefix}.filter`, title: "Search list", run: (ctx: KeyContext) => { blockKey(ctx); setFiltering(true) } },
       { name: `${commandPrefix}.shield`, title: "Block background input", run: blockKey },
     ],
     bindings: [
@@ -1268,7 +1269,7 @@ function MenuDialog<Value>(props: {
       commands.push({ name: cmdName, title: "Type into search", run: (ctx: KeyContext) => { blockKey(ctx); typeFilterChar(char) } })
       bindings.push({ key: char === " " ? "space" : char, cmd: cmdName, desc: "Type into search" })
     }
-    commands.push({ name: `${commandPrefix}.filterAccept`, title: "Save search", run: (ctx: KeyContext) => { blockKey(ctx); setFiltering(false); setFilterApplied(true); setSelected(0) } })
+    commands.push({ name: `${commandPrefix}.filterAccept`, title: "Save search", run: (ctx: KeyContext) => { blockKey(ctx); setFiltering(false); setSelected(0) } })
     bindings.push({ key: "enter", cmd: `${commandPrefix}.filterAccept`, desc: "Save search" })
     commands.push({ name: `${commandPrefix}.filterClear`, title: "Clear search", run: (ctx: KeyContext) => { blockKey(ctx); clearFilter() } })
     bindings.push({ key: "escape", cmd: `${commandPrefix}.filterClear`, desc: "Clear search" })
@@ -1288,13 +1289,17 @@ function MenuDialog<Value>(props: {
         <Show when={filtering()}>
           <text fg={theme().accent}>/ </text>
           <text fg={theme().text}>{query()}</text>
-          <text fg={theme().textMuted}>{query() === "" ? "type to search - enter accepts - esc exits" : "|"}</text>
+          <text fg={theme().textMuted}>{query() === "" ? "type to search - enter saves - esc clears" : "|"}</text>
         </Show>
         <Show when={!filtering()}>
+          <Show when={query().trim() !== ""}>
+            <text fg={theme().accent}>filter: {query()}</text>
+            <text fg={theme().textMuted}>(esc clears, / edits)</text>
+          </Show>
           <text fg={theme().textMuted}>enter select</text>
           <text fg={theme().textMuted}>up/down move</text>
           <text fg={theme().textMuted}>i help</text>
-          <text fg={filterApplied() && query() === "" ? theme().accent : theme().textMuted}>/ search</text>
+          <text fg={theme().accent}>/ search</text>
         </Show>
       </box>
       <scrollbox maxHeight={listHeight()} ref={(element: ScrollBoxRenderable) => (scroll = element)}>
