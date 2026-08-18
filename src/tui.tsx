@@ -192,6 +192,184 @@ function setWizardDialogHeightPercent(api: TuiPluginApi, value: number) {
   api.kv.set(UI_HEIGHT_PERCENT_KV, clampHeightPercent(value))
 }
 
+// ---------------------------------------------------------------------------
+// Dialog size picker (AV-style slider with a live mini preview)
+// ---------------------------------------------------------------------------
+
+type SizeSliderChoice = { action: "save" | "custom-height" } & { height: number }
+
+async function showSizeSlider(api: TuiPluginApi): Promise<SizeSliderChoice | undefined> {
+  let current = wizardDialogHeightPercent(api)
+  while (true) {
+    const choice = await showSizeSliderOnce(api, current)
+    if (!choice) return undefined
+    current = choice.height
+    if (choice.action === "save") return choice
+
+    const input = await showPrompt(api.ui, {
+      title: "Dialog height percent",
+      placeholder: `${HEIGHT_PERCENT_MIN}-${HEIGHT_PERCENT_MAX}`,
+      value: String(current),
+    })
+    if (input === undefined) continue
+    const value = Number(input)
+    if (!Number.isFinite(value)) {
+      await showAlert(api.ui, { title: "Invalid height", message: `Enter a number from ${HEIGHT_PERCENT_MIN} to ${HEIGHT_PERCENT_MAX}.` })
+      continue
+    }
+    current = clampHeightPercent(value)
+  }
+}
+
+function showSizeSliderOnce(api: TuiPluginApi, current: number): Promise<SizeSliderChoice | undefined> {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = (value: SizeSliderChoice | undefined, clear = true) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+      if (clear) api.ui.dialog.clear()
+    }
+    api.ui.dialog.replace(
+      () => <SizeSliderDialog api={api} current={current} onDone={done} />,
+      () => done(undefined, false),
+    )
+  })
+}
+
+const DIALOG_WIDTH_COLUMNS: Record<DialogSize, number> = { medium: 60, large: 88, xlarge: 116 }
+
+function SizeSliderDialog(props: { api: TuiPluginApi; current: number; onDone: (value: SizeSliderChoice | undefined) => void }) {
+  const theme = () => props.api.theme.current
+  useWizardDialogSize(props.api)
+  useHidePromptCursor(props.api)
+  const dimensions = useTerminalDimensions()
+  const [height, setHeight] = createSignal(clampHeightPercent(props.current))
+  const popMode = props.api.mode.push("config-studio.dialog")
+  const commandPrefix = `config-studio.size.${Math.random().toString(36).slice(2)}`
+
+  const cycleWidth = () => setWizardDialogSize(props.api, nextWizardDialogSize(props.api))
+
+  const setPreset = (preset: DialogHeight) => {
+    const found = HEIGHT_PRESETS.find((item) => item.label === preset)
+    if (found) setHeight(found.value)
+  }
+  const move = (delta: number) => setHeight((value) => clampHeightPercent(value + delta))
+
+  const sliderWidth = createMemo(() => (wizardDialogSize(props.api) === "xlarge" ? 64 : wizardDialogSize(props.api) === "large" ? 48 : 34))
+  const sliderCells = createMemo(() => {
+    const width = sliderWidth()
+    const selected = Math.round(((height() - HEIGHT_PERCENT_MIN) / (HEIGHT_PERCENT_MAX - HEIGHT_PERCENT_MIN)) * (width - 1))
+    const presetPositions = new Map(HEIGHT_PRESETS.map((preset) => [Math.round(((preset.value - HEIGHT_PERCENT_MIN) / (HEIGHT_PERCENT_MAX - HEIGHT_PERCENT_MIN)) * (width - 1)), preset.label]))
+    return Array.from({ length: width }, (_, index) => {
+      const isCurrent = index === selected
+      const preset = presetPositions.get(index)
+      return {
+        char: isCurrent ? "●" : preset ? "│" : index < selected ? "━" : "─",
+        color: isCurrent ? theme().primary : preset ? theme().accent : index < selected ? theme().success : theme().textMuted,
+      }
+    })
+  })
+
+  /** Live mini preview: a mock dialog box scaled to the current settings. */
+  const preview = createMemo(() => {
+    const widthColumns = DIALOG_WIDTH_COLUMNS[wizardDialogSize(props.api)]
+    const previewWidth = Math.max(10, Math.min(sliderWidth() + 4, 72))
+    const scale = previewWidth / widthColumns
+    const rows = Math.max(4, Math.round((dimensions().height * (height() / 100)) * scale))
+    const fill = (text: string, width: number) => {
+      const inner = width - 2
+      const slice = text.length > inner ? text.slice(0, inner - 1) + "…" : text
+      return `│${slice}${" ".repeat(Math.max(0, inner - slice.length))}│`
+    }
+    const lines: string[] = []
+    lines.push(`┌${"─".repeat(previewWidth - 2)}┐`)
+    lines.push(fill("Config Studio (preview)", previewWidth))
+    for (let index = 0; index < rows - 3; index++) lines.push(fill("", previewWidth))
+    lines.push(`└${"─".repeat(previewWidth - 2)}┘`)
+    return lines
+  })
+
+  const unregister = props.api.keymap.registerLayer({
+    priority: 10000,
+    commands: [
+      { name: `${commandPrefix}.width`, title: "Cycle width", run: (ctx: KeyContext) => { blockKey(ctx); cycleWidth() } },
+      { name: `${commandPrefix}.left`, title: "Lower height", run: (ctx: KeyContext) => { blockKey(ctx); move(-1) } },
+      { name: `${commandPrefix}.right`, title: "Raise height", run: (ctx: KeyContext) => { blockKey(ctx); move(1) } },
+      { name: `${commandPrefix}.down`, title: "Lower height faster", run: (ctx: KeyContext) => { blockKey(ctx); move(-5) } },
+      { name: `${commandPrefix}.up`, title: "Raise height faster", run: (ctx: KeyContext) => { blockKey(ctx); move(5) } },
+      { name: `${commandPrefix}.compact`, title: "Compact preset", run: (ctx: KeyContext) => { blockKey(ctx); setPreset("compact") } },
+      { name: `${commandPrefix}.normal`, title: "Normal preset", run: (ctx: KeyContext) => { blockKey(ctx); setPreset("normal") } },
+      { name: `${commandPrefix}.tall`, title: "Tall preset", run: (ctx: KeyContext) => { blockKey(ctx); setPreset("tall") } },
+      { name: `${commandPrefix}.max`, title: "Max preset", run: (ctx: KeyContext) => { blockKey(ctx); setPreset("max") } },
+      { name: `${commandPrefix}.custom`, title: "Custom percent", run: (ctx: KeyContext) => { blockKey(ctx); props.onDone({ action: "custom-height", height: height() }) } },
+      { name: `${commandPrefix}.save`, title: "Save", run: (ctx: KeyContext) => { blockKey(ctx); setWizardDialogHeightPercent(props.api, height()); props.onDone({ action: "save", height: height() }) } },
+      { name: `${commandPrefix}.back`, title: "Back", run: (ctx: KeyContext) => { blockKey(ctx); props.onDone(undefined) } },
+      { name: `${commandPrefix}.shield`, title: "Block background input", run: blockKey },
+    ],
+    bindings: [
+      { key: "w", cmd: `${commandPrefix}.width`, desc: "Cycle width" },
+      { key: "left", cmd: `${commandPrefix}.left`, desc: "Lower height" },
+      { key: "right", cmd: `${commandPrefix}.right`, desc: "Raise height" },
+      { key: "down", cmd: `${commandPrefix}.down`, desc: "Lower height faster" },
+      { key: "up", cmd: `${commandPrefix}.up`, desc: "Raise height faster" },
+      { key: "1", cmd: `${commandPrefix}.compact`, desc: "Compact preset" },
+      { key: "2", cmd: `${commandPrefix}.normal`, desc: "Normal preset" },
+      { key: "3", cmd: `${commandPrefix}.tall`, desc: "Tall preset" },
+      { key: "4", cmd: `${commandPrefix}.max`, desc: "Max preset" },
+      { key: "c", cmd: `${commandPrefix}.custom`, desc: "Custom percent" },
+      { key: "enter", cmd: `${commandPrefix}.save`, desc: "Save" },
+      { key: "escape", cmd: `${commandPrefix}.back`, desc: "Back" },
+      ...shieldBindings(`${commandPrefix}.shield`, ["w", "1", "2", "3", "4", "c"]),
+    ],
+  })
+  onCleanup(() => {
+    unregister()
+    popMode()
+  })
+
+  return (
+    <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
+      <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
+        <text fg={theme().accent}><b>Dialog size</b></text>
+        <text fg={theme().textMuted} onMouseUp={() => props.onDone(undefined)}>esc</text>
+      </box>
+      <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
+        <text fg={theme().textMuted}>Width: <text fg={theme().primary}><b>{wizardDialogSize(props.api)}</b></text> ({DIALOG_WIDTH_COLUMNS[wizardDialogSize(props.api)]} cols, w to cycle)</text>
+        <text fg={theme().textMuted}>Height</text>
+        <text fg={theme().primary}><b>{height()}%</b></text>
+      </box>
+      <box flexDirection="row" width="100%" marginBottom={1}>
+        <text fg={theme().textMuted}>{HEIGHT_PERCENT_MIN}% </text>
+        <For each={sliderCells()}>{(cell) => <text fg={cell.color}>{cell.char}</text>}</For>
+        <text fg={theme().textMuted}> {HEIGHT_PERCENT_MAX}%</text>
+      </box>
+      <box flexDirection="row" gap={2} marginBottom={1}>
+        <box flexDirection="column" gap={0}>
+          <For each={HEIGHT_PRESETS}>
+            {(preset) => <text fg={height() === preset.value ? theme().primary : theme().textMuted}>{preset.key} {preset.label}: {preset.value}%</text>}
+          </For>
+          <text fg={theme().textMuted}> </text>
+          <text fg={theme().textMuted}>left/right 1%</text>
+          <text fg={theme().textMuted}>up/down 5%</text>
+          <text fg={theme().textMuted}>c custom</text>
+        </box>
+        <box flexDirection="column" gap={0}>
+          <For each={preview()}>
+            {(line) => <text fg={theme().textMuted}>{line}</text>}
+          </For>
+        </box>
+      </box>
+      <box flexDirection="row" justifyContent="space-between" width="100%">
+        <text fg={theme().textMuted}>enter save</text>
+        <box paddingLeft={3} paddingRight={3} backgroundColor={theme().primary} onMouseUp={() => { setWizardDialogHeightPercent(props.api, height()); props.onDone({ action: "save", height: height() }) }}>
+          <text fg={theme().background}><b>save</b></text>
+        </box>
+      </box>
+    </box>
+  )
+}
+
 function useWizardDialogSize(api: TuiPluginApi) {
   createEffect(() => api.ui.dialog.setSize(wizardDialogSize(api)))
 }
@@ -3182,16 +3360,10 @@ async function diagnosticsScreen(api: TuiPluginApi, state: StudioState): Promise
 async function uiScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
   const options: WizardSelectOption<string>[] = [
     {
-      title: `Dialog width: ${wizardDialogSize(api)}`,
-      value: "width",
-      description: "Cycle medium / large / xlarge",
-      help: "OpenCode exposes fixed dialog widths: medium = 60 columns, large = 88, xlarge = 116.",
-    },
-    {
-      title: `Dialog height: ${wizardDialogHeightPercent(api)}%`,
-      value: "height",
-      description: "Adjust with presets or a custom percent",
-      help: "Maximum height of Config Studio screens. Presets: compact=32%, normal=50%, tall=68%, max=100%.",
+      title: `Dialog size picker: ${wizardDialogSize(api)}, ${wizardDialogHeightPercent(api)}%`,
+      value: "size-picker",
+      description: "Width + height with live preview",
+      help: "AV-style size picker: cycle width (medium/large/xlarge), slide the height with presets (compact/normal/tall/max) or 1% steps, watch a live mini preview of the resulting dialog box.",
     },
   ]
   for (const module of enabledModuleList()) {
@@ -3209,16 +3381,8 @@ async function uiScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
   options.push({ title: "< Back", value: "__back__", description: "Return to main menu" })
   const picked = await showMenu(api, { title: "Advanced", options })
   if (!picked || picked === "__back__") return mainMenu(api, state)
-  if (picked === "width") {
-    setWizardDialogSize(api, nextWizardDialogSize(api))
-    return uiScreen(api, state)
-  }
-  if (picked === "height") {
-    const input = await showPrompt(api.ui, { title: "Height percent", placeholder: `${HEIGHT_PERCENT_MIN}-${HEIGHT_PERCENT_MAX}`, value: String(wizardDialogHeightPercent(api)) })
-    if (input !== undefined) {
-      const num = Number(input)
-      if (Number.isFinite(num)) setWizardDialogHeightPercent(api, num)
-    }
+  if (picked === "size-picker") {
+    await showSizeSlider(api)
     return uiScreen(api, state)
   }
   if (picked.startsWith("module-advanced:")) {
@@ -3326,14 +3490,17 @@ const tui: TuiPlugin = async (api) => {
     duplicateCheckDone = false
     let state: StudioState | undefined
     // Deferred busy indicator: warm caches skip the dialog entirely; only a
-    // genuinely slow load (cold start) flashes it after 150ms.
+    // genuinely slow load (cold start) flashes it after 150ms. The busy
+    // dialog MUST finish its teardown (dialog.clear) before the first menu
+    // opens - otherwise its clear() wipes the menu that replaced it.
     let settled = false
     const loading = refreshStudio(api).then((result) => {
       settled = true
       return result
     })
+    let busyDone: Promise<void> | undefined
     const busyTimer = setTimeout(() => {
-      if (!settled) void showBusy(api, "Loading config layers...", loading.then(() => undefined))
+      if (!settled) busyDone = showBusy(api, "Loading config layers...", loading.then(() => undefined))
     }, 150)
     ;(busyTimer as { unref?: () => void }).unref?.()
     try {
@@ -3341,6 +3508,7 @@ const tui: TuiPlugin = async (api) => {
     } finally {
       clearTimeout(busyTimer)
     }
+    if (busyDone) await busyDone
     if (!state) return
     await mainMenu(api, state)
   })
