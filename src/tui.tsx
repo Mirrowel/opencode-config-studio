@@ -935,6 +935,26 @@ function studioDataDir(api: TuiPluginApi): string {
   return join(api.state.path.config, PLUGIN_ID)
 }
 
+/** Client-call timeout: startup-adjacent SDK calls must never hang the studio (3s, agent-variants pattern). */
+const CLIENT_CALL_TIMEOUT_MS = 3000
+
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), ms)
+        ;(timer as { unref?: () => void }).unref?.()
+      }),
+    ])
+  } catch {
+    return undefined
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 async function fetchProviders(api: TuiPluginApi): Promise<{ providers: RuntimeProviderLike[]; defaults: Record<string, string>; source: StudioState["providersSource"] }> {
   const client = api.client as unknown as {
     provider?: { list?: (params?: unknown) => Promise<unknown> }
@@ -949,7 +969,7 @@ async function fetchProviders(api: TuiPluginApi): Promise<{ providers: RuntimePr
   }
   try {
     if (typeof client.provider?.list === "function") {
-      const result = unwrap(await client.provider.list())
+      const result = unwrap(await withTimeout(client.provider.list(), CLIENT_CALL_TIMEOUT_MS))
       const all = result?.["all"]
       if (Array.isArray(all)) {
         return {
@@ -964,7 +984,7 @@ async function fetchProviders(api: TuiPluginApi): Promise<{ providers: RuntimePr
   }
   try {
     if (typeof client.config?.providers === "function") {
-      const result = unwrap(await client.config.providers())
+      const result = unwrap(await withTimeout(client.config.providers(), CLIENT_CALL_TIMEOUT_MS))
       const providers = result?.["providers"]
       if (Array.isArray(providers)) {
         return {
@@ -997,7 +1017,9 @@ async function refreshStudio(api: TuiPluginApi, previous?: StudioState): Promise
   // instead of round-tripping client.provider.list() on every open. Saves
   // change file content => new hash => immediate refetch.
   const cacheKey = providerCacheKey(merge)
-  const modelsDevPromise = fetchModelsDev(studioDataDir(api))
+  // 8s interactive cap: a slow/blocked models.dev fetch must not stall the
+  // studio open (stale disk cache still serves as fallback on failure).
+  const modelsDevPromise = fetchModelsDev(studioDataDir(api), 8000)
   let providerResult: { providers: RuntimeProviderLike[]; defaults: Record<string, string>; source: StudioState["providersSource"] }
   const cached = getCachedProviders<RuntimeProviderLike>(cacheKey)
   if (cached) {
@@ -3288,17 +3310,14 @@ const tui: TuiPlugin = async (api) => {
   )
   studioSettings = loadSettings(studioDataDir(api))
 
-  // Startup duplicate check + cache preload: the TUI entry runs at OpenCode
-  // startup. Delayed briefly so the initial TUI render settles; the preload
-  // warms the provider-catalog and models.dev caches so the first studio open
-  // is instant. Opening the studio re-checks (duplicateCheckDone is reset per
-  // command run), which is fine - users should be warned twice rather than
-  // never.
+  // Startup duplicate check ONLY: the TUI entry runs at OpenCode startup, and
+  // eager preloading here (client.provider.list / models.dev fetch) stacks on
+  // OpenCode's own boot work and slows startup. Data loads lazily when the
+  // studio command opens; the provider cache makes every later open instant.
+  // Opening the studio re-checks (duplicateCheckDone is reset per command
+  // run), which is fine - users should be warned twice rather than never.
   const startupCheckTimer = setTimeout(() => {
     void checkStandaloneDuplicates(api).catch(() => {})
-    void refreshStudio(api)
-      .then(() => undefined)
-      .catch(() => undefined)
   }, STARTUP_CHECK_DELAY_MS)
   ;(startupCheckTimer as { unref?: () => void }).unref?.()
 

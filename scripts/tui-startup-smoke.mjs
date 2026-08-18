@@ -19,6 +19,7 @@ if (mod?.id !== "config-studio" || typeof mod?.tui !== "function") throw new Err
 function makeMockApi(globalDir) {
   let confirmProps = undefined
   const dialogCalls = []
+  const clientCalls = { providerList: 0, configProviders: 0 }
   const api = {
     state: {
       path: { config: globalDir, directory: globalDir, worktree: globalDir },
@@ -32,7 +33,20 @@ function makeMockApi(globalDir) {
     command: { register: () => () => {} },
     lifecycle: { onDispose: (fn) => { api.__dispose = fn } },
     renderer: { root: {} },
-    client: {},
+    client: {
+      provider: {
+        list: async () => {
+          clientCalls.providerList++
+          return { data: { all: [], default: {} } }
+        },
+      },
+      config: {
+        providers: async () => {
+          clientCalls.configProviders++
+          return { data: { providers: [] } }
+        },
+      },
+    },
     ui: {
       toast: () => {},
       dialog: {
@@ -53,7 +67,7 @@ function makeMockApi(globalDir) {
       DialogPrompt: () => null,
     },
   }
-  return { api, dialogCalls }
+  return { api, dialogCalls, clientCalls }
 }
 
 const dir = mkdtempSync(path.join(tmpdir(), `studio-startup-${caseName}-`))
@@ -69,9 +83,13 @@ try {
     writeFileSync(path.join(globalDir, "opencode.json"), before, "utf8")
   }
 
-  const { api, dialogCalls } = makeMockApi(globalDir)
+  const { api, dialogCalls, clientCalls } = makeMockApi(globalDir)
   await mod.tui(api)
   await new Promise((resolve) => setTimeout(resolve, 2400))
+
+  if (clientCalls.providerList > 0 || clientCalls.configProviders > 0) {
+    throw new Error(`startup must not preload SDK data (provider.list: ${clientCalls.providerList}, config.providers: ${clientCalls.configProviders})`)
+  }
 
   if (caseName === "silent") {
     if (dialogCalls.length !== 0) throw new Error(`expected no dialogs without duplicates, got ${dialogCalls.length}`)
