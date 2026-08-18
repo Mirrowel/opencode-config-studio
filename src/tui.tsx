@@ -4271,8 +4271,8 @@ function registerStudioCommand(api: TuiPluginApi, run: () => Promise<void>) {
   const command = {
     namespace: "palette",
     name: "config-studio.configure",
-    title: "Config Studio: Models & Variants",
-    desc: "Inspect and edit model variants and request defaults",
+    title: "Config Studio: Configure",
+    desc: "Visual config editor - settings, providers, models, variants, TUI",
     category: "",
     slashName: "config-studio",
     run,
