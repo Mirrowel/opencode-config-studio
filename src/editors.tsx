@@ -22,6 +22,7 @@ import {
   PERMISSION_TOOL_KEYS,
   toolsToPermission,
   type FieldKind,
+  type FieldSuggestion,
   type ObjectFieldSpec,
   type RootKeyMeta,
 } from "./keymeta.js"
@@ -41,10 +42,17 @@ export interface EditorKit {
   valueAt: (pointer: JSONPath) => unknown
   sourceLabel: (pointer: JSONPath) => string
   agentNames: () => string[]
+  /** Variant names of a provider/model reference ("" = none). */
+  variantsFor?: (modelRef: string) => string[]
+  /** Known model families from the live catalog. */
+  modelFamilies?: () => string[]
   /** Host hook: open the file-centric plugin manager. */
   openPlugins?: () => Promise<void>
   /** Host hook: open the agents screen. */
   openAgents?: () => Promise<void>
+  /** Host hooks with a return continuation (settings group re-entry). */
+  openPluginsFrom?: (returnTo: () => Promise<void>) => Promise<void>
+  openAgentsFrom?: (returnTo: () => Promise<void>) => Promise<void>
 }
 
 function preview(value: unknown, max = 46): string {
@@ -95,11 +103,40 @@ async function boolFieldEditor(kit: EditorKit, spec: { key: string; title: strin
   await enumFieldEditor(kit, { ...spec, options: ["true", "false"] }, pointer, current)
 }
 
-async function stringFieldEditor(kit: EditorKit, spec: { key: string; title: string; placeholder?: string; doc: string }, pointer: JSONPath, current: unknown): Promise<void> {
+async function stringFieldEditor(kit: EditorKit, spec: { key: string; title: string; placeholder?: string; doc: string; suggestions?: FieldSuggestion[] }, pointer: JSONPath, current: unknown): Promise<void> {
+  if (spec.suggestions && spec.suggestions.length > 0) {
+    const options: WizardSelectOption<string>[] = spec.suggestions.map((suggestion) => ({
+      title: suggestion.label,
+      value: suggestion.value,
+      description: String(current) === suggestion.value ? "current" : suggestion.value,
+      help: suggestion.detail,
+      edited: String(current) === suggestion.value,
+    }))
+    options.push({ title: "Custom...", value: "__custom__", description: "enter a raw value", help: spec.doc })
+    if (current !== undefined && !spec.suggestions.some((suggestion) => suggestion.value === String(current))) {
+      options.unshift({ title: `${truncate(String(current), 40)} (current, custom)`, value: String(current), description: "keep", edited: true })
+    }
+    options.push({ title: "< Cancel", value: "__cancel__", description: "" })
+    const picked = await kit.showMenu({ title: spec.title, options, current: current !== undefined ? String(current) : undefined })
+    if (picked === undefined || picked === "__cancel__") return
+    if (picked === "__custom__") {
+      const input = await kit.showPrompt({ title: spec.title, placeholder: spec.placeholder ?? "(empty removes)", value: typeof current === "string" ? current : "", description: spec.doc })
+      if (input === undefined) return
+      if (input.trim() === "") {
+        await kit.stage([{ op: "delete", path: pointer }], `${spec.title} removed`)
+      } else {
+        await kit.stage([{ op: "set", path: pointer, value: input.trim() }], `${spec.title} set`)
+      }
+      return
+    }
+    await kit.stage([{ op: "set", path: pointer, value: picked }], `${spec.title} = ${picked}`)
+    return
+  }
   const input = await kit.showPrompt({
     title: spec.title,
     placeholder: spec.placeholder ?? "(empty removes)",
     value: typeof current === "string" ? current : "",
+    description: spec.doc,
   })
   if (input === undefined) return
   if (input.trim() === "") {
@@ -114,6 +151,7 @@ async function numberFieldEditor(kit: EditorKit, spec: { key: string; title: str
     title: spec.title,
     placeholder: spec.placeholder ?? "(empty removes)",
     value: current !== undefined ? String(current) : "",
+    description: spec.doc,
   })
   if (input === undefined) return
   if (input.trim() === "") {
@@ -128,7 +166,7 @@ async function numberFieldEditor(kit: EditorKit, spec: { key: string; title: str
   await kit.stage([{ op: "set", path: pointer, value: num }], `${spec.title} = ${num}`)
 }
 
-export async function stringListEditor(kit: EditorKit, title: string, pointer: JSONPath, doc: string): Promise<void> {
+export async function stringListEditor(kit: EditorKit, title: string, pointer: JSONPath, doc: string, suggestions?: FieldSuggestion[]): Promise<void> {
   while (true) {
     const list = kit.valueAt(pointer)
     const items = Array.isArray(list) ? list.map((item) => String(item)) : []
@@ -138,16 +176,25 @@ export async function stringListEditor(kit: EditorKit, title: string, pointer: J
       description: kit.sourceLabel([...pointer, String(index)]),
       edited: true,
     }))
+    if (suggestions) {
+      for (const suggestion of suggestions) {
+        if (!items.includes(suggestion.value)) options.push({ title: `+ ${suggestion.value}`, value: `quick:${suggestion.value}`, description: suggestion.label, help: suggestion.detail, edited: true })
+      }
+    }
     options.push({ title: "+ Add entry", value: "add", description: "" })
     options.push({ title: "< Back", value: "__back__", description: items.length === 0 ? "(list is empty)" : "" })
     const picked = await kit.showMenu({ title, options, help: doc })
     if (!picked || picked === "__back__") return
 
     if (picked === "add") {
-      const value = await kit.showPrompt({ title: "New entry", placeholder: "value" })
+      const value = await kit.showPrompt({ title: "New entry", placeholder: "value", description: doc })
       if (value === undefined || value.trim() === "") continue
       const next = [...items, value.trim()]
       await kit.stage([{ op: "set", path: pointer, value: next }], `${title}: add`)
+      continue
+    }
+    if (picked.startsWith("quick:")) {
+      await kit.stage([{ op: "set", path: pointer, value: [...items, picked.slice(6)] }], `${title}: add ${picked.slice(6)}`)
       continue
     }
     if (picked.startsWith("edit:")) {
@@ -244,7 +291,7 @@ async function jsonFieldEditor(kit: EditorKit, spec: { title: string; doc: strin
   await kit.stage([{ op: "set", path: pointer, value: body }], `${spec.title} set`)
 }
 
-export async function fieldEditor(kit: EditorKit, spec: ObjectFieldSpec, pointer: JSONPath): Promise<void> {
+export async function fieldEditor(kit: EditorKit, spec: ObjectFieldSpec, pointer: JSONPath, returnTo?: () => Promise<void>): Promise<void> {
   const current = kit.valueAt(pointer)
   switch (spec.kind) {
     case "boolean":
@@ -256,7 +303,7 @@ export async function fieldEditor(kit: EditorKit, spec: ObjectFieldSpec, pointer
     case "number":
       return numberFieldEditor(kit, spec, pointer, current)
     case "stringList":
-      return stringListEditor(kit, spec.title, pointer, spec.doc)
+      return stringListEditor(kit, spec.title, pointer, spec.doc, spec.suggestions)
     case "json":
       return jsonFieldEditor(kit, spec, pointer, current, false)
     case "boolOrJson":
@@ -282,12 +329,16 @@ export async function fieldEditor(kit: EditorKit, spec: ObjectFieldSpec, pointer
       return providerListScreen(kit, pointer)
     }
     case "agentMap": {
+      if (kit.openAgentsFrom && returnTo) return kit.openAgentsFrom(returnTo)
       if (kit.openAgents) return kit.openAgents()
       await kit.showInfo({ title: "Agents", message: "Agent editing lives in the studio's Agents screen (main menu)." })
       return
     }
-    case "pluginList":
+    case "pluginList": {
+      if (kit.openPluginsFrom && returnTo) return kit.openPluginsFrom(returnTo)
+      if (kit.openPlugins) return kit.openPlugins()
       return pluginManagerScreen(kit)
+    }
     case "agent": {
       const names = kit.agentNames()
       const picked = await kit.showMenu({
@@ -405,19 +456,21 @@ export async function objectEditor(
 // ---------------------------------------------------------------------------
 
 export async function settingsScreen(kit: EditorKit): Promise<void> {
-  const groupPicked = await kit.showMenu({
-    title: "Settings",
-    options: [
-      ...ROOT_KEY_GROUPS.map((group) => ({
-        title: group,
-        value: group,
-        description: `${ROOT_KEYS.filter((meta) => meta.group === group).length} key(s)`,
-      })),
-      { title: "< Back", value: "__back__", description: "" },
-    ],
-  })
-  if (!groupPicked || groupPicked === "__back__") return
-  await settingsGroupScreen(kit, groupPicked)
+  while (true) {
+    const groupPicked = await kit.showMenu({
+      title: "Settings",
+      options: [
+        ...ROOT_KEY_GROUPS.map((group) => ({
+          title: group,
+          value: group,
+          description: `${ROOT_KEYS.filter((meta) => meta.group === group).length} key(s)`,
+        })),
+        { title: "< Back", value: "__back__", description: "" },
+      ],
+    })
+    if (!groupPicked || groupPicked === "__back__") return
+    await settingsGroupScreen(kit, groupPicked)
+  }
 }
 
 async function settingsGroupScreen(kit: EditorKit, group: string): Promise<void> {
@@ -445,7 +498,7 @@ async function settingsGroupScreen(kit: EditorKit, group: string): Promise<void>
       if (remove) await kit.stage([{ op: "delete", path: [meta.key] }], `cleanup ${meta.key}`)
       continue
     }
-    await fieldEditor(kit, rootSpecToFieldSpec(meta), [meta.key])
+    await fieldEditor(kit, rootSpecToFieldSpec(meta), [meta.key], async () => settingsGroupScreen(kit, group))
   }
 }
 
@@ -461,9 +514,10 @@ function rootSpecToFieldSpec(meta: RootKeyMeta): ObjectFieldSpec {
     title: meta.title,
     kind: meta.kind,
     options: meta.options,
+    suggestions: meta.suggestions,
     placeholder: meta.placeholder,
-    min: undefined,
-    doc: meta.doc + (meta.deprecated ? `\n\nDeprecated: ${meta.deprecated}` : ""),
+    min: meta.min,
+    doc: meta.doc + (meta.deprecated ? `\n\nDeprecated: ${meta.deprecated}` : "") + (meta.concat ? "\n\nNOTE: entries from all config layers are CONCATENATED (global + project), not replaced." : ""),
     fields: meta.fields,
   }
 }
@@ -872,13 +926,17 @@ export async function commandScreen(kit: EditorKit): Promise<void> {
 }
 
 async function commandEntryScreen(kit: EditorKit, name: string): Promise<void> {
+  const modelRef = kit.valueAt(["command", name, "model"])
+  const variantSuggestions: FieldSuggestion[] | undefined = typeof modelRef === "string" && kit.variantsFor
+    ? kit.variantsFor(modelRef).map((variant) => ({ value: variant, label: variant, detail: `Variant of ${modelRef}` }))
+    : undefined
   const COMMAND_FIELDS: ObjectFieldSpec[] = [
-    { key: "template", title: "Template", kind: "string", doc: "Prompt template; {prompt} is replaced with the user input. Required." },
+    { key: "template", title: "Template", kind: "string", doc: "Prompt template. Placeholders: $1..$N (the highest number receives all remaining args) and $ARGUMENTS (raw arg string). Without placeholders, args append after a blank line. !`cmd` segments run in the shell; @file mentions attach files." },
     { key: "description", title: "Description", kind: "string", doc: "Shown in the command list." },
-    { key: "agent", title: "Agent", kind: "agent", doc: "Agent the command runs as (default: current)." },
-    { key: "model", title: "Model", kind: "model", doc: "Model override for the command run." },
-    { key: "variant", title: "Model variant", kind: "string", doc: "Variant for the model above (provider/model#variant)." },
-    { key: "subtask", title: "Subtask", kind: "boolean", doc: "Run as a nested subtask instead of a top-level turn." },
+    { key: "agent", title: "Agent", kind: "agent", doc: "Agent the command runs as (default: current). Unknown agent names error at run time. Subagent-mode agents always run as detached subtasks." },
+    { key: "model", title: "Model", kind: "model", doc: "Model override for the command run. Priority: command.model > command agent's model > request model > session model." },
+    { key: "variant", title: "Model variant", kind: "string", suggestions: variantSuggestions, doc: "Variant for the model above (provider/model#variant)." },
+    { key: "subtask", title: "Subtask", kind: "boolean", doc: "Run as a nested subtask (fresh context) instead of a top-level turn. Forced true when the target agent is subagent-mode." },
   ]
   await objectEditor(kit, {
     title: `/${name}`,
@@ -1028,10 +1086,14 @@ export async function providerEntryScreen(kit: EditorKit, id: string): Promise<v
 
 export async function modelEntryScreen(kit: EditorKit, providerID: string, modelID: string): Promise<void> {
   const pointer: JSONPath = ["provider", providerID, "models", modelID]
+  const familySuggestions: FieldSuggestion[] | undefined = kit.modelFamilies
+    ? kit.modelFamilies().slice(0, 30).map((family) => ({ value: family, label: family, detail: `Model family present in the live catalog.` }))
+    : undefined
+  const fields = MODEL_FIELDS.map((field) => (field.key === "family" && familySuggestions ? { ...field, suggestions: familySuggestions } : field))
   await objectEditor(kit, {
     title: `Model ${providerID}/${modelID}`,
     pointer,
-    fields: MODEL_FIELDS,
+    fields,
     doc: "Full model entry: capabilities, limits, cost, modalities, default options, and variants.",
     onDelete: async () => {
       await kit.stage([{ op: "delete", path: pointer }], `model remove ${providerID}/${modelID}`)

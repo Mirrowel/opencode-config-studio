@@ -36,6 +36,8 @@ export interface ObjectFieldSpec {
   kind: FieldKind
   /** Enum options (kind: enum). */
   options?: string[]
+  /** Curated choices offered alongside "Custom..." free input (string fields). */
+  suggestions?: FieldSuggestion[]
   /** Placeholder shown in prompts. */
   placeholder?: string
   /** Minimum for numbers. */
@@ -52,12 +54,20 @@ export interface ObjectFieldSpec {
   default?: unknown
 }
 
+/** A curated choice with a one-line explainer (shown in [i]). */
+export interface FieldSuggestion {
+  value: string
+  label: string
+  detail: string
+}
+
 export interface RootKeyMeta {
   key: string
   title: string
   group: string
   kind: FieldKind
   options?: string[]
+  suggestions?: FieldSuggestion[]
   placeholder?: string
   min?: number
   timing: EffectTiming
@@ -209,7 +219,17 @@ export const ROOT_KEYS: RootKeyMeta[] = [
     kind: "string",
     placeholder: "(auto)",
     timing: "live",
-    doc: "Default shell executable for the terminal and the bash tool.",
+    suggestions: [
+      { value: "pwsh", label: "pwsh", detail: "PowerShell 7+ (Windows default first choice)." },
+      { value: "powershell", label: "powershell", detail: "Windows PowerShell 5.1." },
+      { value: "cmd", label: "cmd", detail: "Windows CMD." },
+      { value: "bash", label: "bash", detail: "Login shell sourcing rc files (Unix default)." },
+      { value: "zsh", label: "zsh", detail: "macOS default." },
+      { value: "fish", label: "fish", detail: "NOTE: blacklisted for the bash tool - falls back there." },
+      { value: "nu", label: "nu", detail: "NOTE: blacklisted for the bash tool - falls back there." },
+      { value: "sh", label: "sh", detail: "POSIX shell fallback." },
+    ],
+    doc: "Default shell for the terminal, !`cmd` templates, and the bash tool. Unresolvable values fall back per platform (win32: pwsh > powershell > git-bash > COMSPEC; macOS: zsh; else bash > sh). fish and nu are denied for the bash tool. Source: core/src/shell.ts:16-18, 98-137.",
   },
   {
     key: "instructions",
@@ -626,24 +646,54 @@ export const ALL_KEYBIND_NAMES = Object.values(KEYBIND_GROUPS).flat()
 // ---------------------------------------------------------------------------
 
 export const PROVIDER_OPTIONS_FIELDS: ObjectFieldSpec[] = [
-  { key: "apiKey", title: "API key", kind: "string", placeholder: "(env var if empty)", doc: "Static API key. Prefer env vars via the provider env list; this embeds the key in the config file." },
-  { key: "baseURL", title: "Base URL", kind: "string", placeholder: "https://...", doc: "API endpoint base URL (overrides the SDK default)." },
+  { key: "apiKey", title: "API key", kind: "string", placeholder: "(env var if empty)", doc: "Static API key. Prefer env vars via the provider env list; this embeds the key in the config file. Supports {env:VAR} and {file:path} substitution. Wins over env vars and the auth store." },
+  { key: "baseURL", title: "Base URL", kind: "string", placeholder: "https://...", doc: "API endpoint base URL (overrides the catalog URL and provider.api). Passed to the SDK verbatim - no trailing-slash normalization." },
   { key: "enterpriseUrl", title: "Enterprise URL", kind: "string", placeholder: "https://...", doc: "Enterprise gateway endpoint." },
   { key: "setCacheKey", title: "Cache key", kind: "string", doc: "Prompt-cache key override." },
   { key: "timeout", title: "Timeout (ms)", kind: "number", min: 1, placeholder: "(SDK default)", doc: "Overall request timeout. false disables." },
-  { key: "headerTimeout", title: "Header timeout (ms)", kind: "number", min: 1, placeholder: "(SDK default)", doc: "Response-header timeout. false disables." },
-  { key: "chunkTimeout", title: "Chunk timeout (ms)", kind: "number", min: 1, placeholder: "(SDK default)", doc: "Inter-chunk timeout for streams. false disables." },
+  { key: "headerTimeout", title: "Header timeout (ms)", kind: "number", min: 1, placeholder: "(SDK default)", doc: "Response-header timeout. false disables. OpenAI defaults to 300000ms." },
+  { key: "chunkTimeout", title: "Chunk timeout (ms)", kind: "number", min: 1, placeholder: "(SDK default)", doc: "Inter-chunk timeout for streams - aborts a stream that stalls." },
+]
+
+/** SDK packages OpenCode's provider factory supports, with pick guidance. */
+export const SDK_PACKAGES: FieldSuggestion[] = [
+  { value: "@ai-sdk/openai-compatible", label: "OpenAI-compatible", detail: "DEFAULT FALLBACK. Any gateway/local server exposing the OpenAI chat-completions schema (Ollama, vLLM, LM Studio, LiteLLM...). Needs options.baseURL." },
+  { value: "@ai-sdk/openai", label: "OpenAI Responses", detail: "OpenAI proper or endpoints speaking /v1/responses." },
+  { value: "@ai-sdk/anthropic", label: "Anthropic Messages", detail: "Claude and Anthropic-compatible endpoints. Auto prompt caching; interleaved-thinking beta headers." },
+  { value: "@ai-sdk/azure", label: "Azure OpenAI", detail: "Azure-hosted OpenAI. Needs resourceName / AZURE_RESOURCE_NAME or baseURL; useCompletionUrls forces chat-style URLs." },
+  { value: "@ai-sdk/google", label: "Google Gemini (API key)", detail: "Gemini via Google AI Studio key." },
+  { value: "@ai-sdk/google-vertex", label: "Vertex AI (ADC)", detail: "Gemini on GCP with application default credentials. Needs project or env." },
+  { value: "@ai-sdk/google-vertex/anthropic", label: "Anthropic on Vertex", detail: "Claude models on GCP Vertex AI." },
+  { value: "@ai-sdk/amazon-bedrock", label: "AWS Bedrock (IAM)", detail: "Bedrock with SigV4/IAM auth - NOT apiKey headers. Options: region (default us-east-1), profile, endpoint. Cross-region prefixes auto-applied." },
+  { value: "@ai-sdk/amazon-bedrock/mantle", label: "Bedrock Mantle", detail: "OpenAI Responses-style models hosted on Bedrock Mantle." },
+  { value: "@ai-sdk/gateway", label: "Vercel AI Gateway", detail: "Routing many upstreams through Vercel's gateway. Model ids are provider/model." },
+  { value: "@openrouter/ai-sdk-provider", label: "OpenRouter", detail: "OpenRouter routing; sends opencode referer headers." },
+  { value: "@ai-sdk/github-copilot", label: "GitHub Copilot", detail: "Copilot subscriptions via OAuth device flow. enterpriseUrl for GHES." },
+  { value: "gitlab-ai-provider", label: "GitLab Duo", detail: "GitLab Duo Agent Platform. GITLAB_TOKEN or OAuth." },
+  { value: "@ai-sdk/xai", label: "xAI Grok", detail: "grok.com (Responses API)." },
+  { value: "@ai-sdk/mistral", label: "Mistral", detail: "Mistral API. Fixes tool-call-id scrubbing and message sequences." },
+  { value: "@ai-sdk/groq", label: "Groq", detail: "Groq ultra-fast inference endpoints; OpenAI-schema compatible." },
+  { value: "@ai-sdk/deepinfra", label: "DeepInfra", detail: "DeepInfra; emits prompt_cache_key." },
+  { value: "@ai-sdk/cerebras", label: "Cerebras", detail: "Cerebras; 3rd-party integration header." },
+  { value: "@ai-sdk/cohere", label: "Cohere", detail: "Cohere; reasoning via thinking toggle only." },
+  { value: "@ai-sdk/togetherai", label: "Together AI", detail: "Together AI hosted open-weight models." },
+  { value: "@ai-sdk/perplexity", label: "Perplexity", detail: "Perplexity Sonar models; no reasoning variants." },
+  { value: "@ai-sdk/vercel", label: "Vercel Marketplace", detail: "Vercel AI Marketplace models; sends Vercel referer headers." },
+  { value: "@ai-sdk/alibaba", label: "Alibaba DashScope", detail: "Qwen etc.; anthropic-style cacheControl." },
+  { value: "venice-ai-sdk-provider", label: "Venice AI", detail: "Venice AI privacy-focused, no-log inference." },
+  { value: "@jerome-benoit/sap-ai-provider-v2", label: "SAP AI Core", detail: "SAP AI Core; reasoning options must be wrapped in modelParams." },
+  { value: "ai-gateway-provider", label: "Cloudflare AI Gateway", detail: "Cloudflare gateway; model ids are provider/model." },
 ]
 
 export const PROVIDER_FIELDS: ObjectFieldSpec[] = [
-  { key: "name", title: "Display name", kind: "string", doc: "Human-readable provider name shown in pickers." },
-  { key: "api", title: "API base", kind: "string", placeholder: "e.g. openai-compatible", doc: "API family the provider speaks - selects the SDK integration (e.g. openai-compatible, anthropic)." },
-  { key: "npm", title: "SDK package", kind: "string", placeholder: "e.g. @ai-sdk/openai-compatible", doc: "npm package implementing the API. Required for api bases that are not built in." },
-  { key: "id", title: "Provider id", kind: "string", doc: "Explicit provider id override (defaults to the config key)." },
-  { key: "env", title: "API key env vars", kind: "stringList", doc: "Environment variable names probed for the API key, in order." },
-  { key: "whitelist", title: "Model whitelist", kind: "stringList", doc: "Only expose these model ids from the catalog for this provider." },
-  { key: "blacklist", title: "Model blacklist", kind: "stringList", doc: "Hide these model ids for this provider." },
-  { key: "options", title: "Connection options", kind: "object", doc: "SDK connection options (apiKey, baseURL, timeouts, ...).", fields: PROVIDER_OPTIONS_FIELDS, allowExtraKeys: true, extraKeysLabel: "Other options" },
+  { key: "name", title: "Display name", kind: "string", doc: "Human-readable provider name shown in pickers. Falls back to the catalog name, then the config key." },
+  { key: "api", title: "API base URL", kind: "string", placeholder: "https://...", doc: "Base URL for the provider's models (NOT a protocol selector - the wire protocol is chosen by the SDK package). Resolution: options.baseURL > per-model provider.api > this > catalog. ${VAR} env substitution supported." },
+  { key: "npm", title: "SDK package", kind: "string", suggestions: SDK_PACKAGES, doc: "AI SDK integration package. The factory export (create*) of this package builds the client. Fallback chain ends at @ai-sdk/openai-compatible; per-model override via models.<id>.provider.npm." },
+  { key: "id", title: "Provider id", kind: "string", doc: "Explicit provider id override (rarely used; the config key is the authoritative id)." },
+  { key: "env", title: "API key env vars", kind: "stringList", doc: "Environment variable names probed for the API key IN ARRAY ORDER - first one that is set wins. No key found and no auth => provider stays inactive." },
+  { key: "whitelist", title: "Model whitelist", kind: "stringList", doc: "Only expose these exact model ids (exact string match, no globs)." },
+  { key: "blacklist", title: "Model blacklist", kind: "stringList", doc: "Hide these exact model ids (applied after the whitelist)." },
+  { key: "options", title: "Connection options", kind: "object", doc: "SDK connection options (apiKey, baseURL, timeouts, ...). Unknown keys are forwarded verbatim to the SDK factory - Azure resourceName, Bedrock region/profile/endpoint, Vertex project/location all live here.", fields: PROVIDER_OPTIONS_FIELDS, allowExtraKeys: true, extraKeysLabel: "Other options" },
   { key: "models", title: "Models", kind: "providerMap", doc: "Model entries: full custom models and overrides of catalog models." },
 ]
 
@@ -651,41 +701,41 @@ export const MODEL_STATUS_OPTIONS = ["active", "alpha", "beta", "deprecated"]
 
 export const MODEL_FIELDS: ObjectFieldSpec[] = [
   { key: "name", title: "Display name", kind: "string", doc: "Model name shown in pickers." },
-  { key: "id", title: "Model id", kind: "string", doc: "Explicit model id override (defaults to the config key)." },
-  { key: "family", title: "Family", kind: "string", doc: "Model family id (e.g. glm, gpt)." },
-  { key: "release_date", title: "Release date", kind: "string", placeholder: "YYYY-MM-DD", doc: "Release date for sort/upgrade decisions." },
-  { key: "attachment", title: "Attachments", kind: "enum", options: ["true", "false"], placeholder: "(family default)", doc: "Whether the model accepts images/files." },
-  { key: "reasoning", title: "Reasoning", kind: "enum", options: ["true", "false"], placeholder: "(family default)", doc: "Whether the model supports reasoning/thinking." },
-  { key: "temperature", title: "Temperature", kind: "enum", options: ["true", "false"], placeholder: "(family default)", doc: "Whether the model accepts a temperature parameter." },
-  { key: "tool_call", title: "Tool calls", kind: "enum", options: ["true", "false"], placeholder: "(family default)", doc: "Whether the model supports tool calling." },
-  { key: "interleaved", title: "Interleaved thinking", kind: "enum", options: ["true", "false"], placeholder: "(family default)", doc: "Whether thinking can be interleaved between tool calls." },
-  { key: "status", title: "Status", kind: "enum", options: MODEL_STATUS_OPTIONS, placeholder: "active", doc: "Lifecycle status.", default: "active" },
+  { key: "id", title: "Model id", kind: "string", doc: "Upstream API model id override. The config key is the opencode-facing id; the SDK is called with this value (falls back to catalog, then the key)." },
+  { key: "family", title: "Family", kind: "string", doc: "Model family id (e.g. glm, gpt). Drives small-model selection priority and reasoning heuristics." },
+  { key: "release_date", title: "Release date", kind: "string", placeholder: "YYYY-MM-DD", doc: "Newest-first sorting in pickers + lexicographic gates for OpenAI effort variants - must be YYYY-MM-DD to behave correctly (no format enforcement)." },
+  { key: "attachment", title: "Attachments", kind: "enum", options: ["true", "false"], placeholder: "(family default)", doc: "Whether the model accepts images/files. Claiming support the API lacks => upstream errors; omitting it => attachments become error text parts." },
+  { key: "reasoning", title: "Reasoning", kind: "enum", options: ["true", "false"], placeholder: "(family default)", doc: "Gates ALL reasoning variants - false yields an empty variant map and no thinking options." },
+  { key: "temperature", title: "Temperature", kind: "enum", options: ["true", "false"], placeholder: "(family default)", doc: "false = the temperature parameter is omitted from requests entirely." },
+  { key: "tool_call", title: "Tool calls", kind: "enum", options: ["true", "false"], placeholder: "true", doc: "Whether the model supports tool/function calling (default true)." },
+  { key: "interleaved", title: "Interleaved thinking", kind: "enum", options: ["true", "false"], placeholder: "(family default)", doc: "Whether thinking can be interleaved between tool calls. String / {field} forms (e.g. reasoning_content for DeepSeek) edit via raw JSON." },
+  { key: "status", title: "Status", kind: "enum", options: MODEL_STATUS_OPTIONS, placeholder: "active", doc: "deprecated => the model is DELETED from the provider entirely (invisible/unusable). alpha => deleted unless experimental-models flag. beta/active shown normally.", default: "active" },
   {
     key: "limit",
     title: "Limits",
     kind: "object",
-    doc: "Context/output token limits.",
+    doc: "Token limits. context: 0 disables overflow checks. usable = input - reserved (or context - maxOutput); reaching usable triggers auto-compaction. maxOutput = min(output, 32000).",
     fields: [
-      { key: "context", title: "Context", kind: "number", min: 1, placeholder: "(unknown)", doc: "Total context window tokens." },
-      { key: "input", title: "Input", kind: "number", min: 1, placeholder: "(= context)", doc: "Maximum input tokens." },
-      { key: "output", title: "Output", kind: "number", min: 1, placeholder: "(unknown)", doc: "Maximum output tokens." },
+      { key: "context", title: "Context", kind: "number", min: 1, placeholder: "(unknown)", doc: "Total context window tokens. 0 disables overflow checks." },
+      { key: "input", title: "Input", kind: "number", min: 1, placeholder: "(= context)", doc: "Maximum input tokens (enables input-based compaction math when set)." },
+      { key: "output", title: "Output", kind: "number", min: 1, placeholder: "(unknown)", doc: "Maximum output tokens; also caps reasoning budgets." },
     ],
   },
   {
     key: "cost",
     title: "Cost (USD / Mtok)",
     kind: "object",
-    doc: "Pricing per million tokens; used to estimate session cost.",
+    doc: "Numbers (not strings), USD per 1M tokens. input: 0 marks the model free. Reasoning tokens bill at output rate.",
     fields: [
-      { key: "input", title: "Input", kind: "string", placeholder: "e.g. 0.5", doc: "Input cost." },
-      { key: "output", title: "Output", kind: "string", placeholder: "e.g. 2", doc: "Output cost." },
-      { key: "cache_read", title: "Cache read", kind: "string", placeholder: "(free)", doc: "Cached-prompt read cost." },
-      { key: "cache_write", title: "Cache write", kind: "string", placeholder: "(free)", doc: "Prompt-cache write cost." },
+      { key: "input", title: "Input", kind: "string", placeholder: "e.g. 0.5", doc: "Input cost per Mtok." },
+      { key: "output", title: "Output", kind: "string", placeholder: "e.g. 2", doc: "Output cost per Mtok." },
+      { key: "cache_read", title: "Cache read", kind: "string", placeholder: "(free)", doc: "Cached-prompt read cost per Mtok." },
+      { key: "cache_write", title: "Cache write", kind: "string", placeholder: "(free)", doc: "Prompt-cache write cost per Mtok." },
       {
         key: "context_over_200k",
         title: "Over 200k rates",
         kind: "object",
-        doc: "Differential rates applied above 200k context (long-context pricing).",
+        doc: "Differential rates applied when context exceeds 200k tokens (long-context pricing).",
         fields: [
           { key: "input", title: "Input", kind: "string", placeholder: "(same)", doc: "Input cost above 200k." },
           { key: "output", title: "Output", kind: "string", placeholder: "(same)", doc: "Output cost above 200k." },
@@ -699,22 +749,22 @@ export const MODEL_FIELDS: ObjectFieldSpec[] = [
     key: "modalities",
     title: "Modalities",
     kind: "object",
-    doc: "Accepted and produced modalities.",
+    doc: "Accepted and produced modalities. Valid literals ONLY: text, audio, image, video, pdf - anything else fails validation.",
     fields: [
-      { key: "input", title: "Input", kind: "stringList", doc: "e.g. text, image, audio." },
-      { key: "output", title: "Output", kind: "stringList", doc: "e.g. text, image." },
+      { key: "input", title: "Input", kind: "stringList", suggestions: [{ value: "text", label: "text", detail: "Plain text input." }, { value: "image", label: "image", detail: "Image attachments." }, { value: "audio", label: "audio", detail: "Audio attachments." }, { value: "video", label: "video", detail: "Video attachments." }, { value: "pdf", label: "pdf", detail: "PDF documents." }], doc: "e.g. text, image." },
+      { key: "output", title: "Output", kind: "stringList", suggestions: [{ value: "text", label: "text", detail: "Plain text output." }, { value: "image", label: "image", detail: "Image generation." }], doc: "e.g. text." },
     ],
   },
-  { key: "options", title: "Default request options", kind: "json", doc: "Options merged into every request for this model when no variant overrides them (the model default-options editor)." },
-  { key: "headers", title: "Extra headers", kind: "json", doc: "HTTP headers sent with every request for this model." },
+  { key: "options", title: "Default request options", kind: "json", doc: "Options merged into every request for this model when no variant overrides them (the model default-options editor). Request-time merge: SDK defaults < model.options < agent.options < variant." },
+  { key: "headers", title: "Extra headers", kind: "json", doc: "HTTP headers sent with every request for this model (override provider headers)." },
   {
     key: "provider",
     title: "Per-model provider",
     kind: "object",
-    doc: "Provider override for a single model (custom API/npm wiring).",
+    doc: "Provider override for a single model (custom SDK/URL wiring).",
     fields: [
-      { key: "npm", title: "SDK package", kind: "string", doc: "npm package implementing the API." },
-      { key: "api", title: "API base", kind: "string", doc: "API family selector." },
+      { key: "npm", title: "SDK package", kind: "string", suggestions: SDK_PACKAGES, doc: "npm package implementing the API for this model." },
+      { key: "api", title: "API base URL", kind: "string", doc: "Base URL for this model." },
     ],
   },
   { key: "variants", title: "Variants", kind: "json", doc: "Named parameter presets selected via provider/model#variant. Managed from the model detail view." },

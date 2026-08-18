@@ -7,6 +7,8 @@
  */
 
 export interface FieldDoc {
+  /** Code citation shown at the end of the help text. */
+  source?: string
   id: string
   title: string
   summary: string
@@ -24,6 +26,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "Changing the default does not rewrite existing sessions - switching models in a session is per-session.",
       "The configured model becomes the catalog default when its provider is available and the model is enabled. Otherwise OpenCode falls back to the newest available supported model.",
     ],
+    source: "Source: OpenCode core/src/v1/config/config.ts:74-76; provider/provider.ts:1978-2034",
   },
   "root.small_model": {
     id: "root.small_model",
@@ -34,6 +37,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "Small-model requests never apply the selected variant. They use the FIRST variant body of the model if one exists (see request capture to verify what that sends), plus a few provider tweaks.",
       "When unset, OpenCode picks a small model automatically per provider.",
     ],
+    source: "Source: config.ts:77-79; provider.ts:1909-1976",
   },
   "root.default_agent": {
     id: "root.default_agent",
@@ -42,6 +46,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
     lines: [
       "Names the agent that new sessions start with (default: build).",
     ],
+    source: "Source: config.ts:80-83; agent/agent.ts:328-339",
   },
   "root.disabled_providers": {
     id: "root.disabled_providers",
@@ -50,6 +55,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
     lines: [
       "A list of provider IDs. Disabled providers disappear from the model picker and their models cannot be selected.",
     ],
+    source: "Source: config.ts:68-73; provider.ts:1418-1422",
   },
   "root.provider": {
     id: "root.provider",
@@ -61,6 +67,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "models is keyed by catalog model ID. Each model entry can override metadata (name, limit, cost, reasoning, ...) and define options and variants.",
       "At request time provider values are inherited by the model, model values override the provider, and the selected variant is applied last.",
     ],
+    source: "Source: core/src/v1/config/provider.ts:82-126; provider.ts:1452-1550",
   },
   "root.agent": {
     id: "root.agent",
@@ -70,6 +77,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "Keyed by agent name. Common fields: model, variant, temperature, top_p, prompt, description, options, mode, hidden, permission, tools, disable.",
       "agent.<name>.variant applies only when the session uses that agent's configured model.",
     ],
+    source: "Source: core/src/v1/config/agent.ts:12-41; agent.ts:140-293",
   },
   "root.instructions": {
     id: "root.instructions",
@@ -78,6 +86,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
     lines: [
       "Arrays from multiple config files are concatenated, unlike most other keys which are overridden by the highest-precedence file.",
     ],
+    source: "Source: config.ts:124-126 + 45-51; session/instruction.ts",
   },
 
   "provider.name": {
@@ -85,6 +94,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
     title: "provider.<id>.name",
     summary: "Display name for the provider.",
     lines: ["Shown in pickers and menus instead of the provider ID."],
+    source: "Source: provider.ts:1456",
   },
   "provider.env": {
     id: "provider.env",
@@ -93,6 +103,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
     lines: [
       "The provider counts as connected when at least one of these variables is set (unless options.apiKey replaces the need).",
     ],
+    source: "Source: provider.ts:1557-1561",
   },
   "provider.npm": {
     id: "provider.npm",
@@ -102,6 +113,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "Which AI SDK integration serves this provider, e.g. @ai-sdk/openai-compatible or @ai-sdk/anthropic.",
       "The package decides how option keys are serialized into the request body, and which base defaults apply.",
     ],
+    source: "Source: provider.ts:107-134, 1801-1826",
   },
   "provider.options": {
     id: "provider.options",
@@ -111,18 +123,21 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "Common keys: apiKey, baseURL, timeout (ms or false), headerTimeout, chunkTimeout, setCacheKey.",
       "provider.options are inherited by every model of the provider; model.options override them per model.",
     ],
+    source: "Source: provider.ts:1729-1798; variable.ts:33-91",
   },
   "provider.whitelist": {
     id: "provider.whitelist",
     title: "provider.<id>.whitelist",
     summary: "Keep only the listed model IDs.",
     lines: ["Hides every model of the provider except the listed ones. blacklist then removes entries from that set."],
+    source: "Source: provider.ts:1666-1668",
   },
   "provider.blacklist": {
     id: "provider.blacklist",
     title: "provider.<id>.blacklist",
     summary: "Hide the listed model IDs.",
     lines: ["Removes specific models from the picker and catalog for this provider."],
+    source: "Source: provider.ts:1665-1666",
   },
   "provider.models": {
     id: "provider.models",
@@ -133,6 +148,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "A model ID that is not in the catalog creates a custom model; set modelID-like fields (name, reasoning, tool_call, limit, cost, options, variants) so OpenCode can route it.",
       "Use the canonical lowercase model id as the key - display-name casing creates a separate key that never attaches to the built-in model.",
     ],
+    source: "Source: core/src/v1/config/provider.ts:13-80; provider.ts:1463-1547",
   },
 
   "model.name": {
@@ -140,6 +156,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
     title: "models.<id>.name",
     summary: "Display name of the model.",
     lines: ["Shown in the model picker and menus."],
+    source: "Source: provider.ts:1475-1479",
   },
   "model.reasoning": {
     id: "model.reasoning",
@@ -148,18 +165,21 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
     lines: [
       "Controls whether variant derivation and several base defaults (thinking toggles, reasoning summaries) apply.",
     ],
+    source: "Source: provider/transform.ts:729-731",
   },
   "model.tool_call": {
     id: "model.tool_call",
     title: "models.<id>.tool_call",
     summary: "Whether the model supports tool calling.",
     lines: ["Agent features that require tools disable themselves when this is false."],
+    source: "Source: provider.ts:1494",
   },
   "model.temperature": {
     id: "model.temperature",
     title: "models.<id>.temperature",
     summary: "Whether the model accepts sampling temperature.",
     lines: ["When false, temperature is omitted from requests even if configured."],
+    source: "Source: session/request.ts:124-126; transform.ts:528-546",
   },
   "model.limit": {
     id: "model.limit",
@@ -169,12 +189,14 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "limit.context and limit.output bound the usable window and the max output tokens per request.",
       "Budget-token variants (high/max) are computed from these limits.",
     ],
+    source: "Source: session/overflow.ts:10-34; transform.ts:18",
   },
   "model.cost": {
     id: "model.cost",
     title: "models.<id>.cost",
     summary: "Per-token pricing.",
     lines: ["cost.input, cost.output, cost.cache.read, cost.cache.write in dollars per million tokens."],
+    source: "Source: core/src/v1/config/provider.ts:31-46; session.ts:386-403",
   },
   "model.options": {
     id: "model.options",
@@ -185,6 +207,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "This is the 'default' lever: keys set here are sent on every invocation of the model that does not select a variant carrying the same keys.",
       "Use 'Copy from variant' in the Default options editor to materialize a variant body here.",
     ],
+    source: "Source: request.ts:80-91; transform.ts:1360-1418",
   },
   "model.variants": {
     id: "model.variants",
@@ -196,6 +219,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "disabled: true removes the variant from the catalog and picker while keeping the config.",
       "Derived variant names come from models.dev metadata (reasoning effort tiers, token budgets, thinking toggles); do not assume low/high/max exist for every model.",
     ],
+    source: "Source: provider.ts:1538-1546 + 1675-1682",
   },
 
   "variant.reasoningEffort": {
@@ -265,6 +289,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "When set, the agent uses this model for its sessions.",
       "Subagents (task tool calls) whose agent sets a model do NOT inherit the parent's selected variant - they use agent.variant or the model default.",
     ],
+    source: "Source: core/src/v1/config/agent.ts:15-20; tool/task.ts:179-212",
   },
   "agent.variant": {
     id: "agent.variant",
@@ -274,18 +299,21 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "Applies only when the session uses this agent's configured model and the variant exists in that model's variant map.",
       "A variant selected in the session (model picker or prompt) overrides the agent default.",
     ],
+    source: "Source: tool/task.ts:179-212",
   },
   "agent.temperature": {
     id: "agent.temperature",
     title: "agent.<name>.temperature",
     summary: "Sampling temperature override for the agent.",
     lines: ["Sent only when the model supports temperature."],
+    source: "Source: request.ts:80-91",
   },
   "agent.top_p": {
     id: "agent.top_p",
     title: "agent.<name>.top_p",
     summary: "Nucleus sampling override for the agent.",
     lines: ["Sent only when the model supports it."],
+    source: "Source: request.ts:80-91",
   },
   "agent.options": {
     id: "agent.options",
@@ -295,6 +323,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "Merged after model options and before the variant body.",
       "Good place for provider-specific keys an agent should always send.",
     ],
+    source: "Source: request.ts:80-91 (merge: SDK < model < agent < variant)",
   },
   "agent.prompt": {
     id: "agent.prompt",
@@ -304,6 +333,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "Agents can also be defined as markdown files (.opencode/agent/*.md); the config value wins when both exist.",
       "Editing the prompt applies after Save & exit (config reload); no OpenCode restart needed.",
     ],
+    source: "Source: agent/agent.ts:281-293; config/agent.ts:11-32",
   },
   "agent.description": {
     id: "agent.description",
@@ -313,6 +343,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "The main model reads this to decide when to pick the agent - clear descriptions improve selection.",
       "RESTART REQUIRED: OpenCode caches the task list at startup; the new description appears after restart.",
     ],
+    source: "Source: agent.ts:274-293",
   },
   "agent.color": {
     id: "agent.color",
@@ -322,6 +353,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "Theme colors: primary, secondary, accent, success, warning, error, info.",
       "RESTART REQUIRED: cached UI metadata updates only after restart.",
     ],
+    source: "Source: agent.ts:274-293",
   },
   "agent.disable": {
     id: "agent.disable",
@@ -331,6 +363,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "True disable written to opencode.json; removes the agent everywhere (variants included).",
       "Agent Variants parent-patch disable (sidecar) is a softer variant-machinery switch; see the Variants submenu.",
     ],
+    source: "Source: agent.ts:268-271",
   },
 
   "concept.precedence": {
@@ -348,6 +381,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "Plain values: the strongest file wins per key. Objects deep-merge per leaf. instructions arrays concatenate.",
       "OpenCode reads files at startup; after editing, Config Studio triggers a config reload (instance disposal) so changes apply without an app restart.",
     ],
+    source: "Source: opencode/src/config/config.ts:398-434",
   },
   "concept.request": {
     id: "concept.request",
@@ -361,6 +395,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "Subagents inherit the parent session's selected variant only when the agent does not set its own model.",
       "Use 'Capture real request' for ground truth - it runs the full pipeline against a local sink without contacting any provider.",
     ],
+    source: "Source: session/request.ts:80-91",
   },
   "concept.catalog": {
     id: "concept.catalog",
@@ -372,6 +407,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "Your config overlays this: new variant names add entries, matching names deep-merge per key, disabled:true removes.",
       "Config Studio labels each variant: catalog (unchanged), config (file-defined or key-overridden), hidden (disabled), or SDK heuristic (no models.dev metadata).",
     ],
+    source: "Source: core/src/models-dev.ts:160-176",
   },
   "concept.capture": {
     id: "concept.capture",
@@ -383,6 +419,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "A/B mode captures two configurations (e.g. default vs a variant) and diffs the bodies.",
       "Auth headers differ (dummy key) but the request body matches what the provider would receive.",
     ],
+    source: "Source: Config Studio sink design (local listener + temp server)",
   },
   "concept.hotreload": {
     id: "concept.hotreload",
@@ -393,6 +430,7 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
       "Running sessions keep their selected model/variant; new sessions and new task calls pick up the new config.",
       "Some host-cached surfaces (e.g. the model picker list inside the current TUI) may only refresh after the disposal completes.",
     ],
+    source: "Source: config.ts:281-289 + 600-660",
   },
 }
 

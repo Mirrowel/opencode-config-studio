@@ -75,6 +75,25 @@ function withTimeout(promise, ms) {
   return Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve("__timeout__"), ms))])
 }
 
+/** Drives the path then presses Back on the target menu; reports the menu
+ * that the Back press landed on (the recording at index path.length + 1 -
+ * later recordings cascade from the exhausted script treating prompts as Esc
+ * and are not part of the Back navigation itself). */
+async function runBack(api, state, path) {
+  const { probe, menus } = makeProbe([...path])
+  T.__setMenuProbe(probe)
+  try {
+    await withTimeout(T.mainMenu(api, state), RUN_TIMEOUT_MS)
+  } catch {
+    // crashes are reported by the main walk
+  } finally {
+    T.__setMenuProbe(undefined)
+  }
+  const target = menus[path.length - 1]
+  const landedMenu = menus[path.length]
+  return { target: target?.title, landed: landedMenu?.title }
+}
+
 async function walk(api, state, path) {
   if (runs >= MAX_RUNS) return
   runs++
@@ -102,10 +121,27 @@ async function walk(api, state, path) {
   if (rootMenu && path.length === 0) {
     if (!rootMenu.options.some((option) => option.title.startsWith("Save & exit"))) fail(path, "main menu is missing the always-visible Save & exit")
   }
-  // Expand from the deepest non-root menu (the actual target screen of path).
-  const expandMenu = [...menus].reverse().find((menu) => menu.title !== ROOT_MENU_TITLE) ?? rootMenu
+
+  // The menu opened by the LAST path value sits at index path.length (menus[0]
+  // is the root, menus[i] was opened by path[i-1]). Parent pickers may
+  // RE-RENDER after that (when a value misses and a loop re-presents), so
+  // reverse-search over all recordings picks a stale parent - use the index.
+  const expandMenu = menus[Math.min(path.length, menus.length - 1)] ?? rootMenu
+  const deepest = expandMenu
   if (!expandMenu || path.length >= MAX_DEPTH) return
-  const seen = new Set()
+
+  // Navigation contract: activating the Back option on the target menu must
+  // return to the PARENT menu, never all the way to the root (unless the
+  // target is a direct child of root).
+  if (path.length >= 2 && deepest.title !== ROOT_MENU_TITLE) {
+    const backOption = deepest.options.find((option) => option.title.startsWith("<") && (option.value === "__back__" || option.value === "__cancel__"))
+    if (backOption) {
+      const backRun = await runBack(api, state, [...path, backOption.value])
+      if (backRun.landed === ROOT_MENU_TITLE) {
+        fail(path, `"${backOption.title}" on "${deepest.title}" went ALL THE WAY BACK to the main menu - must return one level`)
+      }
+    }
+  }  const seen = new Set()
   for (const option of expandMenu.options) {
     const value = String(option.value ?? "")
     if (value.startsWith("__") || value === "undefined") continue

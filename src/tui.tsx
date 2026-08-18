@@ -76,6 +76,31 @@ function makeEditorKit(api: TuiPluginApi, state: StudioState): EditorKit {
     },
     openPlugins: () => pluginManagerScreen(api, state),
     openAgents: () => agentsScreen(api, state),
+    openPluginsFrom: (returnTo) => pluginManagerScreen(api, state, returnTo),
+    openAgentsFrom: (returnTo) => agentsScreen(api, state, returnTo),
+    variantsFor: (modelRef) => {
+      const [providerID, ...rest] = modelRef.split("/")
+      const modelID = rest.join("/")
+      if (!modelID) return []
+      const runtime = state.providers.find((item) => item.id === providerID)?.models?.[modelID]
+      return runtime?.variants ? Object.keys(runtime.variants) : []
+    },
+    modelFamilies: () => {
+      const families = new Set<string>()
+      for (const provider of state.providers) {
+        for (const model of Object.values(provider.models ?? {})) {
+          const family = (model as unknown as { family?: unknown }).family
+          if (typeof family === "string" && family) families.add(family)
+        }
+      }
+      for (const entry of Object.values(state.modelsDev ?? {})) {
+        for (const model of Object.values((entry as { models?: Record<string, unknown> }).models ?? {})) {
+          const family = (model as unknown as { family?: unknown }).family
+          if (typeof family === "string" && family) families.add(family)
+        }
+      }
+      return [...families].sort()
+    },
   }
 }
 
@@ -291,7 +316,7 @@ async function keybindBrowser(api: TuiPluginApi, state: StudioState): Promise<vo
 // Plugin manager (unified opencode.json + tui.json arrays)
 // ---------------------------------------------------------------------------
 
-async function pluginManagerScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
+async function pluginManagerScreen(api: TuiPluginApi, state: StudioState, returnTo?: () => Promise<void>): Promise<void> {
   const write: WriteContext = { api, state }
   while (true) {
     const rows: Array<{ spec: string; file: string; isTui: boolean; index: number; hasOptions: boolean }> = []
@@ -325,7 +350,7 @@ async function pluginManagerScreen(api: TuiPluginApi, state: StudioState): Promi
     options.push({ title: "< Back", value: "__back__", description: rows.length === 0 ? "(no plugins configured in any file)" : "" })
 
     const picked = await showMenu(api, { title: "Plugins", options })
-    if (!picked || picked === "__back__") return mainMenu(api, state)
+    if (!picked || picked === "__back__") return returnTo ? returnTo() : mainMenu(api, state)
 
     if (picked === "add") {
       const spec = await showPrompt(api.ui, { title: "Plugin spec", placeholder: "package@version or file:///C:/path (or package@tag)" })
@@ -803,12 +828,19 @@ function SizeSliderDialog(props: { api: TuiPluginApi; current: number; onDone: (
     })
   })
 
-  /** Live mini preview: a mock dialog box scaled to the current settings. */
+  /** Live mini preview: a mock dialog box scaled to the current settings.
+   * Uses dialogMetrics so the preview shows the TRUE capped height (what
+   * real dialogs will do), not the raw percent math. */
   const preview = createMemo(() => {
     const widthColumns = DIALOG_WIDTH_COLUMNS[wizardDialogSize(props.api)]
     const previewWidth = Math.max(10, Math.min(sliderWidth() + 4, 72))
     const scale = previewWidth / widthColumns
-    const rows = Math.max(4, Math.round((dimensions().height * (height() / 100)) * scale))
+    // True effective height: the percent capped by the backdrop budget the
+    // way real dialogs compute it (dialogMetrics shares this math).
+    const backdropCap = Math.floor(0.75 * dimensions().height) - 1
+    const requested = Math.floor((dimensions().height * Math.min(100, Math.max(25, height()))) / 100)
+    const effective = Math.min(requested, backdropCap)
+    const rows = Math.max(4, Math.round(effective * scale))
     const fill = (text: string, width: number) => {
       const inner = width - 2
       const slice = text.length > inner ? text.slice(0, inner - 1) + "…" : text
@@ -816,7 +848,7 @@ function SizeSliderDialog(props: { api: TuiPluginApi; current: number; onDone: (
     }
     const lines: string[] = []
     lines.push(`┌${"─".repeat(previewWidth - 2)}┐`)
-    lines.push(fill("Config Studio (preview)", previewWidth))
+    lines.push(fill(`Config Studio (preview)${effective < requested ? " [capped]" : ""}`, previewWidth))
     for (let index = 0; index < rows - 3; index++) lines.push(fill("", previewWidth))
     lines.push(`└${"─".repeat(previewWidth - 2)}┘`)
     return lines
@@ -957,9 +989,26 @@ function estimatedVisualRows(message: string, width: number) {
   return message.split(/\r?\n/).reduce((rows, line) => rows + Math.max(1, Math.ceil(line.length / Math.max(1, width))), 0)
 }
 
+/**
+ * TRUE dialog container budget. OpenCode's dialog backdrop reserves
+ * paddingTop = terminalHeight / 4 and the panel grows with content, so a
+ * dialog taller than 75% of the terminal overflows the bottom edge.
+ * Preview + every dialog consume this ONE function - they cannot diverge.
+ */
+export function dialogMetrics(api: TuiPluginApi, terminalHeight: number, chromeRows: number, minRows: number) {
+  const percent = wizardDialogHeightPercent(api)
+  const backdropBudget = Math.max(minRows + chromeRows, Math.floor(terminalHeight * 0.75) - 1)
+  const target = Math.max(minRows, Math.floor((terminalHeight * percent) / 100))
+  return {
+    /** Rows actually available for content before the backdrop overflows. */
+    availableRows: Math.max(minRows, backdropBudget - chromeRows),
+    /** Rows this dialog wants at the current height percent (capped to fit). */
+    targetRows: Math.min(Math.max(minRows, target), Math.max(minRows, backdropBudget - chromeRows)),
+  }
+}
+
 function wizardMaxRows(api: TuiPluginApi, terminalHeight: number, chromeRows: number, minRows: number) {
-  const usable = Math.max(minRows, terminalHeight - chromeRows)
-  return Math.max(minRows, Math.min(usable, Math.floor(terminalHeight * (wizardDialogHeightPercent(api) / 100))))
+  return dialogMetrics(api, terminalHeight, chromeRows, minRows).availableRows
 }
 
 function menuTitleWidth(size: DialogSize, options: readonly { title: string }[]) {
@@ -2021,6 +2070,7 @@ function docText(docId: string, extra?: string[]): string {
   if (doc) {
     lines.push(doc.summary, "")
     lines.push(...doc.lines)
+    if (doc.source) lines.push("", doc.source)
   } else {
     lines.push("No documentation available.")
   }
@@ -3406,7 +3456,7 @@ async function pickAnyModel(api: TuiPluginApi, state: StudioState, title: string
 // Agents screen
 // ---------------------------------------------------------------------------
 
-async function agentsScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
+async function agentsScreen(api: TuiPluginApi, state: StudioState, returnTo?: () => Promise<void>): Promise<void> {
   const agentConfig = safeStateConfig(api)["agent"]
   const agents = new Map<string, Record<string, unknown>>()
   for (const name of ["build", "plan", "general"]) agents.set(name, {})
@@ -3449,7 +3499,7 @@ async function agentsScreen(api: TuiPluginApi, state: StudioState): Promise<void
   options.push({ title: "< Back", value: "__back__", description: "Return to main menu" })
 
   const picked = await showMenu(api, { title: "Agents", options })
-  if (!picked || picked === "__back__") return mainMenu(api, state)
+  if (!picked || picked === "__back__") return returnTo ? returnTo() : mainMenu(api, state)
   if (picked === "__new_agent__") {
     const name = await showPrompt(api.ui, { title: "Agent name", placeholder: "e.g. reviewer (letters, numbers, dashes)" })
     if (name === undefined || name.trim() === "" || !/^[\w.-]+$/.test(name.trim())) return agentsScreen(api, state)

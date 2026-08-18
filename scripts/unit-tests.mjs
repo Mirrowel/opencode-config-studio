@@ -24,7 +24,6 @@ const cache = await import(dist("providercache"))
 const { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } = await import(dist("migration"))
 const palette = await import(dist("palette-category"))
 const keymeta = await import(dist("keymeta"))
-
 function assert(condition, message) {
   if (!condition) throw new Error(`assert failed: ${message}`)
 }
@@ -838,5 +837,34 @@ async function testCleanupScanner() {
 }
 
 testKeyMeta()
+
+async function testSuggestionsAndMetrics() {
+  const { SDK_PACKAGES, PROVIDER_FIELDS, MODEL_FIELDS } = keymeta
+  assert(SDK_PACKAGES.length >= 25, `SDK package table is exhaustive (got ${SDK_PACKAGES.length})`)
+  for (const entry of SDK_PACKAGES) {
+    assert(entry.value.startsWith("@") || entry.value.includes("-provider") || entry.value.includes("provider"), `SDK entry looks like a package: ${entry.value}`)
+    assert(entry.detail.length > 20, `SDK entry has pick guidance: ${entry.value}`)
+  }
+  const npmField = PROVIDER_FIELDS.find((field) => field.key === "npm")
+  assert(npmField?.suggestions === SDK_PACKAGES, "provider npm field uses the SDK suggestion table")
+  const modelNpmField = MODEL_FIELDS.find((field) => field.key === "provider")?.fields?.find((field) => field.key === "npm")
+  assert(modelNpmField?.suggestions === SDK_PACKAGES, "per-model provider npm uses the SDK suggestion table")
+  const shellMeta = keymeta.ROOT_KEYS.find((meta) => meta.key === "shell")
+  assert((shellMeta?.suggestions ?? []).length >= 6, "shell has curated suggestions")
+  const modalities = MODEL_FIELDS.find((field) => field.key === "modalities")?.fields ?? []
+  assert(modalities.some((field) => (field.suggestions ?? []).some((s) => s.value === "pdf")), "modalities suggestions include pdf")
+
+  // dialogMetrics: capping math (imported from the TUI bundle via menu-tree smoke
+  // because tui.js needs the OpenTUI runtime; here we assert the constant contract).
+  const { dialogMetrics } = await import(dist("tui")).catch(() => ({ dialogMetrics: undefined }))
+  if (dialogMetrics) {
+    const api = { kv: { get: () => 100 } } // 100% height request
+    const small = dialogMetrics(api, 30, 14, 4)
+    assert(small.availableRows <= Math.floor(30 * 0.75) - 14 + 1, `tall dialogs never exceed the 75% backdrop budget on small terminals (got ${small.availableRows})`)
+    const tall = dialogMetrics(api, 100, 14, 4)
+    assert(tall.targetRows <= tall.availableRows, "targetRows capped to availableRows")
+  }
+}
+testSuggestionsAndMetrics()
 
 console.log("all unit tests passed")

@@ -50,6 +50,7 @@ const required = [
   "src/modules/agent-variants.ts",
   "dist/palette-category.js",
   "src/palette-category.ts",
+  "docs/SETTINGS_REFERENCE.md",
   "tsconfig.json",
 ]
 
