@@ -25,6 +25,46 @@ export type ModuleSettings = {
 export type StudioSettings = {
   capture: CaptureSettings
   modules: ModuleSettings
+  /** Pinned deep screens (Menu-2+ only) shown after the fixed defaults. */
+  quickAccess: string[]
+}
+
+/**
+ * Fixed Quick access entries: always present, never pinnable/unpinnable -
+ * they are already one click away (the whole main menu is).
+ */
+export const DEFAULT_QUICK_ACCESS = ["browse", "agents"]
+
+/**
+ * Pinnable screens: real option-menus at Menu depth 2+ (children of a
+ * main-menu screen). Menu-1 screens (Settings, Browse, Agents, ...) are NOT
+ * pinnable - they live in the main menu. Info views (Diagnostics, How it
+ * works, captures) are not menus and cannot be pinned.
+ */
+export const PINNABLE_SCREENS: Array<{ id: string; title: string }> = [
+  { id: "settings:Models & agents", title: "Models & agents" },
+  { id: "settings:Providers", title: "Settings - Providers" },
+  { id: "settings:Providers:disabled_providers", title: "Disabled providers" },
+  { id: "settings:Providers:enabled_providers", title: "Enabled providers (allowlist)" },
+  { id: "settings:Providers:provider", title: "Provider entries (all, green = enabled)" },
+  { id: "settings:Tools & files", title: "Settings - Tools & files" },
+  { id: "settings:Tools & files:mcp", title: "MCP servers" },
+  { id: "settings:Tools & files:command", title: "Commands" },
+  { id: "settings:Tools & files:permission", title: "Permissions" },
+  { id: "settings:Tools & files:instructions", title: "Instructions" },
+  { id: "settings:Tools & files:skills", title: "Skills" },
+  { id: "settings:Tools & files:references", title: "References" },
+  { id: "settings:Tools & files:formatter", title: "Formatter" },
+  { id: "settings:Tools & files:lsp", title: "LSP" },
+  { id: "settings:Session behavior", title: "Settings - Session behavior" },
+  { id: "settings:Sharing & updates", title: "Settings - Sharing & updates" },
+  { id: "settings:Server", title: "Settings - Server" },
+  { id: "settings:Developer", title: "Settings - Developer" },
+  { id: "settings:Deprecated", title: "Settings - Deprecated" },
+]
+
+export function screenTitle(id: string): string {
+  return PINNABLE_SCREENS.find((screen) => screen.id === id)?.title ?? id
 }
 
 /** Sections hidden by default when rendering captured request bodies. */
@@ -42,6 +82,9 @@ export function defaultSettings(): StudioSettings {
   return {
     capture: { hiddenSections: [...DEFAULT_HIDDEN_SECTIONS] },
     modules: { enabled: {}, options: {} },
+    // Deep pins only; the fixed defaults (DEFAULT_QUICK_ACCESS) are always
+    // rendered and never stored here.
+    quickAccess: [],
   }
 }
 
@@ -82,6 +125,9 @@ export function loadSettings(dataDir: string): StudioSettings {
         }
       }
     }
+    const quickAccess = report.data["quickAccess"]
+    const pinned = coerceStringArray(quickAccess)
+    if (pinned) result.quickAccess = pinned
   } catch {
     // Corrupt settings never block the studio.
   }
@@ -94,6 +140,7 @@ export function saveSettings(dataDir: string, settings: StudioSettings): void {
     {
       capture: settings.capture,
       modules: settings.modules,
+      quickAccess: settings.quickAccess,
     },
     null,
     2,

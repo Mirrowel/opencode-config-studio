@@ -38,6 +38,8 @@ export interface ObjectFieldSpec {
   options?: string[]
   /** Curated choices offered alongside "Custom..." free input (string fields). */
   suggestions?: FieldSuggestion[]
+  /** Dynamic suggestion source key (resolved by the host at edit time). */
+  suggestionsFrom?: "providersNotEnabled" | "providersNotDisabled"
   /** Placeholder shown in prompts. */
   placeholder?: string
   /** Minimum for numbers. */
@@ -67,7 +69,10 @@ export interface RootKeyMeta {
   group: string
   kind: FieldKind
   options?: string[]
+  /** Static curated choices. */
   suggestions?: FieldSuggestion[]
+  /** Dynamic suggestion source key (resolved by the host at edit time). */
+  suggestionsFrom?: "providersNotEnabled" | "providersNotDisabled"
   placeholder?: string
   min?: number
   timing: EffectTiming
@@ -202,7 +207,8 @@ export const ROOT_KEYS: RootKeyMeta[] = [
     group: "Providers",
     kind: "stringList",
     timing: "live",
-    doc: "Provider ids to hide from the model picker and provider list.",
+    suggestionsFrom: "providersNotEnabled",
+    doc: "Provider ids to hide from the model picker and provider list. Pick suggestions list every known provider that is not in the enabled allowlist (mutually exclusive - a provider cannot be both disabled and enabled).",
   },
   {
     key: "enabled_providers",
@@ -210,7 +216,8 @@ export const ROOT_KEYS: RootKeyMeta[] = [
     group: "Providers",
     kind: "stringList",
     timing: "live",
-    doc: "When set, ONLY these providers load. Mutually exclusive with disabled_providers - setting both is a config smell.",
+    suggestionsFrom: "providersNotDisabled",
+    doc: "When set, ONLY these providers load. Pick suggestions exclude providers already in disabled_providers (mutually exclusive - a provider cannot be both disabled and enabled).",
   },
   {
     key: "shell",

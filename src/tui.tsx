@@ -26,6 +26,7 @@ import {
   bodyOneLine,
   computeBaseDefaults,
   fetchModelsDev,
+  providerUniverse,
   type ModelAnalysis,
   type ModelsDevCatalog,
   type ProviderAnalysis,
@@ -41,10 +42,10 @@ import { computeDialogRows } from "./size.js"
 import { currentPaletteCategory, declarePaletteCategory, schedulePaletteReconcile } from "./palette-category.js"
 import { discoverMarkdownAgents, discoverTuiFiles, type MarkdownAgent } from "./discovery.js"
 import { CLEANUP_RULES, TUI_KEYS, keybindGroupsMatching, toolsToPermission, type ObjectFieldSpec } from "./keymeta.js"
-import { fieldEditor as kitFieldEditor, permissionEditor as kitPermissionEditor, providerEntryScreen, providerModelsScreen, settingsScreen as kitSettingsScreen, type EditorKit } from "./editors.js"
+import { fieldEditor as kitFieldEditor, permissionEditor as kitPermissionEditor, providerEntryScreen, providerModelsScreen, settingsGroupDirect as kitDrillSettingsGroup, settingsFieldDirect as kitDrillSettings, settingsScreen as kitSettingsScreen, type EditorKit } from "./editors.js"
 import { providerCacheKey, getCachedProviders, setCachedProviders, providerCacheState, detectOutsideChanges, type OutsideChange } from "./providercache.js"
 import { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } from "./migration.js"
-import { DEFAULT_HIDDEN_SECTIONS, loadSettings, saveSettings, settingsPath, type StudioSettings } from "./settings.js"
+import { DEFAULT_HIDDEN_SECTIONS, loadSettings, saveSettings, settingsPath, PINNABLE_SCREENS, screenTitle, type StudioSettings } from "./settings.js"
 import { enabledModules, moduleUsesOwnMenu, getModules, type ModuleContext } from "./modules.js"
 import { agentVariantsModuleId, setModulePickImplementation } from "./modules/agent-variants.js"
 import { findStandaloneAgentVariants, removeStandaloneHits } from "./standalone.js"
@@ -56,7 +57,7 @@ import { findStandaloneAgentVariants, removeStandaloneHits } from "./standalone.
 function makeEditorKit(api: TuiPluginApi, state: StudioState): EditorKit {
   return {
     state,
-    showMenu: (props) => showMenu(api, props),
+    showMenu: (props) => showMenu(api, { ...props, pin: props.pinId ? pinPropsFor(props.pinId) : undefined }),
     showPrompt: (props) => showPrompt(api.ui, props),
     showConfirm: (props) => showConfirm(api.ui, props),
     showAlert: (props) => showAlert(api.ui, props),
@@ -75,6 +76,7 @@ function makeEditorKit(api: TuiPluginApi, state: StudioState): EditorKit {
       for (const agent of state.markdownAgents) names.add(agent.name)
       return [...names].sort()
     },
+    providerUniverse: () => providerUniverse(state.providers, state.modelsDev, state.merge).map((row) => ({ ...row })),
     openPlugins: () => pluginManagerScreen(api, state),
     openAgents: () => agentsScreen(api, state),
     openPluginsFrom: (returnTo) => pluginManagerScreen(api, state, returnTo),
@@ -1101,7 +1103,7 @@ function showSelect<Value>(
 
 type MenuChoice<Value> = { action: "select" | "inspect"; value: Value }
 
-async function showMenu<Value>(api: TuiPluginApi, props: { title: string; options: WizardSelectOption<Value>[]; current?: Value }): Promise<Value | undefined> {
+async function showMenu<Value>(api: TuiPluginApi, props: { title: string; options: WizardSelectOption<Value>[]; current?: Value; pin?: { id: string; onToggle: () => void } }): Promise<Value | undefined> {
   let current = props.current
   while (true) {
     const choice = await showMenuOnce(api, { ...props, current })
@@ -1134,6 +1136,12 @@ export type MenuProbe = {
 }
 
 let menuProbe: MenuProbe | undefined
+/** Most recent TuiPluginApi (pin toggling needs host access from dialogs). */
+let activeApi: TuiPluginApi | undefined
+
+function currentApi(): TuiPluginApi | undefined {
+  return activeApi
+}
 
 export function __setMenuProbe(probe?: MenuProbe): void {
   menuProbe = probe
@@ -1146,7 +1154,7 @@ function probeMenuOnce<Value>(props: { title: string; options: WizardSelectOptio
   return { handled: true, selection: selection as Value }
 }
 
-function showMenuOnce<Value>(api: TuiPluginApi, props: { title: string; options: WizardSelectOption<Value>[]; current?: Value }): Promise<MenuChoice<Value> | undefined> {
+function showMenuOnce<Value>(api: TuiPluginApi, props: { title: string; options: WizardSelectOption<Value>[]; current?: Value; pin?: { id: string; onToggle: () => void } }): Promise<MenuChoice<Value> | undefined> {
   if (menuProbe?.onMenu) {
     const probed = probeMenuOnce(props)
     return Promise.resolve(probed.selection !== undefined ? { action: "select", value: probed.selection } : undefined)
@@ -1160,7 +1168,7 @@ function showMenuOnce<Value>(api: TuiPluginApi, props: { title: string; options:
       if (clear) api.ui.dialog.clear()
     }
     api.ui.dialog.replace(
-      () => <MenuDialog api={api} title={props.title} options={props.options} current={props.current} onDone={done} />,
+      () => <MenuDialog api={api} title={props.title} options={props.options} current={props.current} pin={props.pin} onDone={done} />,
       () => done(undefined, false),
     )
   })
@@ -1171,6 +1179,7 @@ function MenuDialog<Value>(props: {
   title: string
   options: WizardSelectOption<Value>[]
   current?: Value
+  pin?: { id: string; onToggle: () => void }
   onDone: (value: MenuChoice<Value> | undefined) => void
 }) {
   const theme = () => props.api.theme.current
@@ -1237,6 +1246,7 @@ function MenuDialog<Value>(props: {
         props.onDone(undefined)
       } },
       { name: `${commandPrefix}.filter`, title: "Search list", run: (ctx: KeyContext) => { blockKey(ctx); setFiltering(true) } },
+      { name: `${commandPrefix}.pin`, title: "Pin/unpin to Quick access", run: (ctx: KeyContext) => { blockKey(ctx); props.pin?.onToggle() } },
       { name: `${commandPrefix}.shield`, title: "Block background input", run: blockKey },
     ],
     bindings: [
@@ -1248,7 +1258,8 @@ function MenuDialog<Value>(props: {
       { key: "i", cmd: `${commandPrefix}.inspect`, desc: "Item help" },
       { key: "escape", cmd: `${commandPrefix}.back`, desc: "Back" },
       { key: "/", cmd: `${commandPrefix}.filter`, desc: "Search list" },
-      ...shieldBindings(`${commandPrefix}.shield`, ["i"]),
+      ...(props.pin ? [{ key: "f", cmd: `${commandPrefix}.pin`, desc: "Pin to Quick access" }] : []),
+      ...shieldBindings(`${commandPrefix}.shield`, ["i", "f"]),
     ],
   })
   onCleanup(() => {
@@ -1299,6 +1310,9 @@ function MenuDialog<Value>(props: {
           <text fg={theme().textMuted}>enter select</text>
           <text fg={theme().textMuted}>up/down move</text>
           <text fg={theme().textMuted}>i help</text>
+          <Show when={props.pin}>
+            <text fg={theme().textMuted}>f pin</text>
+          </Show>
           <text fg={theme().accent}>/ search</text>
         </Show>
       </box>
@@ -2195,25 +2209,81 @@ function defaultInfoText(state: StudioState, analysis: ModelAnalysis): string {
 // Main menu
 // ---------------------------------------------------------------------------
 
+/** Quick access: fixed defaults (browse, agents) + pinned deep screens (Menu-2+). */
+
+/** Runs a quick-access entry; deep ids (settings:Group[:key]) drill straight in. */
+async function runQuickAccess(api: TuiPluginApi, state: StudioState, id: string): Promise<void> {
+  if (id === "browse") return providerBrowser(api, state)
+  if (id === "agents") return agentsScreen(api, state)
+  if (id.startsWith("settings:")) {
+    const rest = id.slice("settings:".length)
+    const group = rest.includes(":") ? rest.slice(0, rest.indexOf(":")) : rest
+    const key = rest.includes(":") ? rest.slice(rest.indexOf(":") + 1) : undefined
+    const kit = makeEditorKit(api, state)
+    if (key !== undefined) {
+      await kitDrillSettings(kit, group, key)
+    } else {
+      await kitDrillSettingsGroup(kit, group)
+    }
+    return mainMenu(api, state)
+  }
+  return mainMenu(api, state)
+}
+
+/** Toggles a deep-screen pin; persists to settings.jsonc. */
+function toggleQuickAccess(api: TuiPluginApi, id: string): void {
+  const dataDir = studioDataDir(api)
+  const list = studioSettings.quickAccess.filter((item) => item !== id)
+  const pinned = list.length === studioSettings.quickAccess.length
+  if (pinned) list.push(id)
+  studioSettings.quickAccess = list
+  saveSettings(dataDir, studioSettings)
+  api.ui.toast({ variant: "info", title: pinned ? "Pinned to Quick access" : "Unpinned from Quick access", message: screenTitle(id) })
+}
+
+/** Menu pin-prop factory: only Menu-2+ screens are pinnable. */
+function pinPropsFor(id: string): { id: string; onToggle: () => void } | undefined {
+  if (!PINNABLE_SCREENS.some((screen) => screen.id === id)) return undefined
+  const api = currentApi()
+  if (!api) return undefined
+  return { id, onToggle: () => toggleQuickAccess(api, id) }
+}
+
 async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
   await checkStandaloneDuplicates(api)
   const editedProviders = analyzeProviders(state.providers, state.defaults, state.merge).filter((provider) => provider.edited).length
   const modules = enabledModuleList()
   const modulePending = modules.some((module) => module.hasPendingChanges(moduleContext(api, state)))
   const pendingCount = state.pending.length + (modulePending ? 1 : 0)
+
+  // Quick access: fixed defaults (the hoisted main-menu staples) + pinned
+  // deep screens. Links, not copies - each entry runs the same handler the
+  // original menu row would.
   const opts: WizardSelectOption<string>[] = [
     {
-      title: "Browse providers & models",
-      value: "browse",
+      title: "Providers & models",
+      value: "quick:browse",
       description: `${state.providers.length} provider(s), ${editedProviders} edited`,
       help: "Open the model browser. Providers and models edited in any config file are listed first and highlighted.",
     },
     {
-      title: "Default model",
-      value: "root-model",
-      description: "Root model and small_model pickers",
-      help: docText("root.model") + "\n\n" + docText("root.small_model"),
+      title: "Agents",
+      value: "quick:agents",
+      description: "Agent model, variant, temperature, top_p",
+      help: docText("root.agent"),
     },
+  ]
+  for (const id of studioSettings.quickAccess) {
+    if (!PINNABLE_SCREENS.some((screen) => screen.id === id)) continue
+    opts.push({
+      title: ` ${screenTitle(id)}`,
+      value: `quick:${id}`,
+      description: "pinned",
+      help: `Jump straight to ${screenTitle(id)}. (Pinned - press f on that screen's menu to unpin; f on any deep screen's menu to pin it.)`,
+    })
+  }
+  opts.push({ title: "─ main ─", value: "__qa_divider__", description: "" })
+  opts.push(
     {
       title: "Settings",
       value: "settings",
@@ -2237,12 +2307,6 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
       value: "cleanup",
       description: "Deprecated keys: detect and migrate",
       help: "Scans every config file for deprecated or dead keys (mode, tools, autoshare, reference, layout, logLevel, agent tools/maxSteps, misplaced tui keys) and stages migrations to their modern equivalents.",
-    },
-    {
-      title: "Agents",
-      value: "agents",
-      description: "Agent model, variant, temperature, top_p",
-      help: docText("root.agent"),
     },
     {
       title: "Config files",
@@ -2274,7 +2338,7 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
       description: `Dialog sizing, debug tools, module options`,
       help: "Wizard UI sizing for Config Studio screens plus advanced tools contributed by enabled modules (Agent Variants debug mode, logs, backups, ...).",
     },
-  ]
+  )
   for (const module of modules) {
     if (!moduleUsesOwnMenu(studioSettings, module) || !module.mainMenuEntry) continue
     const entry = module.mainMenuEntry(moduleContext(api, state))
@@ -2305,6 +2369,9 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
   })
 
   const action = await showMenu(api, { title: "Config Studio", options: opts })
+  if (action?.startsWith("quick:")) {
+    return runQuickAccess(api, state, action.slice("quick:".length))
+  }
   if (action?.startsWith("module:")) {
     const module = modules.find((item) => item.id === action.slice("module:".length))
     const entry = module && moduleUsesOwnMenu(studioSettings, module) ? module.mainMenuEntry?.(moduleContext(api, state)) : undefined
@@ -2323,8 +2390,6 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
       return pluginManagerScreen(api, state)
     case "cleanup":
       return cleanupScreen(api, state)
-    case "root-model":
-      return rootModelScreen(api, state)
     case "agents":
       return agentsScreen(api, state)
     case "files":
@@ -2447,7 +2512,7 @@ const STARTUP_CHECK_DELAY_MS = 1500
 
 function loadSettingsDefaultPlaceholder(): StudioSettings {
   // Replaced at command start; safe default before that.
-  return { capture: { hiddenSections: [...DEFAULT_HIDDEN_SECTIONS] }, modules: { enabled: {}, options: {} } }
+  return { capture: { hiddenSections: [...DEFAULT_HIDDEN_SECTIONS] }, modules: { enabled: {}, options: {} }, quickAccess: [] }
 }
 
 function moduleContext(api: TuiPluginApi, state: StudioState): ModuleContext {
@@ -3431,36 +3496,6 @@ async function runAndShowCapture(api: TuiPluginApi, analysis: ModelAnalysis, pro
 // Root model screen
 // ---------------------------------------------------------------------------
 
-async function rootModelScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
-  const write: WriteContext = { api, state }
-  const resolved = safeStateConfig(api)
-  const currentModel = typeof resolved["model"] === "string" ? resolved["model"] : "(not set)"
-  const currentSmall = typeof resolved["small_model"] === "string" ? resolved["small_model"] : "(auto)"
-  const options: WizardSelectOption<string>[] = [
-    {
-      title: "Set default model",
-      value: "model",
-      description: `current: ${currentModel}`,
-      help: docText("root.model", [`Current merged value: ${currentModel}`, provenanceLine(state, ["model"])]),
-    },
-    {
-      title: "Set small_model",
-      value: "small_model",
-      description: `current: ${currentSmall}`,
-      help: docText("root.small_model", [`Current merged value: ${currentSmall}`, provenanceLine(state, ["small_model"])]),
-    },
-    { title: "< Back", value: "__back__", description: "Return to main menu" },
-  ]
-  const picked = await showMenu(api, { title: "Default model", options })
-  if (!picked || picked === "__back__") return mainMenu(api, state)
-
-  const modelPick = await pickAnyModel(api, state, picked === "model" ? "Pick default model" : "Pick small_model")
-  if (!modelPick) return rootModelScreen(api, state)
-  const ok = await applyEdits(write, [{ op: "set", path: [picked], value: `${modelPick.providerID}/${modelPick.modelID}` }], `set ${picked}`)
-  if (ok) return rootModelScreen(api, state)
-  return rootModelScreen(api, state)
-}
-
 function provenanceLine(state: StudioState, pointer: JSONPath): string {
   const { winner } = provenanceAt(state.merge, pointer)
   return winner ? `From: ${fileLabel(state, winner)}` : "From: OpenCode default (no config file sets it)"
@@ -4247,6 +4282,7 @@ function registerStudioCommand(api: TuiPluginApi, run: () => Promise<void>) {
 }
 
 const tui: TuiPlugin = async (api) => {
+  activeApi = api
   // Belt-and-braces: if this plugin got registered in opencode.json but not in
   // any tui.json layer, mirror the registration (normally done by the server
   // entry; no-op when the TUI part is already properly wired).

@@ -214,6 +214,7 @@ async function runLayout(label, ownMenu) {
     T.setStudioSettings({
       capture: { hiddenSections: ["messages"] },
       modules: { enabled: {}, options: ownMenu ? { "agent-variants": { ownMenu: true } } : {} },
+      quickAccess: ["settings:Providers:disabled_providers"],
     })
     T.resetDuplicateCheck()
     const state = await T.refreshStudio(api)

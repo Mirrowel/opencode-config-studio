@@ -33,6 +33,7 @@
     "dist",
     "src",
     "docs/SETTINGS_REFERENCE.md",
+    "docs/TUI_MAP.md",
     "tsconfig.json",
     "README.md",
     "LICENSE"

@@ -475,6 +475,8 @@ export interface ProviderAnalysis {
   modelCount: number
   editedModelCount: number
   edited: boolean
+  isDisabled?: boolean
+  isExcluded?: boolean
 }
 
 export function analyzeProviders(
@@ -507,6 +509,74 @@ export function analyzeProviders(
     return a.name.localeCompare(b.name)
   })
   return analyses
+}
+
+/**
+ * The full provider universe for the Settings provider list: union of the
+ * runtime list, the models.dev catalog, and config-defined entries, with an
+ * enabled flag (green = active; white = disabled via disabled_providers,
+ * allowlist-excluded, or merely present in the catalog with no config).
+ */
+export function providerUniverse(
+  providers: RuntimeProviderLike[],
+  modelsDev: Record<string, unknown> | undefined,
+  merge: ProvenancedMerge,
+): Array<ProviderAnalysis & { known: boolean }> {
+  const disabled = new Set((getIn(merge.merged, ["disabled_providers"]) as unknown[] | undefined ?? []).map(String))
+  const enabled = getIn(merge.merged, ["enabled_providers"]) as unknown[] | undefined
+  const allowlist = enabled === undefined ? undefined : new Set(enabled.map(String))
+  const runtimeIds = new Set(providers.map((provider) => provider.id))
+  const configProviders = (getIn(merge.merged, ["provider"]) as Record<string, unknown> | undefined) ?? {}
+  const universe = new Map<string, ProviderAnalysis & { known: boolean }>()
+
+  for (const analysis of analyzeProviders(providers, {}, merge)) {
+    universe.set(analysis.providerID, { ...analysis, known: true })
+  }
+  for (const id of Object.keys(configProviders)) {
+    if (universe.has(id)) continue
+    universe.set(id, {
+      providerID: id,
+      name: id,
+      npm: undefined,
+      source: "config",
+      connected: false,
+      isDefaultProvider: false,
+      modelCount: 0,
+      editedModelCount: 0,
+      edited: true,
+      known: true,
+    })
+  }
+  for (const [id, entry] of Object.entries(modelsDev ?? {})) {
+    if (universe.has(id)) continue
+    const info = entry as { name?: string; models?: Record<string, unknown> }
+    universe.set(id, {
+      providerID: id,
+      name: info.name || id,
+      npm: undefined,
+      source: "catalog",
+      connected: false,
+      isDefaultProvider: false,
+      modelCount: Object.keys(info.models ?? {}).length,
+      editedModelCount: 0,
+      edited: false,
+      known: false,
+    })
+  }
+
+  const rows = [...universe.values()].map((row) => {
+    const isDisabled = disabled.has(row.providerID)
+    const isExcluded = allowlist !== undefined && !allowlist.has(row.providerID) && !disabled.has(row.providerID)
+    const runtimeActive = runtimeIds.has(row.providerID)
+    return { ...row, connected: runtimeActive, isDisabled, isExcluded }
+  })
+
+  rows.sort((a, b) => {
+    if (a.edited !== b.edited) return a.edited ? -1 : 1
+    if (a.connected !== b.connected) return a.connected ? -1 : 1
+    return a.name.localeCompare(b.name)
+  })
+  return rows
 }
 
 export function bodyOneLine(body: Record<string, unknown> | undefined, max = 60): string {

@@ -31,7 +31,7 @@ import type { StudioState, WizardSelectOption } from "./tui.js"
 
 export interface EditorKit {
   state: StudioState
-  showMenu: <V>(props: { title: string; options: WizardSelectOption<V>[]; current?: V; help?: string }) => Promise<V | undefined>
+  showMenu: <V>(props: { title: string; options: WizardSelectOption<V>[]; current?: V; help?: string; pinId?: string }) => Promise<V | undefined>
   showPrompt: (props: { title: string; description?: string; placeholder?: string; value?: string }) => Promise<string | undefined>
   showConfirm: (props: { title: string; message: string; confirmLabel?: string }) => Promise<boolean>
   showAlert: (props: { title: string; message: string }) => Promise<void>
@@ -46,6 +46,8 @@ export interface EditorKit {
   variantsFor?: (modelRef: string) => string[]
   /** Known model families from the live catalog. */
   modelFamilies?: () => string[]
+  /** Full provider universe (runtime + catalog + config) with enabled flags. */
+  providerUniverse?: () => Array<{ providerID: string; name: string; connected: boolean; edited: boolean; known: boolean; modelCount?: number; isDisabled?: boolean; isExcluded?: boolean }>
   /** Host hook: open the file-centric plugin manager. */
   openPlugins?: () => Promise<void>
   /** Host hook: open the agents screen. */
@@ -166,7 +168,16 @@ async function numberFieldEditor(kit: EditorKit, spec: { key: string; title: str
   await kit.stage([{ op: "set", path: pointer, value: num }], `${spec.title} = ${num}`)
 }
 
-export async function stringListEditor(kit: EditorKit, title: string, pointer: JSONPath, doc: string, suggestions?: FieldSuggestion[]): Promise<void> {
+export async function stringListEditor(kit: EditorKit, title: string, pointer: JSONPath, doc: string, suggestions?: FieldSuggestion[], suggestionsFrom?: "providersNotEnabled" | "providersNotDisabled"): Promise<void> {
+  const pinId = pointer.length === 1 && (pointer[0] === "disabled_providers" || pointer[0] === "enabled_providers") ? `settings:Providers:${String(pointer[0])}` : undefined
+  // Dynamic provider suggestions: full universe minus the inverse list so a
+  // provider can never be both disabled and enabled.
+  if (!suggestions && suggestionsFrom && kit.providerUniverse) {
+    const inverse = new Set(Array.isArray(kit.valueAt([suggestionsFrom === "providersNotEnabled" ? "enabled_providers" : "disabled_providers"])) ? (kit.valueAt([suggestionsFrom === "providersNotEnabled" ? "enabled_providers" : "disabled_providers"]) as unknown[]).map(String) : [])
+    suggestions = kit.providerUniverse()
+      .filter((row) => !inverse.has(row.providerID))
+      .map((row) => ({ value: row.providerID, label: row.providerID, detail: row.connected ? "active provider" : (row as { isDisabled?: boolean }).isDisabled ? "disabled" : "known provider" }))
+  }
   while (true) {
     const list = kit.valueAt(pointer)
     const items = Array.isArray(list) ? list.map((item) => String(item)) : []
@@ -183,7 +194,7 @@ export async function stringListEditor(kit: EditorKit, title: string, pointer: J
     }
     options.push({ title: "+ Add entry", value: "add", description: "" })
     options.push({ title: "< Back", value: "__back__", description: items.length === 0 ? "(list is empty)" : "" })
-    const picked = await kit.showMenu({ title, options, help: doc })
+    const picked = await kit.showMenu({ title, options, help: doc, pinId })
     if (!picked || picked === "__back__") return
 
     if (picked === "add") {
@@ -303,7 +314,7 @@ export async function fieldEditor(kit: EditorKit, spec: ObjectFieldSpec, pointer
     case "number":
       return numberFieldEditor(kit, spec, pointer, current)
     case "stringList":
-      return stringListEditor(kit, spec.title, pointer, spec.doc, spec.suggestions)
+      return stringListEditor(kit, spec.title, pointer, spec.doc, spec.suggestions, spec.suggestionsFrom)
     case "json":
       return jsonFieldEditor(kit, spec, pointer, current, false)
     case "boolOrJson":
@@ -337,7 +348,8 @@ export async function fieldEditor(kit: EditorKit, spec: ObjectFieldSpec, pointer
     case "pluginList": {
       if (kit.openPluginsFrom && returnTo) return kit.openPluginsFrom(returnTo)
       if (kit.openPlugins) return kit.openPlugins()
-      return pluginManagerScreen(kit)
+      await kit.showInfo({ title: "Plugins", message: "The plugin manager edits raw plugin arrays per file. Open it from the studio main menu." })
+      return
     }
     case "agent": {
       const names = kit.agentNames()
@@ -473,6 +485,21 @@ export async function settingsScreen(kit: EditorKit): Promise<void> {
   }
 }
 
+/** Quick-access drill-in: render one Settings group directly. */
+export async function settingsGroupDirect(kit: EditorKit, group: string): Promise<void> {
+  return settingsGroupScreen(kit, group)
+}
+
+/** Quick-access drill-in: open one field of a Settings group. */
+export async function settingsFieldDirect(kit: EditorKit, group: string, key: string): Promise<void> {
+  const meta = ROOT_KEYS.find((item) => item.group === group && item.key === key)
+  if (!meta) {
+    await kit.showInfo({ title: "Quick access", message: `The pinned setting ${group} > ${key} no longer exists. Unpin it from the main menu (f on its screen) or re-pin from Settings.` })
+    return
+  }
+  await fieldEditor(kit, rootSpecToFieldSpec(meta), [meta.key], async () => settingsGroupScreen(kit, group))
+}
+
 async function settingsGroupScreen(kit: EditorKit, group: string): Promise<void> {
   while (true) {
     const metas = ROOT_KEYS.filter((meta) => meta.group === group)
@@ -485,7 +512,7 @@ async function settingsGroupScreen(kit: EditorKit, group: string): Promise<void>
       edited: kit.valueAt([meta.key]) !== undefined,
     }))
     options.push({ title: "< Back", value: "__back__", description: "" })
-    const picked = await kit.showMenu({ title: group, options })
+    const picked = await kit.showMenu({ title: group, options, pinId: `settings:${group}` })
     if (!picked || picked === "__back__") return
     const meta = metas.find((item) => item.key === picked)
     if (!meta) continue
@@ -515,6 +542,7 @@ function rootSpecToFieldSpec(meta: RootKeyMeta): ObjectFieldSpec {
     kind: meta.kind,
     options: meta.options,
     suggestions: meta.suggestions,
+    suggestionsFrom: meta.suggestionsFrom,
     placeholder: meta.placeholder,
     min: meta.min,
     doc: meta.doc + (meta.deprecated ? `\n\nDeprecated: ${meta.deprecated}` : "") + (meta.concat ? "\n\nNOTE: entries from all config layers are CONCATENATED (global + project), not replaced." : ""),
@@ -1043,19 +1071,31 @@ export async function providerListScreen(kit: EditorKit, pointer: JSONPath): Pro
   while (true) {
     const providerMap = kit.valueAt(pointer)
     const map = isPlainObject(providerMap) ? providerMap : {}
-    const options: WizardSelectOption<string>[] = Object.keys(map)
-      .sort()
-      .map((id) => ({
-        title: id,
-        value: `provider:${id}`,
-        description: `${Object.keys(isPlainObject(map[id]) ? map[id]!["models"] ?? {} : {}).length} model entry(s) (${kit.sourceLabel([...pointer, id])})`,
-        edited: true,
-        help: "Provider config entry.",
-      }))
-    options.push({ title: "+ Add provider", value: "add", description: "custom provider (api base, npm SDK, models)" })
-    options.push({ title: "< Back", value: "__back__", description: Object.keys(map).length === 0 ? "(no provider entries in config)" : "" })
+    const universe = kit.providerUniverse?.() ?? Object.keys(map).map((id) => ({ providerID: id, name: id, connected: false, edited: true, known: true }))
+    const options: WizardSelectOption<string>[] = universe.map((row) => {
+      const hasEntry = isPlainObject(map[row.providerID])
+      const tags: string[] = []
+      if (hasEntry) tags.push("edited")
+      if (row.connected) tags.push("enabled")
+      else if ((row as { isDisabled?: boolean }).isDisabled) tags.push("disabled")
+      else if ((row as { isExcluded?: boolean }).isExcluded) tags.push("excluded")
+      else tags.push(row.known ? "unused" : "catalog")
+      const entry: Record<string, unknown> | undefined = hasEntry ? (map[row.providerID] as Record<string, unknown>) : undefined
+      const models = isPlainObject(entry?.["models"]) ? (entry!["models"] as Record<string, unknown>) : {}
+      const modelCount = hasEntry ? Object.keys(models).length : (row as { modelCount?: number }).modelCount ?? 0
+      return {
+        title: row.providerID,
+        value: `provider:${row.providerID}`,
+        description: `${row.name}${row.name !== row.providerID ? ` (${row.providerID})` : ""} - ${modelCount} model(s), ${tags.join(", ")}`,
+        edited: row.connected === true,
+        color: row.connected ? undefined : "white",
+        help: `Provider ${row.providerID}${hasEntry ? " has a config entry - selecting opens the full editor." : " has no config entry yet - selecting stages an empty entry and opens the editor."} Green rows are active providers; white rows are disabled, allowlist-excluded, or catalog-only.`,
+      }
+    })
+    options.push({ title: "+ Add provider", value: "add", description: "new custom provider id (api base, npm SDK, models)" })
+    options.push({ title: "< Back", value: "__back__", description: universe.length === 0 ? "(no providers found)" : "" })
 
-    const picked = await kit.showMenu({ title: "Provider entries", options })
+    const picked = await kit.showMenu({ title: "Providers - all (green = enabled)", options, pinId: "settings:Providers:provider" })
     if (!picked || picked === "__back__") return
     if (picked === "add") {
       const id = await kit.showPrompt({ title: "Provider id", placeholder: "e.g. my-gateway (lowercase, no slashes)" })
@@ -1065,7 +1105,11 @@ export async function providerListScreen(kit: EditorKit, pointer: JSONPath): Pro
       continue
     }
     if (picked.startsWith("provider:")) {
-      await providerEntryScreen(kit, picked.slice(9))
+      const id = picked.slice(9)
+      if (!isPlainObject(map[id])) {
+        await kit.stage([{ op: "set", path: [...pointer, id], value: {} }], `provider add ${id}`)
+      }
+      await providerEntryScreen(kit, id)
       continue
     }
   }
@@ -1145,10 +1189,3 @@ export async function providerModelsScreen(kit: EditorKit, providerID: string): 
 // Plugin manager hook (implemented host-side: file-centric staging)
 // ---------------------------------------------------------------------------
 
-export async function pluginManagerScreen(kit: EditorKit): Promise<void> {
-  if (kit.openPlugins) return kit.openPlugins()
-  await kit.showInfo({
-    title: "Plugins",
-    message: "The plugin manager edits raw plugin arrays per file. Open it from the studio main menu.",
-  })
-}

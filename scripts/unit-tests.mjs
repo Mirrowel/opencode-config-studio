@@ -535,9 +535,55 @@ function section(name) {
     writeFileSync(settingsPath(dir), "{ broken json !!!", "utf8")
     const corrupt = loadSettings(dir)
     assert(JSON.stringify(corrupt.capture.hiddenSections) === JSON.stringify(DEFAULT_HIDDEN_SECTIONS), "corrupt settings fall back to defaults")
+
+    // Quick access: deep pins only; defaults are rendered, never stored.
+    assert(Array.isArray(initial.quickAccess) && initial.quickAccess.length === 0, "fresh settings carry no pins (defaults are hardcoded)")
+    corrupt.quickAccess = ["settings:Providers:disabled_providers", "settings:Providers"]
+    saveSettings(dir, corrupt)
+    const pinned = loadSettings(dir)
+    assert(JSON.stringify(pinned.quickAccess) === JSON.stringify(["settings:Providers:disabled_providers", "settings:Providers"]), "quick access pins persist verbatim")
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+}
+
+// ---------------------------------------------------------------------------
+// provider universe (Settings provider list: runtime + catalog + config)
+// ---------------------------------------------------------------------------
+
+{
+  section("catalog: provider universe union with enabled flags")
+  const { providerUniverse } = await import(dist("catalog"))
+  const merge = {
+    merged: {
+      disabled_providers: ["opencode-go"],
+      enabled_providers: ["zai-coding-plan"],
+      provider: { "my-gateway": { models: { "custom-1": {} } } },
+    },
+    winner: new Map(),
+    contributors: new Map(),
+  }
+  const runtime = [
+    { id: "zai-coding-plan", name: "ZAI", models: { "glm-5.3": {} } },
+  ]
+  const modelsDev = {
+    "zai-coding-plan": { name: "ZAI", models: { "glm-5.3": {} } },
+    "opencode": { name: "OpenCode", models: { "gpt-5": {} } },
+    "opencode-go": { name: "OpenCode GO", models: { "gpt-5-go": {} } },
+    "some-catalog-only": { name: "Catalog Only", models: { m1: {}, m2: {} } },
+  }
+  const rows = providerUniverse(runtime, modelsDev, merge)
+  const byId = Object.fromEntries(rows.map((row) => [row.providerID, row]))
+  assert(rows.length === 5, `universe dedupes across sources (got ${rows.length}: ${rows.map((r) => r.providerID).join(", ")})`)
+  assert(byId["zai-coding-plan"].connected === true, "runtime provider is enabled")
+  assert(byId["zai-coding-plan"].isDisabled !== true && byId["zai-coding-plan"].isExcluded !== true, "allowlisted provider is neither disabled nor excluded")
+  assert(byId["opencode-go"].connected === false && byId["opencode-go"].isDisabled === true, "disabled_providers entry is flagged disabled")
+  assert(byId["opencode"].connected === false && byId["opencode"].isExcluded === true, "provider missing from the allowlist is flagged excluded")
+  assert(byId["my-gateway"].known === true && byId["my-gateway"].edited === true, "config-only provider is known + edited")
+  assert(byId["some-catalog-only"].known === false && byId["some-catalog-only"].modelCount === 2, "catalog-only provider carries catalog model count")
+  const firstConnected = rows.findIndex((row) => row.providerID === "zai-coding-plan")
+  const firstInactive = rows.findIndex((row) => row.providerID === "opencode-go" || row.providerID === "opencode" || row.providerID === "some-catalog-only")
+  assert(firstConnected < firstInactive, "within the unedited set, enabled providers sort before inactive ones")
 }
 
 // ---------------------------------------------------------------------------
