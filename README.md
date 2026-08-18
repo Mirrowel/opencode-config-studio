@@ -165,7 +165,7 @@ The full [agent-variants](https://github.com/Mirrowel/opencode-agent-variants) f
 
 The studio is built as a module host — Agent Variants is the first module, not a special case. Next up:
 
-- **[OpenCode Souk](https://github.com/Mirrowel/opencode-souk)** — the OpenCode plugin manager (browse, install, and update plugins). Once integrated as a module, you'll be able to manage plugins without leaving the studio, right next to the plugin entries it already edits.
+- **[OpenCode Souk](https://github.com/Mirrowel/opencode-souk)** — the OpenCode plugin manager (browse, install, and update plugins). Souk is still incomplete, but it will be developed alongside this plugin so the two grow together: first-class config editing and plugin management in one place — MCP servers, plugins, skills, agents, all included.
 
 ## Development
 
