@@ -1978,12 +1978,14 @@ async function pickWriteTarget(write: WriteContext, pointer: JSONPath, suggested
       help: `Precedence ${file.precedence + 1} of ${write.state.files.length} layers. ${file.path}`,
     }
   })
+  options.push({ title: "< Back", value: "__back__", description: "cancel this edit" })
   const current = write.state.targetFilePath ?? strongest?.path ?? editable[editable.length - 1]?.path
   const picked = await showMenu(write.api, {
     title: `Edit which file? - ${suggestedLabel}`,
     options,
     current,
   })
+  if (!picked || picked === "__back__") return undefined
   return picked
 }
 
@@ -2622,7 +2624,8 @@ async function agentVariantsSourceScreen(api: TuiPluginApi, state: StudioState):
         options: [...hits.map((hit) => ({ title: hit.spec, value: String(hit.index), description: fileLabel(state, hit.file) })), { title: "< Cancel", value: "__cancel__", description: "" }],
       })
       if (!target || target === "__cancel__") continue
-      const hit = hits.find((item) => String(item.index) === target)!
+      const hit = typeof target === "object" ? target : hits.find((item) => String(item.index) === target)
+      if (!hit) continue
       const channel = await showMenu(api, {
         title: `Channel for ${hit.spec}`,
         options: [
@@ -4559,6 +4562,10 @@ export const __testInternals = {
   },
   resetDuplicateCheck: () => {
     duplicateCheckDone = false
+  },
+  /** Skips the startup duplicate dialog (tests: the walker must not answer it). */
+  suppressDuplicateDialog: () => {
+    duplicateCheckDone = true
   },
   defaultHiddenSections: () => [...DEFAULT_HIDDEN_SECTIONS],
 }

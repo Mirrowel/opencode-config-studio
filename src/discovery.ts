@@ -133,7 +133,12 @@ export function discoverConfigFiles(input: DiscoveryInput): ConfigFileEntry[] {
     }
   }
 
-  return entries
+  // Dedupe by absolute path (e.g. directory == globalConfigDir makes the same
+  // file appear as both global and project layer). Keep the LAST entry: it has
+  // the higher precedence, matching how the merge would resolve the same file.
+  const byPath = new Map<string, ConfigFileEntry>()
+  for (const entry of entries) byPath.set(entry.path, entry)
+  return [...byPath.values()]
 }
 
 export function editableFiles(entries: ConfigFileEntry[]): ConfigFileEntry[] {
@@ -172,7 +177,9 @@ export function discoverTuiFiles(input: DiscoveryInput): ConfigFileEntry[] {
       }
     }
   }
-  return entries
+  const byPath = new Map<string, ConfigFileEntry>()
+  for (const entry of entries) byPath.set(entry.path, entry)
+  return [...byPath.values()]
 }
 
 // ---------------------------------------------------------------------------

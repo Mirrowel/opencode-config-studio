@@ -886,23 +886,32 @@ async function testCleanupScanner() {
 async function testAvSource() {
   const dir = mkdtempSync(path.join(tmpdir(), "av-source-"))
   const family = path.join(dir, "@mirrowel")
-  mkdirSync(path.join(family, "opencode-agent-variants@dev"), { recursive: true })
-  mkdirSync(path.join(family, "opencode-agent-variants@latest"), { recursive: true })
-  mkdirSync(path.join(family, "opencode-agent-variants@0.9.0-dev.1"), { recursive: true })
-  mkdirSync(path.join(family, "unrelated-pkg@dev"), { recursive: true })
-  for (const name of ["opencode-agent-variants@dev", "opencode-agent-variants@latest", "opencode-agent-variants@0.9.0-dev.1"]) {
-    writeFileSync(path.join(family, name, "package.json"), JSON.stringify({ name: "@mirrowel/opencode-agent-variants", version: name.split("@").pop() }), "utf8")
+  // Real OpenCode cache layout: wrapper dirs whose package.json only declares
+  // the dependency, with the actual package nested under node_modules.
+  for (const tag of ["dev", "latest", "0.9.0-dev.1"]) {
+    const wrapper = path.join(family, `opencode-agent-variants@${tag}`)
+    const nested = path.join(wrapper, "node_modules", "@mirrowel", "opencode-agent-variants")
+    mkdirSync(nested, { recursive: true })
+    writeFileSync(path.join(wrapper, "package.json"), JSON.stringify({ dependencies: { "@mirrowel/opencode-agent-variants": tag } }), "utf8")
+    writeFileSync(path.join(nested, "package.json"), JSON.stringify({ name: "@mirrowel/opencode-agent-variants", version: tag === "latest" ? "0.8.0" : tag }), "utf8")
   }
+  mkdirSync(path.join(family, "unrelated-pkg@dev"), { recursive: true })
+  writeFileSync(path.join(family, "unrelated-pkg@dev", "package.json"), JSON.stringify({ name: "@mirrowel/unrelated-pkg" }), "utf8")
+  // A direct (non-wrapper) package directory, as file:// checkouts have.
   const local = path.join(dir, "local-av")
   mkdirSync(local, { recursive: true })
   writeFileSync(path.join(local, "package.json"), JSON.stringify({ name: "@mirrowel/opencode-agent-variants", version: "file-local" }), "utf8")
 
-  assert(resolveStandaloneDirIn(dir, "@mirrowel/opencode-agent-variants@dev")?.endsWith("opencode-agent-variants@dev"), "exact @dev tag resolves")
-  assert(resolveStandaloneDirIn(dir, "@mirrowel/opencode-agent-variants@0.9.0-dev.1")?.endsWith("opencode-agent-variants@0.9.0-dev.1"), "exact version resolves")
-  assert(resolveStandaloneDirIn(dir, "@mirrowel/opencode-agent-variants")?.endsWith("opencode-agent-variants@latest"), "bare spec resolves @latest")
-  assert(resolveStandaloneDirIn(dir, "@mirrowel/opencode-agent-variants@beta")?.endsWith("opencode-agent-variants@dev"), "unknown tag falls back to @dev")
+  // Wrapper dirs resolve to the nested package, not the wrapper root.
+  const devDir = resolveStandaloneDirIn(dir, "@mirrowel/opencode-agent-variants@dev")
+  assert(devDir?.includes(path.join("node_modules", "@mirrowel", "opencode-agent-variants")), "exact @dev tag resolves through the wrapper")
+  const exactDir = resolveStandaloneDirIn(dir, "@mirrowel/opencode-agent-variants@0.9.0-dev.1")
+  assert(exactDir?.includes("node_modules"), "exact version resolves through the wrapper")
+  assert(resolveStandaloneDirIn(dir, "@mirrowel/opencode-agent-variants")?.endsWith(path.join("node_modules", "@mirrowel", "opencode-agent-variants")), "bare spec resolves @latest through the wrapper")
+  assert(resolveStandaloneDirIn(dir, "@mirrowel/opencode-agent-variants@beta")?.includes("node_modules"), "unknown tag falls back to @dev through the wrapper")
+  // Direct package dirs pass through unwrapped.
   const fileSpec = pathToFileURL(local).href
-  assert(resolveStandaloneDirIn(dir, fileSpec) === local, "file:// spec resolves to its directory")
+  assert(resolveStandaloneDirIn(dir, fileSpec) === local, "file:// spec resolves to its directory (direct layout)")
   assert(resolveStandaloneDirIn(path.join(dir, "empty-cache"), "@mirrowel/opencode-agent-variants@dev") === undefined, "empty cache resolves nothing")
   assert(avSourceKind() === "embedded", "studio starts on the embedded implementation")
   assert(avOrigin().includes("embedded"), "origin reports embedded by default")

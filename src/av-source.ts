@@ -72,6 +72,29 @@ function packageJsonExists(dir: string): boolean {
  * file:// (or absolute) paths resolve directly; npm specs resolve against
  * OpenCode's package cache (~/.cache/opencode/packages/&lt;spec&gt;).
  */
+const AV_PACKAGE_NAME = "@mirrowel/opencode-agent-variants"
+
+function readPackageName(dir: string): string | undefined {
+  try {
+    const manifest = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { name?: string }
+    return manifest.name
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * OpenCode's package cache stores npm specs as wrapper directories whose
+ * package.json only declares a dependency on the real package; the install
+ * itself lives at node_modules/<name>. Descend when we landed on a wrapper.
+ */
+function unwrapCacheDir(dir: string): string {
+  if (readPackageName(dir) === AV_PACKAGE_NAME) return dir
+  const nested = join(dir, "node_modules", ...AV_PACKAGE_NAME.split("/"))
+  if (readPackageName(nested) === AV_PACKAGE_NAME) return nested
+  return dir
+}
+
 export function resolveStandaloneDir(spec: string): string | undefined {
   return resolveStandaloneDirIn(join(homedir(), ".cache", "opencode", "packages"), spec)
 }
@@ -80,14 +103,14 @@ export function resolveStandaloneDirIn(base: string, spec: string): string | und
   try {
     if (spec.startsWith("file://")) {
       const path = fileURLToPath(spec)
-      return packageJsonExists(path) ? path : undefined
+      return packageJsonExists(path) ? unwrapCacheDir(path) : undefined
     }
     if (/^([a-zA-Z]:[\\/]|\/)/.test(spec)) {
-      return packageJsonExists(spec) ? spec : undefined
+      return packageJsonExists(spec) ? unwrapCacheDir(spec) : undefined
     }
     const normalized = spec.startsWith("@mirrowel") && !spec.includes("@", 1) ? `${spec}@latest` : spec
     const direct = join(base, ...sanitizeSpec(normalized).split("/"))
-    if (packageJsonExists(direct)) return direct
+    if (packageJsonExists(direct)) return unwrapCacheDir(direct)
     const family = join(base, "@mirrowel")
     if (!existsSync(family)) return undefined
     const prefix = "opencode-agent-variants"
@@ -105,7 +128,7 @@ export function resolveStandaloneDirIn(base: string, spec: string): string | und
       entries.find((entry) => entry === `${prefix}@latest`) ??
       entries[0]!
     const dir = join(family, pick)
-    return packageJsonExists(dir) ? dir : undefined
+    return packageJsonExists(dir) ? unwrapCacheDir(dir) : undefined
   } catch {
     return undefined
   }
@@ -150,7 +173,7 @@ export async function refreshAvSource(source: "embedded" | "standalone", pluginS
   const impl = await loadFromDir(spec, dir)
   if (!impl) {
     active = undefined
-    return { ok: false, origin: avOrigin(), error: `Standalone plugin "${spec}" could not be loaded (missing or incompatible dist/wizard.js); using the embedded copy.` }
+    return { ok: false, origin: avOrigin(), error: `Standalone plugin "${spec}" could not be loaded (missing or incompatible dist/wizard.js - if the cached copy is stale, remove ~/.cache/opencode/packages/@mirrowel/opencode-agent-variants@<tag> or pin an exact version); using the embedded copy.` }
   }
   active = impl
   return { ok: true, origin: avOrigin() }
