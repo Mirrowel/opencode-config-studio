@@ -334,9 +334,10 @@ function SizeSliderDialog(props: { api: TuiPluginApi; current: number; onDone: (
         <text fg={theme().accent}><b>Dialog size</b></text>
         <text fg={theme().textMuted} onMouseUp={() => props.onDone(undefined)}>esc</text>
       </box>
-      <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
-        <text fg={theme().textMuted}>Width: <text fg={theme().primary}><b>{wizardDialogSize(props.api)}</b></text> ({DIALOG_WIDTH_COLUMNS[wizardDialogSize(props.api)]} cols, w to cycle)</text>
-        <text fg={theme().textMuted}>Height</text>
+      <box flexDirection="row" gap={0} width="100%" marginBottom={1}>
+        <text fg={theme().textMuted}>Width: </text>
+        <text fg={theme().primary}><b>{wizardDialogSize(props.api)}</b></text>
+        <text fg={theme().textMuted}> ({DIALOG_WIDTH_COLUMNS[wizardDialogSize(props.api)]} cols, w to cycle)   Height: </text>
         <text fg={theme().primary}><b>{height()}%</b></text>
       </box>
       <box flexDirection="row" width="100%" marginBottom={1}>
@@ -3526,6 +3527,8 @@ export const __testInternals = {
   mainMenu,
   refreshStudio,
   __setMenuProbe,
+  SizeSliderDialog,
+  PagedDialog,
   setStudioSettings: (settings: StudioSettings) => {
     studioSettings = settings
   },

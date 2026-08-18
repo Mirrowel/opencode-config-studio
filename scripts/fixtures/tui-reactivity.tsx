@@ -3,6 +3,16 @@
 import type { BoxRenderable, ScrollBoxRenderable } from "@opentui/core"
 import { testRender } from "@opentui/solid"
 import { createSignal } from "solid-js"
+import { __testInternals } from "../../dist/tui.js"
+
+const mockApi = () => ({
+  kv: { get: () => undefined, set: () => {} },
+  theme: { current: { accent: "#aaaaaa", error: "#ff0000", success: "#00ff00", textMuted: "#888888", text: "#ffffff", background: "#000000", primary: "#0000ff", backgroundPanel: "#111111" } },
+  mode: { push: () => () => {} },
+  keymap: { registerLayer: () => () => {} },
+  renderer: { root: {} },
+  ui: { dialog: { setSize: () => {} } },
+})
 
 export async function verifyReactiveSelection() {
   let edited: BoxRenderable | undefined
@@ -116,6 +126,31 @@ export async function verifyPagedSectionJump() {
     scroll.scrollTop = 0
     await app.flush()
     if (scroll.scrollTop !== 0) throw new Error("scrollTop did not reset to top")
+  } finally {
+    app.renderer.destroy()
+  }
+}
+
+/**
+ * Renders the real SizeSliderDialog (compiled Solid output) under a real
+ * test renderer. Catches markup-level crashes like nested <text> elements
+ * (TextNodeRenderable rejects them) before they ship.
+ */
+export async function verifySizeSliderDialogRenders() {
+  const api = mockApi() as any
+  let settled: ((value: unknown) => void) | undefined
+  const done = new Promise((resolve) => (settled = resolve))
+
+  const app = await testRender(() => {
+    const SizeSliderDialog = __testInternals.SizeSliderDialog as any
+    return <SizeSliderDialog api={api} current={50} onDone={(value: unknown) => settled?.(value)} />
+  }, { width: 90, height: 30 })
+  try {
+    await app.flush()
+    // Give reactive effects a beat, then close through the API the dialog
+    // itself registered (not key events) to exercise cleanup.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await app.flush()
   } finally {
     app.renderer.destroy()
   }

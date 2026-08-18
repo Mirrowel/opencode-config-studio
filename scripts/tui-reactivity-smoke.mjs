@@ -19,6 +19,7 @@ try {
   const fixture = await import(`${pathToFileURL(output).href}?${Date.now()}`)
   await fixture.verifyReactiveSelection()
   await fixture.verifyPagedSectionJump()
+  await fixture.verifySizeSliderDialogRenders()
   console.log("TUI selection repaint test passed")
 } finally {
   rmSync(temp, { recursive: true, force: true })
