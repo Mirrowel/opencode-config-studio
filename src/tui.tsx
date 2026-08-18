@@ -609,6 +609,8 @@ export type WizardSelectOption<Value = unknown> = TuiDialogSelectOption<Value> &
   danger?: boolean
   help?: string
   edited?: boolean
+  /** Non-interactive section separator row (never focusable, clickable, or filtered). */
+  divider?: boolean
 }
 type DialogSize = "medium" | "large" | "xlarge"
 type KeyContext = { event?: { preventDefault?: () => void; stopPropagation?: () => void } }
@@ -1192,9 +1194,10 @@ function MenuDialog<Value>(props: {
     const text = query().trim()
     // Filter on the QUERY, not the input-mode flag: Enter saves the query and
     // unlocks shortcuts while the list stays filtered; Esc clears it.
+    // Dividers are structural and always visible (never matched, never hidden).
     if (text === "") return props.options
     return rankOptions(
-      props.options.map((option) => ({ title: String(option.title), description: option.description ?? "", value: option.value, option })),
+      props.options.filter((option) => !option.divider).map((option) => ({ title: String(option.title), description: option.description ?? "", value: option.value, option })),
       text,
     ).map((ranked) => (ranked as { option: WizardSelectOption<Value> }).option)
   })
@@ -1202,21 +1205,31 @@ function MenuDialog<Value>(props: {
   const titleWidth = createMemo(() => menuTitleWidth(wizardDialogSize(props.api), props.options))
   let scroll: ScrollBoxRenderable | undefined
   const popMode = props.api.mode.push("config-studio.dialog")
-  const [selected, setSelected] = createSignal(Math.max(0, props.options.findIndex((option) => option.value === props.current)))
+  const [selected, setSelected] = createSignal((() => {
+    const initial = Math.max(0, props.options.findIndex((option) => option.value === props.current))
+    let index = initial
+    while (index < props.options.length && props.options[index]?.divider) index++
+    return index < props.options.length ? index : initial
+  })())
   const current = createMemo(() => visibleOptions()[selected()] ?? visibleOptions()[0])
+  /** Move one step, skipping divider rows (they can never hold the selection). */
   const move = (delta: number) => setSelected((value) => {
-    const next = Math.max(0, Math.min(visibleOptions().length - 1, value + delta))
+    const list = visibleOptions()
+    const count = list.length
+    let next = Math.max(0, Math.min(count - 1, value + delta))
+    while (next >= 0 && next < count && list[next]?.divider) next += delta >= 0 ? 1 : -1
+    if (next < 0 || next >= count || list[next]?.divider) return value
     scroll?.scrollTo(Math.max(0, next - 2))
     return next
   })
   const choose = () => {
     const option = current()
-    if (!option || option.disabled) return
+    if (!option || option.disabled || option.divider) return
     props.onDone({ action: "select", value: option.value })
   }
   const inspect = () => {
     const option = current()
-    if (!option || option.disabled) return
+    if (!option || option.disabled || option.divider) return
     props.onDone({ action: "inspect", value: option.value })
   }
   const commandPrefix = `config-studio.menu.${Math.random().toString(36).slice(2)}`
@@ -1321,24 +1334,31 @@ function MenuDialog<Value>(props: {
         <For each={visibleOptions()}>
           {(option, index) => {
             const active = createMemo(() => selected() === index())
-            const fg = createMemo(() => active() ? theme().background : option.danger ? theme().error : option.color ?? (option.edited ? theme().success : theme().text))
-            const descFg = createMemo(() => active() ? theme().background : option.edited ? theme().success : theme().textMuted)
             return (
-              <box
-                flexDirection="row"
-                width="100%"
-                gap={1}
-                paddingLeft={1}
-                paddingRight={1}
-                backgroundColor={active() ? theme().primary : theme().backgroundPanel}
-                onMouseOver={() => setSelected(index())}
-                onMouseUp={() => {
-                  if (!option.disabled) props.onDone({ action: "select", value: option.value })
-                }}
+              <Show
+                when={!option.divider}
+                fallback={
+                  <box flexDirection="row" width="100%" paddingLeft={1} paddingRight={1}>
+                    <text flexGrow={1} fg={theme().textMuted} wrapMode="none" overflow="hidden">{option.title}</text>
+                  </box>
+                }
               >
-                <text width={titleWidth()} flexShrink={0} fg={fg()} wrapMode="none" overflow="hidden"><b>{option.title}</b></text>
-                <text flexGrow={1} fg={descFg()} wrapMode="none" overflow="hidden">{option.description ?? ""}</text>
-              </box>
+                <box
+                  flexDirection="row"
+                  width="100%"
+                  gap={1}
+                  paddingLeft={1}
+                  paddingRight={1}
+                  backgroundColor={active() ? theme().primary : theme().backgroundPanel}
+                  onMouseOver={() => setSelected(index())}
+                  onMouseUp={() => {
+                    if (!option.disabled) props.onDone({ action: "select", value: option.value })
+                  }}
+                >
+                  <text width={titleWidth()} flexShrink={0} fg={active() ? theme().background : option.danger ? theme().error : option.color ?? (option.edited ? theme().success : theme().text)} wrapMode="none" overflow="hidden"><b>{option.title}</b></text>
+                  <text flexGrow={1} fg={active() ? theme().background : option.edited ? theme().success : theme().textMuted} wrapMode="none" overflow="hidden">{option.description ?? ""}</text>
+                </box>
+              </Show>
             )
           }}
         </For>
@@ -2282,7 +2302,7 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
       help: `Jump straight to ${screenTitle(id)}. (Pinned - press f on that screen's menu to unpin; f on any deep screen's menu to pin it.)`,
     })
   }
-  opts.push({ title: "─ main ─", value: "__qa_divider__", description: "" })
+  opts.push({ title: "─ main ─", value: "__qa_divider__", description: "", divider: true })
   opts.push(
     {
       title: "Settings",
