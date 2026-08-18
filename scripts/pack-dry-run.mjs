@@ -48,6 +48,8 @@ const required = [
   "src/modules.ts",
   "src/standalone.ts",
   "src/modules/agent-variants.ts",
+  "dist/palette-category.js",
+  "src/palette-category.ts",
   "tsconfig.json",
 ]
 

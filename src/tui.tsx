@@ -37,6 +37,7 @@ import { ensureTuiRegistration, ourRootDir } from "./selfwire.js"
 import { agentMode as avAgentMode, showFieldList as avShowFieldList, type FieldListOption as AVFieldListOption, type FieldListChoice as AVFieldListChoice } from "@mirrowel/opencode-agent-variants/wizard"
 import { FIELD_DOCS } from "./docs.js"
 import { rankOptions } from "./search.js"
+import { currentPaletteCategory, declarePaletteCategory, schedulePaletteReconcile } from "./palette-category.js"
 import { providerCacheKey, getCachedProviders, setCachedProviders, providerCacheState, detectOutsideChanges, type OutsideChange } from "./providercache.js"
 import { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } from "./migration.js"
 import { DEFAULT_HIDDEN_SECTIONS, loadSettings, saveSettings, settingsPath, type StudioSettings } from "./settings.js"
@@ -3221,10 +3222,12 @@ function registerStudioCommand(api: TuiPluginApi, run: () => Promise<void>) {
     name: "config-studio.configure",
     title: "Config Studio: Models & Variants",
     desc: "Inspect and edit model variants and request defaults",
-    category: "Plugins",
+    category: "",
     slashName: "config-studio",
     run,
   }
+  command.category = declarePaletteCategory("Config Studio", command)
+  schedulePaletteReconcile()
   const apiWithKeymap = api as TuiPluginApi & {
     keymap?: {
       registerLayer?: (layer: { commands: Array<typeof command>; bindings: unknown[] }) => () => void
@@ -3238,7 +3241,7 @@ function registerStudioCommand(api: TuiPluginApi, run: () => Promise<void>) {
       title: "Config Studio: Models & Variants",
       value: "config-studio.configure",
       description: "Inspect and edit model variants and request defaults",
-      category: "Plugins",
+      category: currentPaletteCategory(),
       slash: {
         name: "config-studio",
       },

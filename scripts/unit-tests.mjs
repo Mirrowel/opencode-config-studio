@@ -22,6 +22,7 @@ const { applyOpsToData, getAtPath } = await import(dist("jsonc"))
 const { isStandaloneAgentVariantsSpec, findStandaloneAgentVariants, removeStandaloneHits } = await import(dist("standalone"))
 const cache = await import(dist("providercache"))
 const { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } = await import(dist("migration"))
+const palette = await import(dist("palette-category"))
 
 function assert(condition, message) {
   if (!condition) throw new Error(`assert failed: ${message}`)
@@ -737,6 +738,40 @@ function section(name) {
   assert(plan, "plan builds for unknown preset")
   const modelOp = plan.ops.find((op) => op.path.join(".") === "agent.general.model")
   assert(modelOp && modelOp.value === "nonexistent-preset", "unresolvable preset keeps raw value")
+}
+
+// ---------------------------------------------------------------------------
+// palette-category: runtime registry join
+// ---------------------------------------------------------------------------
+
+{
+  section("palette-category: registry declaration and joins")
+  palette.__resetPaletteRegistry()
+
+  const avCommand = { category: "" }
+  assert(palette.declarePaletteCategory("Agent Variants", avCommand) === "Agent Variants", "lone declaration returns its own name")
+  assert(avCommand.category === "Agent Variants", "lone declaration stamps its command")
+
+  const studioCommand = { category: "" }
+  assert(palette.declarePaletteCategory("Config Studio", studioCommand) === "Agent Variants & Config Studio", "second declaration returns the join")
+  assert(avCommand.category === "Agent Variants & Config Studio", "earlier command mutated to the join")
+  assert(palette.currentPaletteCategory() === "Agent Variants & Config Studio", "live getter matches")
+
+  const soukCommand = { category: "" }
+  palette.declarePaletteCategory("Souk", soukCommand)
+  const expected = "Agent Variants, Config Studio & Souk"
+  assert(soukCommand.category === expected, "three-way join stamped")
+  assert(avCommand.category === expected && studioCommand.category === expected, "all commands mutated to the three-way join")
+
+  palette.declarePaletteCategory("Agent Variants")
+  assert(palette.currentPaletteCategory() === expected, "duplicate label does not duplicate in the join")
+
+  avCommand.category = "stale"
+  palette.reconcilePaletteCategories()
+  assert(avCommand.category === expected, "reconcile repairs stale categories")
+
+  palette.__resetPaletteRegistry()
+  assert(palette.currentPaletteCategory() === "", "reset clears the registry")
 }
 
 console.log("all unit tests passed")
