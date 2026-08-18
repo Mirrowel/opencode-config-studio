@@ -1,6 +1,6 @@
 {
   "name": "@mirrowel/opencode-config-studio",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "OpenCode plugin for inspecting and editing model variants and request defaults across config files",
   "license": "MIT",
