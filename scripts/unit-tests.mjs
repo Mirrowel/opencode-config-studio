@@ -854,15 +854,19 @@ async function testSuggestionsAndMetrics() {
   const modalities = MODEL_FIELDS.find((field) => field.key === "modalities")?.fields ?? []
   assert(modalities.some((field) => (field.suggestions ?? []).some((s) => s.value === "pdf")), "modalities suggestions include pdf")
 
-  // dialogMetrics: capping math (imported from the TUI bundle via menu-tree smoke
-  // because tui.js needs the OpenTUI runtime; here we assert the constant contract).
-  const { dialogMetrics } = await import(dist("tui")).catch(() => ({ dialogMetrics: undefined }))
-  if (dialogMetrics) {
-    const api = { kv: { get: () => 100 } } // 100% height request
-    const small = dialogMetrics(api, 30, 14, 4)
-    assert(small.availableRows <= Math.floor(30 * 0.75) - 14 + 1, `tall dialogs never exceed the 75% backdrop budget on small terminals (got ${small.availableRows})`)
-    const tall = dialogMetrics(api, 100, 14, 4)
-    assert(tall.targetRows <= tall.availableRows, "targetRows capped to availableRows")
+  // dialogMetrics math (pure module - Node-testable without the OpenTUI runtime).
+  const { computeDialogRows } = await import(dist("size"))
+  {
+    const low = computeDialogRows(30, 60, 6, 4)
+    const high = computeDialogRows(100, 60, 6, 4)
+    assert(high.targetRows > low.targetRows, `height percent must drive dialog size (30%=${low.targetRows}, 100%=${high.targetRows})`)
+    const ceiling = Math.max(4, Math.floor(60 * 0.75) - 1 - 6)
+    assert(high.targetRows <= ceiling, `100% saturates at the physical backdrop ceiling (got ${high.targetRows}, ceiling ${ceiling})`)
+    assert(high.targetRows >= ceiling - 1, `100% must use (nearly) the whole ceiling - no artificial shrink (got ${high.targetRows}, ceiling ${ceiling})`)
+    const tiny = computeDialogRows(10, 20, 6, 4)
+    assert(tiny.targetRows >= 4 && tiny.availableRows >= 4, "min rows floor holds on tiny terminals")
+    const grows = computeDialogRows(50, 100, 6, 4)
+    assert(grows.targetRows === Math.min(Math.floor(100 * 0.5) - 6, Math.floor(100 * 0.75) - 1 - 6), "exact percent math")
   }
 }
 testSuggestionsAndMetrics()

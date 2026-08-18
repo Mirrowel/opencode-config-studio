@@ -37,6 +37,7 @@ import { ensureTuiRegistration, ourRootDir } from "./selfwire.js"
 import { agentMode as avAgentMode, showFieldList as avShowFieldList, type FieldListOption as AVFieldListOption, type FieldListChoice as AVFieldListChoice } from "@mirrowel/opencode-agent-variants/wizard"
 import { FIELD_DOCS } from "./docs.js"
 import { rankOptions } from "./search.js"
+import { computeDialogRows } from "./size.js"
 import { currentPaletteCategory, declarePaletteCategory, schedulePaletteReconcile } from "./palette-category.js"
 import { discoverMarkdownAgents, discoverTuiFiles, type MarkdownAgent } from "./discovery.js"
 import { CLEANUP_RULES, TUI_KEYS, keybindGroupsMatching, toolsToPermission, type ObjectFieldSpec } from "./keymeta.js"
@@ -835,11 +836,10 @@ function SizeSliderDialog(props: { api: TuiPluginApi; current: number; onDone: (
     const widthColumns = DIALOG_WIDTH_COLUMNS[wizardDialogSize(props.api)]
     const previewWidth = Math.max(10, Math.min(sliderWidth() + 4, 72))
     const scale = previewWidth / widthColumns
-    // True effective height: the percent capped by the backdrop budget the
-    // way real dialogs compute it (dialogMetrics shares this math).
-    const backdropCap = Math.floor(0.75 * dimensions().height) - 1
+    // Same math the real dialogs use (dialogMetrics shares this budget).
+    const metrics = dialogMetrics(props.api, dimensions().height, 6, 4)
+    const effective = metrics.targetRows
     const requested = Math.floor((dimensions().height * Math.min(100, Math.max(25, height()))) / 100)
-    const effective = Math.min(requested, backdropCap)
     const rows = Math.max(4, Math.round(effective * scale))
     const fill = (text: string, width: number) => {
       const inner = width - 2
@@ -996,19 +996,11 @@ function estimatedVisualRows(message: string, width: number) {
  * Preview + every dialog consume this ONE function - they cannot diverge.
  */
 export function dialogMetrics(api: TuiPluginApi, terminalHeight: number, chromeRows: number, minRows: number) {
-  const percent = wizardDialogHeightPercent(api)
-  const backdropBudget = Math.max(minRows + chromeRows, Math.floor(terminalHeight * 0.75) - 1)
-  const target = Math.max(minRows, Math.floor((terminalHeight * percent) / 100))
-  return {
-    /** Rows actually available for content before the backdrop overflows. */
-    availableRows: Math.max(minRows, backdropBudget - chromeRows),
-    /** Rows this dialog wants at the current height percent (capped to fit). */
-    targetRows: Math.min(Math.max(minRows, target), Math.max(minRows, backdropBudget - chromeRows)),
-  }
+  return computeDialogRows(wizardDialogHeightPercent(api), terminalHeight, chromeRows, minRows)
 }
 
 function wizardMaxRows(api: TuiPluginApi, terminalHeight: number, chromeRows: number, minRows: number) {
-  return dialogMetrics(api, terminalHeight, chromeRows, minRows).availableRows
+  return dialogMetrics(api, terminalHeight, chromeRows, minRows).targetRows
 }
 
 function menuTitleWidth(size: DialogSize, options: readonly { title: string }[]) {
@@ -1185,14 +1177,25 @@ function MenuDialog<Value>(props: {
   useWizardDialogSize(props.api)
   useHidePromptCursor(props.api)
   const dimensions = useTerminalDimensions()
-  const listHeight = createMemo(() => cappedHeight(props.options.length, wizardMaxRows(props.api, dimensions().height, 14, 6)))
+  const [filtering, setFiltering] = createSignal(false)
+  const [query, setQuery] = createSignal("")
+  const [filterApplied, setFilterApplied] = createSignal(false)
+  const visibleOptions = createMemo(() => {
+    const text = query().trim()
+    if (!filtering() || text === "") return props.options
+    return rankOptions(
+      props.options.map((option) => ({ title: String(option.title), description: option.description ?? "", value: option.value, option })),
+      text,
+    ).map((ranked) => (ranked as { option: WizardSelectOption<Value> }).option)
+  })
+  const listHeight = createMemo(() => cappedHeight(visibleOptions().length, wizardMaxRows(props.api, dimensions().height, 6, 6)))
   const titleWidth = createMemo(() => menuTitleWidth(wizardDialogSize(props.api), props.options))
   let scroll: ScrollBoxRenderable | undefined
   const popMode = props.api.mode.push("config-studio.dialog")
   const [selected, setSelected] = createSignal(Math.max(0, props.options.findIndex((option) => option.value === props.current)))
-  const current = createMemo(() => props.options[selected()] ?? props.options[0])
+  const current = createMemo(() => visibleOptions()[selected()] ?? visibleOptions()[0])
   const move = (delta: number) => setSelected((value) => {
-    const next = Math.max(0, Math.min(props.options.length - 1, value + delta))
+    const next = Math.max(0, Math.min(visibleOptions().length - 1, value + delta))
     scroll?.scrollTo(Math.max(0, next - 2))
     return next
   })
@@ -1207,6 +1210,16 @@ function MenuDialog<Value>(props: {
     props.onDone({ action: "inspect", value: option.value })
   }
   const commandPrefix = `config-studio.menu.${Math.random().toString(36).slice(2)}`
+  const typeFilterChar = (char: string) => {
+    setQuery((value) => value + char)
+    setSelected(0)
+    scroll?.scrollTo(0)
+  }
+  const clearFilter = () => {
+    setFiltering(false)
+    setQuery("")
+    setSelected(0)
+  }
   const unregister = props.api.keymap.registerLayer({
     priority: 10000,
     commands: [
@@ -1214,7 +1227,15 @@ function MenuDialog<Value>(props: {
       { name: `${commandPrefix}.down`, title: "Next item", run: (ctx: KeyContext) => { blockKey(ctx); move(1) } },
       { name: `${commandPrefix}.select`, title: "Select item", run: (ctx: KeyContext) => { blockKey(ctx); choose() } },
       { name: `${commandPrefix}.inspect`, title: "Item help", run: (ctx: KeyContext) => { blockKey(ctx); inspect() } },
-      { name: `${commandPrefix}.back`, title: "Back", run: (ctx: KeyContext) => { blockKey(ctx); props.onDone(undefined) } },
+      { name: `${commandPrefix}.back`, title: "Back", run: (ctx: KeyContext) => {
+        blockKey(ctx)
+        if (filtering() || query() !== "") {
+          clearFilter()
+          return
+        }
+        props.onDone(undefined)
+      } },
+      { name: `${commandPrefix}.filter`, title: "Search list", run: (ctx: KeyContext) => { blockKey(ctx); setFiltering(true); setFilterApplied(true) } },
       { name: `${commandPrefix}.shield`, title: "Block background input", run: blockKey },
     ],
     bindings: [
@@ -1225,12 +1246,36 @@ function MenuDialog<Value>(props: {
       { key: "enter", cmd: `${commandPrefix}.select`, desc: "Select item" },
       { key: "i", cmd: `${commandPrefix}.inspect`, desc: "Item help" },
       { key: "escape", cmd: `${commandPrefix}.back`, desc: "Back" },
+      { key: "/", cmd: `${commandPrefix}.filter`, desc: "Search list" },
       ...shieldBindings(`${commandPrefix}.shield`, ["i"]),
     ],
   })
   onCleanup(() => {
     unregister()
     popMode()
+  })
+
+  // Filter-input layer: exists ONLY while filtering. Sits above the menu
+  // layer so every printable key types into the query box instead of
+  // triggering menu shortcuts; enter saves the query, escape clears it.
+  createEffect(() => {
+    if (!filtering()) return
+    const chars = "abcdefghijklmnopqrstuvwxyz0123456789 -_."
+    const commands: Array<{ name: string; title: string; run: (ctx: KeyContext) => void }> = []
+    const bindings: Array<{ key: string; cmd: string; desc: string }> = []
+    for (const char of chars) {
+      const cmdName = `${commandPrefix}.type.${char.codePointAt(0)}`
+      commands.push({ name: cmdName, title: "Type into search", run: (ctx: KeyContext) => { blockKey(ctx); typeFilterChar(char) } })
+      bindings.push({ key: char === " " ? "space" : char, cmd: cmdName, desc: "Type into search" })
+    }
+    commands.push({ name: `${commandPrefix}.filterAccept`, title: "Save search", run: (ctx: KeyContext) => { blockKey(ctx); setFiltering(false); setFilterApplied(true); setSelected(0) } })
+    bindings.push({ key: "enter", cmd: `${commandPrefix}.filterAccept`, desc: "Save search" })
+    commands.push({ name: `${commandPrefix}.filterClear`, title: "Clear search", run: (ctx: KeyContext) => { blockKey(ctx); clearFilter() } })
+    bindings.push({ key: "escape", cmd: `${commandPrefix}.filterClear`, desc: "Clear search" })
+    commands.push({ name: `${commandPrefix}.filterBackspace`, title: "Delete search char", run: (ctx: KeyContext) => { blockKey(ctx); setQuery((value) => value.slice(0, -1)) } })
+    bindings.push({ key: "backspace", cmd: `${commandPrefix}.filterBackspace`, desc: "Delete search char" })
+    const unregisterFilter = props.api.keymap.registerLayer({ priority: 10001, commands, bindings })
+    onCleanup(() => unregisterFilter())
   })
 
   return (
@@ -1240,13 +1285,21 @@ function MenuDialog<Value>(props: {
         <text fg={theme().textMuted} onMouseUp={() => props.onDone(undefined)}>esc</text>
       </box>
       <box flexDirection="row" gap={3} marginBottom={1}>
-        <text fg={theme().textMuted}>enter select</text>
-        <text fg={theme().textMuted}>up/down move</text>
-        <text fg={theme().textMuted}>i help</text>
+        <Show when={filtering()}>
+          <text fg={theme().accent}>/ </text>
+          <text fg={theme().text}>{query()}</text>
+          <text fg={theme().textMuted}>{query() === "" ? "type to search - enter accepts - esc exits" : "|"}</text>
+        </Show>
+        <Show when={!filtering()}>
+          <text fg={theme().textMuted}>enter select</text>
+          <text fg={theme().textMuted}>up/down move</text>
+          <text fg={theme().textMuted}>i help</text>
+          <text fg={filterApplied() && query() === "" ? theme().accent : theme().textMuted}>/ search</text>
+        </Show>
       </box>
       <scrollbox maxHeight={listHeight()} ref={(element: ScrollBoxRenderable) => (scroll = element)}>
       <box flexDirection="column" gap={0}>
-        <For each={props.options}>
+        <For each={visibleOptions()}>
           {(option, index) => {
             const active = createMemo(() => selected() === index())
             const fg = createMemo(() => active() ? theme().background : option.danger ? theme().error : option.color ?? (option.edited ? theme().success : theme().text))
@@ -1397,7 +1450,7 @@ function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; 
   const popMode = props.api.mode.push("config-studio.dialog")
   const lines = createMemo(() => props.message.split(/\r?\n/))
   const visualRows = createMemo(() => estimatedVisualRows(props.message, dialogContentWidth(props.api)))
-  const bodyHeight = createMemo(() => cappedHeight(visualRows() + 1, wizardMaxRows(props.api, dimensions().height, 13, 4), 4))
+  const bodyHeight = createMemo(() => cappedHeight(visualRows() + 1, wizardMaxRows(props.api, dimensions().height, 6, 4), 4))
   let scroll: ScrollBoxRenderable | undefined
   const page = () => Math.max(1, (scroll?.height ?? bodyHeight()) - 1)
   const commandPrefix = `config-studio.info.${Math.random().toString(36).slice(2)}`
@@ -1551,7 +1604,7 @@ function PagedDialog(props: { api: TuiPluginApi; title: string; sections: PagedS
   const dimensions = useTerminalDimensions()
   const popMode = props.api.mode.push("config-studio.dialog")
 
-  const height = createMemo(() => Math.max(6, wizardMaxRows(props.api, dimensions().height, 14, 6)))
+  const height = createMemo(() => Math.max(6, wizardMaxRows(props.api, dimensions().height, 6, 6)))
   const sections = createMemo(() => (props.sections.length > 0 ? props.sections : [{ title: "", lines: ["(empty)"] }]))
   const jumpKeys = createMemo(() => sections().slice(0, 9).map((section, index) => ({ section, key: String(index + 1) })))
 
