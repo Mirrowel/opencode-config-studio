@@ -48,7 +48,7 @@ import { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS }
 import { DEFAULT_HIDDEN_SECTIONS, loadSettings, moduleOption, saveSettings, setModuleOption, settingsPath, PINNABLE_SCREENS, screenTitle, type StudioSettings } from "./settings.js"
 import { avOrigin, refreshAvSource } from "./av-source.js"
 import { enabledModules, moduleUsesOwnMenu, getModules, type ModuleContext } from "./modules.js"
-import { agentVariantsModuleId, setModulePickImplementation } from "./modules/agent-variants.js"
+import { agentVariantsModuleId, agentVariantsHiddenAliases, resetAgentVariantsLens, setModuleAlertImplementation, setModulePickImplementation } from "./modules/agent-variants.js"
 import { findStandaloneAgentVariants, removeStandaloneHits } from "./standalone.js"
 
 // ---------------------------------------------------------------------------
@@ -3742,6 +3742,24 @@ async function agentsScreen(api: TuiPluginApi, state: StudioState, returnTo?: ()
   for (const markdownAgent of state.markdownAgents) {
     if (!agents.has(markdownAgent.name)) agents.set(markdownAgent.name, { __markdown: markdownAgent.path })
   }
+  // Agent Variants injects task-tool clones of parent agents (variant aliases)
+  // into the runtime config this screen reads from. They are not real config
+  // agents: editing one here would materialize a real agent.<name> entry and
+  // fork the variant's single source of truth. Silently drop them (they are
+  // copies of the base agent by design, managed in the Agent Variants module);
+  // a name that ALSO exists in a discovered config file stays visible.
+  // Exploring a read-only view of them here could be worthwhile someday.
+  const hiddenAliases = agentVariantsHiddenAliases()
+  if (hiddenAliases.size > 0) {
+    for (const name of [...agents.keys()]) {
+      if (!hiddenAliases.has(name)) continue
+      const definedInFile = state.files.some((file) => {
+        const agentTree = (file.data as Record<string, unknown> | undefined)?.["agent"]
+        return !!agentTree && typeof agentTree === "object" && (agentTree as Record<string, unknown>)[name] !== undefined
+      })
+      if (!definedInFile) agents.delete(name)
+    }
+  }
   const options: WizardSelectOption<string>[] = [...agents.entries()].map(([name, entry]) => {
     const hasEdits = state.files.some((file) => fileAgentEdits(file).some((agent) => agent.agentID === name))
     const markdown = state.markdownAgents.find((agent) => agent.name === name)
@@ -4499,6 +4517,8 @@ const tui: TuiPlugin = async (api) => {
       })),
     }),
   )
+  setModuleAlertImplementation((moduleApi, title, message) => showAlert(moduleApi.ui, { title, message }))
+  resetAgentVariantsLens()
   studioSettings = loadSettings(studioDataDir(api))
 
   // Startup duplicate check ONLY: the TUI entry runs at OpenCode startup, and

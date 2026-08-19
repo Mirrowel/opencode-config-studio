@@ -25,6 +25,7 @@ const { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } 
 const palette = await import(dist("palette-category"))
 const keymeta = await import(dist("keymeta"))
 const { resolveStandaloneDirIn, avOrigin, avSourceKind } = await import(dist("av-source"))
+const { variantAliasesOf } = await import(dist("modules/agent-variants"))
 function assert(condition, message) {
   if (!condition) throw new Error(`assert failed: ${message}`)
 }
@@ -919,6 +920,27 @@ async function testAvSource() {
 
 testKeyMeta()
 await testAvSource()
+
+function testVariantAliases() {
+  const cfg = () => ({
+    debug: false,
+    routing: { prompt_markers: false },
+    ui: { width: "large", height: "normal" },
+    models: {},
+    agents: {
+      general: { parent: {}, variants: { quick: { model: "zai/glm-5.2" }, deep: { name: "Deep Research" }, off: { disable: true } } },
+      ghost: { disable: true, parent: {}, variants: { gone: {} } },
+    },
+  })
+  const aliases = variantAliasesOf(cfg())
+  assert(aliases.has("general-quick"), "default alias parent-key")
+  assert(aliases.has("Deep Research"), "name override becomes the alias")
+  assert(!aliases.has("general-off"), "disabled variant produces no alias")
+  assert(!aliases.has("ghost-gone"), "disabled parent produces no aliases")
+  assert(!aliases.has("general"), "parents are not aliases")
+  assert(variantAliasesOf({ ...cfg(), agents: {} }).size === 0, "no variants means no aliases")
+}
+testVariantAliases()
 
 async function testSuggestionsAndMetrics() {
   const { SDK_PACKAGES, PROVIDER_FIELDS, MODEL_FIELDS } = keymeta
