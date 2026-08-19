@@ -206,6 +206,9 @@ async function runLayout(label, ownMenu) {
   const globalDir = path.join(dir, "global")
   mkdirSync(path.join(dir, "config-studio"), { recursive: true })
   mkdirSync(globalDir, { recursive: true })
+  // Seed a global config carrying the standalone AV plugin entry so the walker
+  // exercises the Source & channel single-hit flow (the old TypeError path).
+  writeFileSync(path.join(globalDir, "opencode.json"), JSON.stringify({ plugin: ["@mirrowel/opencode-agent-variants@dev"] }), "utf8")
   // Seed models.dev cache so the walk never touches the network.
   writeFileSync(path.join(dir, "config-studio", "models-cache.json"), JSON.stringify({ at: Date.now(), catalog: {} }), "utf8")
   try {
@@ -217,6 +220,7 @@ async function runLayout(label, ownMenu) {
       quickAccess: ["settings:Providers:disabled_providers"],
     })
     T.resetDuplicateCheck()
+    T.suppressDuplicateDialog()
     const state = await T.refreshStudio(api)
     runs = 0
     await walk(api, state, [])

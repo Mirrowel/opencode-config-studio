@@ -24,6 +24,8 @@ const cache = await import(dist("providercache"))
 const { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } = await import(dist("migration"))
 const palette = await import(dist("palette-category"))
 const keymeta = await import(dist("keymeta"))
+const { resolveStandaloneDirIn, avOrigin, avSourceKind } = await import(dist("av-source"))
+const { variantAliasesOf } = await import(dist("modules/agent-variants"))
 function assert(condition, message) {
   if (!condition) throw new Error(`assert failed: ${message}`)
 }
@@ -882,7 +884,63 @@ async function testCleanupScanner() {
   assert(clean.length === 0, "no false positives on a clean config")
 }
 
+async function testAvSource() {
+  const dir = mkdtempSync(path.join(tmpdir(), "av-source-"))
+  const family = path.join(dir, "@mirrowel")
+  // Real OpenCode cache layout: wrapper dirs whose package.json only declares
+  // the dependency, with the actual package nested under node_modules.
+  for (const tag of ["dev", "latest", "0.9.0-dev.1"]) {
+    const wrapper = path.join(family, `opencode-agent-variants@${tag}`)
+    const nested = path.join(wrapper, "node_modules", "@mirrowel", "opencode-agent-variants")
+    mkdirSync(nested, { recursive: true })
+    writeFileSync(path.join(wrapper, "package.json"), JSON.stringify({ dependencies: { "@mirrowel/opencode-agent-variants": tag } }), "utf8")
+    writeFileSync(path.join(nested, "package.json"), JSON.stringify({ name: "@mirrowel/opencode-agent-variants", version: tag === "latest" ? "0.8.0" : tag }), "utf8")
+  }
+  mkdirSync(path.join(family, "unrelated-pkg@dev"), { recursive: true })
+  writeFileSync(path.join(family, "unrelated-pkg@dev", "package.json"), JSON.stringify({ name: "@mirrowel/unrelated-pkg" }), "utf8")
+  // A direct (non-wrapper) package directory, as file:// checkouts have.
+  const local = path.join(dir, "local-av")
+  mkdirSync(local, { recursive: true })
+  writeFileSync(path.join(local, "package.json"), JSON.stringify({ name: "@mirrowel/opencode-agent-variants", version: "file-local" }), "utf8")
+
+  // Wrapper dirs resolve to the nested package, not the wrapper root.
+  const devDir = resolveStandaloneDirIn(dir, "@mirrowel/opencode-agent-variants@dev")
+  assert(devDir?.includes(path.join("node_modules", "@mirrowel", "opencode-agent-variants")), "exact @dev tag resolves through the wrapper")
+  const exactDir = resolveStandaloneDirIn(dir, "@mirrowel/opencode-agent-variants@0.9.0-dev.1")
+  assert(exactDir?.includes("node_modules"), "exact version resolves through the wrapper")
+  assert(resolveStandaloneDirIn(dir, "@mirrowel/opencode-agent-variants")?.endsWith(path.join("node_modules", "@mirrowel", "opencode-agent-variants")), "bare spec resolves @latest through the wrapper")
+  assert(resolveStandaloneDirIn(dir, "@mirrowel/opencode-agent-variants@beta")?.includes("node_modules"), "unknown tag falls back to @dev through the wrapper")
+  // Direct package dirs pass through unwrapped.
+  const fileSpec = pathToFileURL(local).href
+  assert(resolveStandaloneDirIn(dir, fileSpec) === local, "file:// spec resolves to its directory (direct layout)")
+  assert(resolveStandaloneDirIn(path.join(dir, "empty-cache"), "@mirrowel/opencode-agent-variants@dev") === undefined, "empty cache resolves nothing")
+  assert(avSourceKind() === "embedded", "studio starts on the embedded implementation")
+  assert(avOrigin().includes("embedded"), "origin reports embedded by default")
+}
+
 testKeyMeta()
+await testAvSource()
+
+function testVariantAliases() {
+  const cfg = () => ({
+    debug: false,
+    routing: { prompt_markers: false },
+    ui: { width: "large", height: "normal" },
+    models: {},
+    agents: {
+      general: { parent: {}, variants: { quick: { model: "zai/glm-5.2" }, deep: { name: "Deep Research" }, off: { disable: true } } },
+      ghost: { disable: true, parent: {}, variants: { gone: {} } },
+    },
+  })
+  const aliases = variantAliasesOf(cfg())
+  assert(aliases.has("general-quick"), "default alias parent-key")
+  assert(aliases.has("Deep Research"), "name override becomes the alias")
+  assert(!aliases.has("general-off"), "disabled variant produces no alias")
+  assert(!aliases.has("ghost-gone"), "disabled parent produces no aliases")
+  assert(!aliases.has("general"), "parents are not aliases")
+  assert(variantAliasesOf({ ...cfg(), agents: {} }).size === 0, "no variants means no aliases")
+}
+testVariantAliases()
 
 async function testSuggestionsAndMetrics() {
   const { SDK_PACKAGES, PROVIDER_FIELDS, MODEL_FIELDS } = keymeta

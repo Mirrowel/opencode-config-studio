@@ -13,35 +13,20 @@
  * draft; the studio's unified Save & exit writes it (saveSidecar) together
  * with any staged opencode.json changes. The standalone plugin remains fully
  * functional on its own.
+ *
+ * NOTE (layout direction): maintaining BOTH layouts - integrated screens plus
+ * the own-menu submenu - keeps growing in cost with every feature (profiles,
+ * lens, guards each need wiring in both). If this keeps trending, the likely
+ * decision is to consolidate on the own-menu layout and drop the integrated
+ * view. Until then, new features must land in both.
  */
 
 import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
-import {
-  defaultSidecarPath,
-  diagnoseConfig,
-  loadSidecar,
-  saveSidecar,
-  type SidecarConfig,
-} from "@mirrowel/opencode-agent-variants/config"
-import {
-  addVariantFor,
-  agentModes,
-  clearDebugLog,
-  configBackupsMenu,
-  deleteVariantFor,
-  editParentFields,
-  editVariantFor,
-  generatedAliasSet,
-  manageModelPresets,
-  newWizardSettings,
-  pickParentAgent,
-  toggleEntryFor,
-  variantCount,
-  viewDebugLog,
-  wizardInfoText,
-  type WizardSettings,
-} from "@mirrowel/opencode-agent-variants/wizard"
+import type { SidecarConfig } from "@mirrowel/opencode-agent-variants/config"
+import type { WizardSettings } from "@mirrowel/opencode-agent-variants/wizard"
+import type * as EmbeddedWizard from "@mirrowel/opencode-agent-variants/wizard"
 import { registerModule, type ModuleContext, type StudioModule } from "../modules.js"
+import { av } from "../av-source.js"
 import { buildMigrationPlan, savableParentFields } from "../migration.js"
 
 /** Parent-patch fields that stay in the sidecar (config hosts the rest). */
@@ -49,15 +34,91 @@ const SIDECAR_PARENT_FIELDS = new Set(["prompt_prepend", "prompt_append", "descr
 
 let draft: SidecarConfig | undefined
 let wizardSettings: WizardSettings | undefined
+/** Profile editing lens for this studio run (undefined = global default). Resets on every studio open, save, and discard. */
+let avLens: string | undefined
+
+export function resetAgentVariantsLens(): void {
+  avLens = undefined
+}
+
+/**
+ * Wizard surface with the profile-lens-capable signatures (agent-variants
+ * 0.9.0-dev.2+). The embedded copy may be older - lens entry points are
+ * optional and feature-detected; the editors accept the lens as a trailing
+ * argument and simply ignore it when absent.
+ */
+type LensWizard = {
+  profileSwitcher?: (api: AVApi, config: SidecarConfig, lens: string | undefined) => Promise<{ config: SidecarConfig; lens: string | undefined } | undefined>
+  warnStructuralInProfile?: (api: AVApi, lens: string | undefined) => Promise<boolean>
+  lensTitle?: (base: string, lens: string | undefined) => string
+  manageProfiles?: (api: AVApi, config: SidecarConfig, settings: WizardSettings) => Promise<SidecarConfig>
+  editVariantFor: (api: AVApi, config: SidecarConfig, settings: WizardSettings, agent: string, key: string, lens?: string) => Promise<SidecarConfig>
+  editParentFields: (api: AVApi, config: SidecarConfig, agent: string, settings: WizardSettings, fieldFilter?: ReadonlySet<string>, lens?: string) => Promise<SidecarConfig>
+}
+
+function lensWizard(): LensWizard {
+  return av().wizard as unknown as LensWizard
+}
+
+function profilesAvailable(): boolean {
+  return typeof lensWizard().profileSwitcher === "function"
+}
+
+function lensSuffix(base: string): string {
+  const title = lensWizard().lensTitle
+  return title ? title(base, avLens) : base
+}
+
+/** True (and informs) when a structural action must be blocked by the lens. */
+async function guardStructural(ctx: ModuleContext): Promise<boolean> {
+  if (avLens === undefined) return false
+  const warn = lensWizard().warnStructuralInProfile
+  if (!warn) return false
+  return warn(avApi(ctx.api), avLens)
+}
+
+/** Profile-context row shared by the AV submenus (switches the editing lens). */
+function profileContextRow(): PickOption {
+  return {
+    title: `Profile context: ${avLens ?? "Global default"}`,
+    value: "__av_lens__",
+    description: avLens ? "hot fields only - structural rows grayed out" : "every field editable",
+    help: "Switch which layer the AV editors write to: the global default or a named profile overlay (hot-reload fields only). Editing context only - live sessions follow the runtime activation in the standalone wizard's Profiles menu.",
+  }
+}
+
+async function openProfileSwitcher(ctx: ModuleContext): Promise<void> {
+  const switcher = lensWizard().profileSwitcher
+  if (!switcher) {
+    await ctxAlert(ctx, "Profiles unavailable", "The embedded agent-variants copy lacks profiles. Switch the module source to the standalone install (Modules > Agent Variants > Source & channel), or wait for agent-variants 0.9.0 stable.")
+    return
+  }
+  const switched = await switcher(avApi(ctx.api), ensureDraft(), avLens)
+  if (switched) {
+    assign(switched.config)
+    avLens = switched.lens
+  }
+}
+
+/** Alert indirection (same one-way-circularity avoidance as pickImpl). */
+let alertImpl: ((api: TuiPluginApi, title: string, message: string) => Promise<void>) | undefined
+
+export function setModuleAlertImplementation(impl: typeof alertImpl): void {
+  alertImpl = impl
+}
+
+async function ctxAlert(ctx: ModuleContext, title: string, message: string): Promise<void> {
+  if (alertImpl) await alertImpl(ctx.api, title, message)
+}
 
 function ensureDraft(): SidecarConfig {
-  draft ??= loadSidecar(defaultSidecarPath())
-  wizardSettings ??= newWizardSettings(true)
+  draft ??= av().config.loadSidecar(av().config.defaultSidecarPath())
+  wizardSettings ??= av().wizard.newWizardSettings(true)
   return draft
 }
 
 function settingsOf(): WizardSettings {
-  wizardSettings ??= newWizardSettings(true)
+  wizardSettings ??= av().wizard.newWizardSettings(true)
   return wizardSettings
 }
 
@@ -67,7 +128,7 @@ function assign(next: SidecarConfig): void {
 
 function sidecarChanged(): boolean {
   if (!draft) return false
-  return JSON.stringify(draft) !== JSON.stringify(loadSidecar(defaultSidecarPath()))
+  return JSON.stringify(draft) !== JSON.stringify(av().config.loadSidecar(av().config.defaultSidecarPath()))
 }
 
 /** Agents the sidecar knows (parents with variants or parent overrides). */
@@ -89,6 +150,7 @@ async function variantsSubmenu(ctx: ModuleContext, agent: string): Promise<void>
     const parentDisabled = entry?.disable === true
     const variants = Object.entries(entry?.variants ?? {})
     const options = [
+      profileContextRow(),
       {
         title: `Full disable: ${parentDisabled ? "currently sidecar-disabled" : "off"} - write to config`,
         value: "__config_disable__",
@@ -123,9 +185,14 @@ async function variantsSubmenu(ctx: ModuleContext, agent: string): Promise<void>
       }),
       { title: "< Back", value: "__back__", description: "Return to agent detail" },
     ]
-    const picked = await ctxPick(ctx, { title: `${agent} - Agent Variants`, options })
+    const picked = await ctxPick(ctx, { title: lensSuffix(`${agent} - Agent Variants`), options })
     if (!picked || picked === "__back__") return
+    if (picked === "__av_lens__") {
+      await openProfileSwitcher(ctx)
+      continue
+    }
     if (picked === "__config_disable__") {
+      if (await guardStructural(ctx)) continue
       // Full disable lives in opencode.json: stage through the studio queue.
       const agentEntry = (ctx.state.merge.merged as Record<string, unknown>)["agent"] as Record<string, unknown> | undefined
       const currentlyDisabled = (agentEntry?.[agent] as Record<string, unknown> | undefined)?.["disable"] === true
@@ -141,11 +208,13 @@ async function variantsSubmenu(ctx: ModuleContext, agent: string): Promise<void>
       continue
     }
     if (picked === "__parent_toggle__") {
-      assign(await toggleEntryFor(avApi(ctx.api), config, settingsOf(), { agent }))
+      if (await guardStructural(ctx)) continue
+      assign(await av().wizard.toggleEntryFor(avApi(ctx.api), config, settingsOf(), { agent }))
       continue
     }
     if (picked === "__add__") {
-      assign(await addVariantFor(avApi(ctx.api), config, settingsOf(), agent))
+      if (await guardStructural(ctx)) continue
+      assign(await av().wizard.addVariantFor(avApi(ctx.api), config, settingsOf(), agent))
       continue
     }
     assign(await variantActions(ctx, agent, picked))
@@ -161,18 +230,22 @@ async function variantActions(ctx: ModuleContext, agent: string, key: string): P
     { title: "Delete variant", value: "delete", description: "Remove from sidecar", danger: true },
     { title: "< Back", value: "__back__", description: "Return to variants" },
   ]
-  const picked = await ctxPick(ctx, { title: `${agent} / ${key}`, options })
+  const picked = await ctxPick(ctx, { title: lensSuffix(`${agent} / ${key}`), options })
   if (!picked || picked === "__back__") return config
-  if (picked === "edit") return editVariantFor(avApi(ctx.api), config, settingsOf(), agent, key)
-  if (picked === "toggle") return toggleEntryFor(avApi(ctx.api), config, settingsOf(), { agent, variant: key })
-  return deleteVariantFor(avApi(ctx.api), config, settingsOf(), agent, key)
+  if (picked === "edit") return lensWizard().editVariantFor(avApi(ctx.api), config, settingsOf(), agent, key, avLens)
+  if (picked === "toggle") {
+    if (await guardStructural(ctx)) return config
+    return av().wizard.toggleEntryFor(avApi(ctx.api), config, settingsOf(), { agent, variant: key })
+  }
+  if (await guardStructural(ctx)) return config
+  return av().wizard.deleteVariantFor(avApi(ctx.api), config, settingsOf(), agent, key)
 }
 
 // The wizard library is compiled inside the agent-variants package, whose
 // TuiPluginApi type may come from a different @opencode-ai/plugin copy than
 // the studio's (guaranteed identical shape). Derive the exact parameter type
 // from a wizard entry point and cast once at this boundary.
-type AVApi = Parameters<typeof pickParentAgent>[0]
+type AVApi = Parameters<typeof EmbeddedWizard.pickParentAgent>[0]
 
 function avApi(api: TuiPluginApi): AVApi {
   return api as unknown as AVApi
@@ -240,22 +313,28 @@ async function ownMenuSubmenu(ctx: ModuleContext): Promise<void> {
   while (true) {
     const config = ensureDraft()
     const action = await ctxPick(ctx, {
-      title: "Agent Variants",
+      title: lensSuffix("Agent Variants"),
       options: [
+        profileContextRow(),
         { title: "Add variant", value: "add", description: "Create a new agent variant", help: "Creates a new variant under a parent agent. The new task-list alias appears after an OpenCode restart." },
         { title: "Edit variant", value: "edit", description: "Change fields on an existing variant" },
         { title: "Toggle disable", value: "toggle", description: "Enable or disable agents/variants" },
         { title: "Delete variant", value: "delete", description: "Remove a variant", danger: true },
         { title: "Edit parent fields", value: "parent", description: "Override fields on an agent parent" },
         { title: `Model presets (${Object.keys(config.models).length})`, value: "presets", description: "Reusable model shortcuts" },
-        { title: "< Back", value: "__back__", description: "Return to Config Studio" },
+        { title: `< Back`, value: "__back__", description: "Return to Config Studio" },
       ],
     })
     if (!action || action === "__back__") return
 
+    if (action === "__av_lens__") {
+      await openProfileSwitcher(ctx)
+      continue
+    }
     if (action === "add") {
-      const agent = await pickParentAgent(avApi(ctx.api), config, settingsOf(), "Add variant - pick parent agent")
-      if (agent) assign(await addVariantFor(avApi(ctx.api), ensureDraft(), settingsOf(), agent))
+      if (await guardStructural(ctx)) continue
+      const agent = await av().wizard.pickParentAgent(avApi(ctx.api), config, settingsOf(), "Add variant - pick parent agent")
+      if (agent) assign(await av().wizard.addVariantFor(avApi(ctx.api), ensureDraft(), settingsOf(), agent))
       continue
     }
     if (action === "edit" || action === "delete") {
@@ -263,11 +342,15 @@ async function ownMenuSubmenu(ctx: ModuleContext): Promise<void> {
       if (!agent) continue
       const key = await pickVariantOf(ctx, agent, `${action} variant of "${agent}"`)
       if (!key) continue
-      if (action === "edit") assign(await editVariantFor(avApi(ctx.api), ensureDraft(), settingsOf(), agent, key))
-      else assign(await deleteVariantFor(avApi(ctx.api), ensureDraft(), settingsOf(), agent, key))
+      if (action === "edit") assign(await lensWizard().editVariantFor(avApi(ctx.api), ensureDraft(), settingsOf(), agent, key, avLens))
+      else {
+        if (await guardStructural(ctx)) continue
+        assign(await av().wizard.deleteVariantFor(avApi(ctx.api), ensureDraft(), settingsOf(), agent, key))
+      }
       continue
     }
     if (action === "toggle") {
+      if (await guardStructural(ctx)) continue
       const config2 = ensureDraft()
       const items: Array<{ title: string; value: string }> = []
       for (const [agent, raw] of Object.entries(config2.agents)) {
@@ -286,16 +369,16 @@ async function ownMenuSubmenu(ctx: ModuleContext): Promise<void> {
       const [kind, agent, key] = picked.split(":")
       void kind
       const target = key !== undefined ? { agent: agent!, variant: key } : { agent: agent! }
-      assign(await toggleEntryFor(avApi(ctx.api), config2, settingsOf(), target))
+      assign(await av().wizard.toggleEntryFor(avApi(ctx.api), config2, settingsOf(), target))
       continue
     }
     if (action === "parent") {
-      const agent = await pickParentAgent(avApi(ctx.api), config, settingsOf(), "Edit parent fields - pick agent")
-      if (agent) assign(await editParentFields(avApi(ctx.api), ensureDraft(), agent, settingsOf()))
+      const agent = await av().wizard.pickParentAgent(avApi(ctx.api), config, settingsOf(), lensSuffix("Edit parent fields - pick agent"))
+      if (agent) assign(await lensWizard().editParentFields(avApi(ctx.api), ensureDraft(), agent, settingsOf(), undefined, avLens))
       continue
     }
     if (action === "presets") {
-      assign(await manageModelPresets(avApi(ctx.api), ensureDraft()))
+      assign(await av().wizard.manageModelPresets(avApi(ctx.api), ensureDraft()))
       continue
     }
   }
@@ -366,7 +449,7 @@ const agentVariantsModule: StudioModule = {
   hasPendingChanges: () => sidecarChanged(),
   mainMenuEntry: (ctx) => ({
     title: "Agent Variants",
-    description: `${variantCount(ensureDraft())} variant(s), ${sidecarAgents().length} agent(s)`,
+    description: `${av().wizard.variantCount(ensureDraft())} variant(s), ${sidecarAgents().length} agent(s)`,
     help: "Variant management in one menu: add/edit/toggle/delete variants, parent fields, presets. Saves stage into the studio queue - use the studio's Save & exit.",
     run: async (context) => {
       await ownMenuSubmenu(context)
@@ -374,14 +457,29 @@ const agentVariantsModule: StudioModule = {
   }),
   agentsScreenEntries: (ctx) => {
     const config = ensureDraft()
+    // The embedded (0.8.x) sidecar type lacks `profiles`; read it loosely.
+    const profileCount = Object.keys((config as unknown as { profiles?: Record<string, unknown> }).profiles ?? {}).length
     void ctx
     return [
+      {
+        title: `AV profiles (${profileCount})`,
+        description: profilesAvailable() ? `Conditional overlays - editing context: ${avLens ?? "global default"}` : "embedded copy lacks profiles - use the standalone source",
+        help: "Profiles are conditional hot-field overlays on top of the global default, activated by the primary session's model or a manual pin. This opens the full manager (activation, match rules, per-agent overrides); the quick context switcher lives inside the AV submenus' Profile context row.",
+        run: async (context) => {
+          const manager = lensWizard().manageProfiles
+          if (!manager) {
+            await ctxAlert(context, "Profiles unavailable", "The embedded agent-variants copy lacks profiles. Switch the module source to the standalone install (Modules > Agent Variants > Source & channel), or wait for agent-variants 0.9.0 stable.")
+            return
+          }
+          assign(await manager(avApi(context.api), ensureDraft(), settingsOf()))
+        },
+      },
       {
         title: `Model presets (${Object.keys(config.models).length})`,
         description: "Reusable model shortcuts",
         help: "Create reusable model presets (light, heavy, ...) that variant and parent fields can reference.",
         run: async (context) => {
-          assign(await manageModelPresets(avApi(context.api), ensureDraft()))
+          assign(await av().wizard.manageModelPresets(avApi(context.api), ensureDraft()))
         },
       },
     ]
@@ -416,20 +514,20 @@ const agentVariantsModule: StudioModule = {
       description: "Prepend/append prompt & description patches",
       help: "Agent Variants parent patches that stay sidecar-only: relative prompt/description prepend+append (config cannot express them).",
       run: async (context: ModuleContext) => {
-        assign(await editParentFields(avApi(context.api), ensureDraft(), agent, settingsOf(), SIDECAR_PARENT_FIELDS))
+        assign(await lensWizard().editParentFields(avApi(context.api), ensureDraft(), agent, settingsOf(), SIDECAR_PARENT_FIELDS, avLens))
       },
     })
     return entries
   },
   diagnosticsSections: async (ctx) => {
     const config = ensureDraft()
-    const generatedAliases = generatedAliasSet(config)
+    const generatedAliases = av().wizard.generatedAliasSet(config)
     const agents = agentsFromState(avApi(ctx.api)).filter((agent) => !generatedAliases.has(agent))
-    const diagnostics = diagnoseConfig(config, {
+    const diagnostics = av().config.diagnoseConfig(config, {
       agents,
       providers: avApi(ctx.api).state.provider,
       pluginEntries: avApi(ctx.api).state.config.plugin as unknown[] | undefined,
-      agentModes: agentModes(avApi(ctx.api)),
+      agentModes: av().wizard.agentModes(avApi(ctx.api)),
     })
     const errors = diagnostics.filter((item) => item.level === "error").length
     const warnings = diagnostics.filter((item) => item.level === "warning").length
@@ -446,9 +544,9 @@ const agentVariantsModule: StudioModule = {
       {
         title: "AV summary",
         lines: [
-          `sidecar: ${defaultSidecarPath()}`,
+          `sidecar: ${av().config.defaultSidecarPath()}`,
           `agents configured: ${Object.keys(config.agents).length}`,
-          `variants configured: ${variantCount(config)}`,
+          `variants configured: ${av().wizard.variantCount(config)}`,
           `debug mode: ${config.debug ? "enabled" : "disabled"}`,
           `prompt route markers: ${config.routing.prompt_markers ? "enabled" : "disabled"}`,
           `summary: ${errors} error(s), ${warnings} warning(s), ${infos} info`,
@@ -468,7 +566,7 @@ const agentVariantsModule: StudioModule = {
         : []),
     ]
   },
-  infoSections: () => [{ title: "Agent Variants", lines: wizardInfoText().split("\n") }],
+  infoSections: () => [{ title: "Agent Variants", lines: av().wizard.wizardInfoText().split("\n") }],
   advancedEntries: (ctx) => {
     void ctx
     const config = ensureDraft()
@@ -502,7 +600,7 @@ const agentVariantsModule: StudioModule = {
         description: "Recent agent-variants.debug.log entries",
         help: "Shows the tail of the debug log written while the sidecar debug flag is on.",
         run: async (context) => {
-          await viewDebugLog(avApi(context.api))
+          await av().wizard.viewDebugLog(avApi(context.api))
         },
       },
       {
@@ -510,7 +608,7 @@ const agentVariantsModule: StudioModule = {
         description: "Empty agent-variants.debug.log",
         help: "Clears the debug log file immediately (not staged).",
         run: async (context) => {
-          await clearDebugLog(avApi(context.api))
+          await av().wizard.clearDebugLog(avApi(context.api))
         },
       },
       {
@@ -518,7 +616,7 @@ const agentVariantsModule: StudioModule = {
         description: "Preview, restore, and snapshot the agent-variants config",
         help: "Browse the sidecar backup journal (reverse patches and full snapshots). Restoring replaces the staged draft.",
         run: async (context) => {
-          assign(await configBackupsMenu(avApi(context.api), ensureDraft()))
+          assign(await av().wizard.configBackupsMenu(avApi(context.api), ensureDraft()))
         },
       },
       {
@@ -534,7 +632,7 @@ const agentVariantsModule: StudioModule = {
   },
   pendingSummary: () => {
     if (!sidecarChanged() || !draft) return undefined
-    const disk = loadSidecar(defaultSidecarPath())
+    const disk = av().config.loadSidecar(av().config.defaultSidecarPath())
     const changedSections: string[] = []
     for (const key of ["agents", "models", "routing", "ui", "debug"] as const) {
       if (JSON.stringify(draft[key]) !== JSON.stringify(disk[key])) changedSections.push(key)
@@ -543,7 +641,7 @@ const agentVariantsModule: StudioModule = {
       title: "Agent Variants sidecar",
       lines: [
         `Changed sections: ${changedSections.join(", ") || "(unknown)"}`,
-        `Variants: ${variantCount(draft)} (disk: ${variantCount(disk)})`,
+        `Variants: ${av().wizard.variantCount(draft)} (disk: ${av().wizard.variantCount(disk)})`,
         ...settingsOf().restartReasons.map((reason) => `restart: ${reason}`),
       ],
       restartReasons: [...settingsOf().restartReasons],
@@ -551,15 +649,51 @@ const agentVariantsModule: StudioModule = {
   },
   save: async () => {
     if (!draft || !sidecarChanged()) return { restartReasons: [] }
-    saveSidecar(draft, defaultSidecarPath())
+    av().config.saveSidecar(draft, av().config.defaultSidecarPath())
     const restartReasons = [...new Set(settingsOf().restartReasons)]
-    wizardSettings = newWizardSettings(true)
+    wizardSettings = av().wizard.newWizardSettings(true)
+    avLens = undefined
     return { restartReasons }
   },
   discard: () => {
-    draft = loadSidecar(defaultSidecarPath())
-    wizardSettings = newWizardSettings(true)
+    draft = av().config.loadSidecar(av().config.defaultSidecarPath())
+    wizardSettings = av().wizard.newWizardSettings(true)
+    avLens = undefined
   },
+}
+
+/**
+ * Variant aliases a sidecar config injects as task-tool agent clones
+ * (mirrors agent-variants' assembly: name override or parent-key; disabled
+ * parents/variants produce no alias). Pure - no sidecar I/O.
+ */
+export function variantAliasesOf(config: SidecarConfig): Set<string> {
+  const aliases = new Set<string>()
+  for (const [parent, raw] of Object.entries(config.agents)) {
+    const entry = raw as { disable?: boolean; variants?: Record<string, { name?: string; disable?: boolean }> }
+    if (entry.disable === true) continue
+    for (const [key, variant] of Object.entries(entry.variants ?? {})) {
+      if (variant.disable === true) continue
+      aliases.add(variant.name?.trim() || `${parent}-${key}`)
+    }
+  }
+  return aliases
+}
+
+/**
+ * Variant aliases to silently exclude from the studio's config-editor agents
+ * list. They are NOT real agents: they are task-tool clones of a parent agent
+ * maintained entirely by agent-variants. Editing one here would materialize a
+ * real agent.<name> entry in opencode.json and fork the variant's single
+ * source of truth (the studio would show both). Worth exploring a read-only
+ * view of them someday - until then they belong to the AV module only.
+ */
+export function agentVariantsHiddenAliases(): Set<string> {
+  try {
+    return variantAliasesOf(ensureDraft())
+  } catch {
+    return new Set<string>()
+  }
 }
 
 function agentsFromState(api: { state: { config: { agent?: Record<string, unknown> } } }): string[] {
