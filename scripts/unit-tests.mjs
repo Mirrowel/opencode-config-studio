@@ -25,6 +25,7 @@ const { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } 
 const palette = await import(dist("palette-category"))
 const keymeta = await import(dist("keymeta"))
 const { resolveStandaloneDirIn, avOrigin, avSourceKind } = await import(dist("av-source"))
+const reload = await import(dist("reload"))
 const { variantAliasesOf } = await import(dist("modules/agent-variants"))
 function assert(condition, message) {
   if (!condition) throw new Error(`assert failed: ${message}`)
@@ -920,6 +921,161 @@ async function testAvSource() {
 
 testKeyMeta()
 await testAvSource()
+
+async function testDeferredReload() {
+  const tick = (ms = 25) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  function fakeReloadApi({ active, sessions = {}, waitControl = false } = {}) {
+    const state = { disposed: 0, toasts: [], activeMap: active, waitResolvers: [] }
+    return {
+      api: {
+        client: {
+          global: {
+            dispose: async () => {
+              state.disposed++
+            },
+          },
+          session: {
+            active: async () => {
+              if (state.activeMap === "fail") throw new Error("unreachable")
+              return { data: state.activeMap ?? {} }
+            },
+            get: async ({ sessionID }) => ({ data: sessions[sessionID] ?? { id: sessionID } }),
+            wait: () =>
+              new Promise((resolve) => {
+                if (waitControl) state.waitResolvers.push(resolve)
+                else resolve(undefined)
+              }),
+          },
+        },
+        ui: { toast: (input) => state.toasts.push(input) },
+      },
+      state,
+      setActive: (next) => {
+        state.activeMap = next
+      },
+      releaseWaits: () => {
+        const resolvers = state.waitResolvers.splice(0)
+        resolvers.forEach((resolve) => resolve(undefined))
+      },
+    }
+  }
+
+  // Idle: reload happens immediately.
+  reload.__testReset()
+  reload.__testSetTimings({ studioHoldPoll: 5, failureRetry: 5 })
+  {
+    const { api, state } = fakeReloadApi({ active: {} })
+    const result = await reload.requestReload(api)
+    assert(result.kind === "reloaded", "idle config reloads immediately")
+    assert(state.disposed === 1, "idle path disposes once")
+    assert(reload.pendingReload() === undefined, "no pending state after idle reload")
+  }
+
+  // Busy: deferred, then watcher applies the reload once sessions finish.
+  {
+    const { api, state } = fakeReloadApi({ active: { ses_a: { type: "running" }, ses_b: { type: "running" } } })
+    const result = await reload.requestReload(api)
+    assert(result.kind === "deferred" && result.active === 2, "running sessions defer the reload")
+    assert(state.disposed === 0, "no dispose while sessions run")
+    assert(reload.pendingReload()?.active === 2, "pending state records the active count")
+    state.activeMap = {}
+    await tick()
+    assert(state.disposed === 1, "watcher disposes once sessions go idle")
+    assert(reload.pendingReload() === undefined, "pending cleared after auto-reload")
+    assert(state.toasts.some((toast) => String(toast.message).includes("reloaded")), "success toast emitted")
+  }
+
+  // New session starts while waiting: the watcher keeps waiting.
+  {
+    const { api, state, releaseWaits } = fakeReloadApi({ active: { ses_a: { type: "running" } }, waitControl: true })
+    const result = await reload.requestReload(api)
+    assert(result.kind === "deferred", "deferred with controlled waits")
+    await tick()
+    state.activeMap = { ses_a: { type: "running" }, ses_new: { type: "running" } }
+    releaseWaits()
+    await tick()
+    assert(state.disposed === 0, "still waiting after a new session appeared")
+    state.activeMap = {}
+    releaseWaits()
+    await tick()
+    assert(state.disposed === 1, "reloads only when every session finished")
+  }
+
+  // Detection failure: defers (never interrupts on uncertainty).
+  {
+    const { api, state } = fakeReloadApi({ active: "fail" })
+    const result = await reload.requestReload(api)
+    assert(result.kind === "deferred" && result.detectionFailed === true, "detection failure defers")
+    assert(state.disposed === 0, "no dispose when detection fails")
+    reload.cancelPendingReload()
+  }
+
+  // Studio flow guard: the watcher holds off while the studio is open.
+  {
+    if (reload.__testWatching()) {
+      // A prior block left an immortal watcher (its fake wait never settles
+      // after that block's assertions); reset so this scenario starts clean.
+      reload.__testReset()
+      reload.__testSetTimings({ studioHoldPoll: 5, failureRetry: 5 })
+    }
+    const { api, state } = fakeReloadApi({ active: { ses_a: { type: "running" } } })
+    reload.beginStudioFlow()
+    const result = await reload.requestReload(api)
+    assert(result.kind === "deferred", "deferred while studio open")
+    state.activeMap = {}
+    await tick()
+    assert(state.disposed === 0, "watcher holds while the studio flow is open")
+    reload.endStudioFlow()
+    await tick(30)
+    assert(state.disposed === 1, "watcher resumes after the studio flow ends")
+  }
+
+  // Manual force: clears pending and disposes immediately.
+  {
+    const { api, state, releaseWaits } = fakeReloadApi({ active: { ses_a: { type: "running" } }, waitControl: true })
+    await reload.requestReload(api)
+    await tick()
+    const ok = await reload.reloadNow(api)
+    assert(ok === true, "force reload reports success")
+    assert(state.disposed === 1, "force reload disposes")
+    // Let the cancelled watcher observe the cleared pending state and exit.
+    state.activeMap = {}
+    releaseWaits()
+    await tick()
+  }
+
+  // Cancel: drops the pending auto-reload without disposing.
+  {
+    const { api, state, releaseWaits } = fakeReloadApi({ active: { ses_a: { type: "running" } }, waitControl: true })
+    await reload.requestReload(api)
+    await tick()
+    reload.cancelPendingReload()
+    state.activeMap = {}
+    releaseWaits()
+    await tick()
+    assert(state.disposed === 0, "cancelled watcher never disposes")
+  }
+
+  // Running session details for confirmation dialogs.
+  {
+    const { api } = fakeReloadApi({
+      active: { ses_a: { type: "running" } },
+      sessions: { ses_a: { id: "ses_a", title: "Refactor sprint", agent: "build", directory: "C:\\repo\\app", parentID: "ses_parent", model: { providerID: "zai-coding-plan", id: "glm-5.3" } } },
+    })
+    const running = await reload.fetchRunningSessions(api)
+    assert(running?.length === 1, "one running session detailed")
+    const session = running[0]
+    assert(session.title === "Refactor sprint" && session.agent === "build", "title and agent surfaced")
+    assert(session.model === "zai-coding-plan/glm-5.3", "model formatted provider/id")
+    assert(session.parentID === "ses_parent", "parentID marks child sessions")
+  }
+
+  reload.__testReset()
+  reload.__testSetTimings({ studioHoldPoll: 5000, failureRetry: 10000 })
+}
+
+await testDeferredReload()
 
 function testVariantAliases() {
   const cfg = () => ({

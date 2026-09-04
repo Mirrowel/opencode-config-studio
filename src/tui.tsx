@@ -47,6 +47,7 @@ import { providerCacheKey, getCachedProviders, setCachedProviders, providerCache
 import { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } from "./migration.js"
 import { DEFAULT_HIDDEN_SECTIONS, loadSettings, moduleOption, saveSettings, setModuleOption, settingsPath, PINNABLE_SCREENS, screenTitle, type StudioSettings } from "./settings.js"
 import { avOrigin, refreshAvSource } from "./av-source.js"
+import { beginStudioFlow, cancelPendingReload, endStudioFlow, fetchActiveSessions, fetchRunningSessions, pendingReload, reloadNow, requestReload, __testSetPending as setReloadPendingForTest, type RunningSession } from "./reload.js"
 import { enabledModules, moduleUsesOwnMenu, getModules, type ModuleContext } from "./modules.js"
 import { agentVariantsModuleId, agentVariantsHiddenAliases, resetAgentVariantsLens, setModuleAlertImplementation, setModulePickImplementation } from "./modules/agent-variants.js"
 import { findStandaloneAgentVariants, removeStandaloneHits } from "./standalone.js"
@@ -1906,16 +1907,9 @@ async function refreshStudio(api: TuiPluginApi, previous?: StudioState): Promise
 }
 
 async function reloadOpenCode(api: TuiPluginApi): Promise<boolean> {
-  const client = api.client as unknown as { global?: { dispose?: () => Promise<unknown> } }
-  try {
-    if (typeof client.global?.dispose === "function") {
-      await client.global.dispose()
-      return true
-    }
-  } catch {
-    // fall through
-  }
-  return false
+  // Superseded by the deferred reload coordinator (src/reload.ts); kept as a
+  // thin alias for any external callers.
+  return reloadNow(api)
 }
 
 function fileByID(state: StudioState, id: string): ConfigFileEntry | undefined {
@@ -2306,6 +2300,15 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
     })
   }
   opts.push({ title: "─".repeat(60), value: "__qa_divider__", description: "", divider: true })
+  const pendingReloadState = pendingReload()
+  if (pendingReloadState) {
+    opts.push({
+      title: `● Config reload pending - ${pendingReloadState.active} session(s) running`,
+      value: "__reload_pending__",
+      description: "saved config applies when sessions finish",
+      help: "A config save deferred its reload because session(s) are still running. It applies automatically once they finish; you can also force it now (with a warning) or cancel the auto-reload.",
+    })
+  }
   opts.push(
     {
       title: "Settings",
@@ -2402,6 +2405,8 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
     return mainMenu(api, state)
   }
   switch (action) {
+    case "__reload_pending__":
+      return reloadPendingMenu(api, state)
     case "browse":
       return providerBrowser(api, state)
     case "settings":
@@ -2889,6 +2894,60 @@ async function stagedChangeDetail(api: TuiPluginApi, state: StudioState, change:
   return reviewChangesScreen(api, state)
 }
 
+function describeRunningSessions(running: RunningSession[]): string[] {
+  const lines = running.slice(0, 8).map((session) => {
+    const label = session.title?.trim() || session.agent || session.id
+    const parts = [session.parentID ? `${label} [child session]` : label]
+    if (session.agent) parts.push(session.agent)
+    if (session.model) parts.push(session.model)
+    if (session.directory) parts.push(session.directory.split(/[\\/]/).filter(Boolean).slice(-1)[0] ?? session.directory)
+    return `  • ${parts.join(" - ")}`
+  })
+  if (running.length > 8) lines.push(`  … and ${running.length - 8} more`)
+  return lines
+}
+
+/** Force-reload confirmation: shows what is still running, then reloads on confirm. */
+async function confirmForceReload(api: TuiPluginApi): Promise<boolean> {
+  const running = await fetchRunningSessions(api)
+  const message = [
+    running === undefined
+      ? "Could not verify running sessions."
+      : running.length === 0
+        ? "No running sessions detected - reloading is safe."
+        : [`These session(s) are still running:`, ...describeRunningSessions(running), "", "Reloading interrupts their in-progress work."].join("\n"),
+    "",
+    "Reload OpenCode config now?",
+  ].join("\n")
+  return showConfirm(api.ui, { title: "Reload config now?", message, confirmLabel: "Reload now" })
+}
+
+/** Main-menu entry for a deferred reload: force (with warning) or cancel the auto-reload. */
+async function reloadPendingMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
+  const active = await fetchActiveSessions(api)
+  const count = active?.length ?? pendingReload()?.active ?? 0
+  const picked = await showMenu(api, {
+    title: "Config reload pending",
+    options: [
+      { title: `Reload NOW - interrupts ${count} running session(s)`, value: "force", description: "red button - stops in-progress work", danger: true, help: "Forces the deferred config reload immediately. Running sessions are interrupted." },
+      { title: "Cancel auto-reload", value: "cancel", description: "keep the saved config on disk, never apply it automatically", help: "Drops the pending reload. The saved files stay on disk but are NOT applied until the next manual reload or OpenCode restart." },
+      { title: "< Back", value: "__back__", description: "keep waiting" },
+    ],
+  })
+  if (picked === "force") {
+    if (await confirmForceReload(api)) {
+      const ok = await reloadNow(api)
+      api.ui.toast({ variant: ok ? "success" : "warning", title: ok ? "Config reloaded" : "Reload failed", message: ok ? "OpenCode config disposed and rebuilt." : "global.dispose unavailable - restart OpenCode to apply." })
+    }
+    return mainMenu(api, state)
+  }
+  if (picked === "cancel") {
+    cancelPendingReload()
+    api.ui.toast({ variant: "info", title: "Auto-reload cancelled", message: "Saved config stays on disk until the next reload or restart." })
+  }
+  return mainMenu(api, state)
+}
+
 async function saveAndExit(api: TuiPluginApi, state: StudioState): Promise<void> {
   const moduleSummaries = modulePendingSummaries(moduleContext(api, state))
   const total = state.pending.length + moduleSummaries.length
@@ -2928,7 +2987,13 @@ async function saveAndExit(api: TuiPluginApi, state: StudioState): Promise<void>
   }
   configRestartReasons.length = 0
   const uniqueReasons = [...new Set(restartReasons)]
-  api.ui.toast({ variant: uniqueReasons.length > 0 ? "warning" : "success", title: "Config saved", message: uniqueReasons.length > 0 ? "Restart OpenCode to apply task-list/UI changes." : "All changes written." })
+  const activeNow = await fetchActiveSessions(api)
+  const deferred = activeNow === undefined || activeNow.length > 0
+  const deferredCount = activeNow?.length ?? 0
+  const reloadLine = deferred
+    ? `Config reload DEFERRED - ${activeNow === undefined ? "could not verify" : `${deferredCount} session(s) running`}. It applies automatically once they finish, or reload now below.`
+    : "OpenCode config reloads now; running sessions keep their previous settings."
+  api.ui.toast({ variant: uniqueReasons.length > 0 ? "warning" : "success", title: "Config saved", message: uniqueReasons.length > 0 ? "Restart OpenCode to apply task-list/UI changes." : deferred ? "Reload deferred until sessions finish." : "All changes written." })
   // Summary dialog BEFORE the config reload: dispose reloads plugins and
   // would tear this dialog down mid-display otherwise.
   if (uniqueReasons.length > 0) {
@@ -2943,7 +3008,7 @@ async function saveAndExit(api: TuiPluginApi, state: StudioState): Promise<void>
             "RESTART REQUIRED for these changes:",
             ...uniqueReasons.map((reason) => `  - ${reason}`),
             "",
-            "OpenCode config reloads now; running sessions keep their previous settings.",
+            reloadLine,
           ],
         },
       ],
@@ -2954,12 +3019,26 @@ async function saveAndExit(api: TuiPluginApi, state: StudioState): Promise<void>
       message: [
         `Wrote staged changes to ${result.saved} file(s) plus ${moduleSummaries.length} module change(s).`,
         "",
-        "OpenCode config reloads now; running sessions keep their previous settings.",
+        reloadLine,
         "Restart OpenCode if anything looks stale.",
       ].join("\n"),
     })
   }
-  await reloadOpenCode(api)
+  const reloadResult = await requestReload(api)
+  if (reloadResult.kind === "deferred") {
+    // Red shortcut right after the save: force the reload before the studio closes.
+    const picked = await showMenu(api, {
+      title: "Reload deferred",
+      options: [
+        { title: `Reload NOW - interrupts ${reloadResult.detectionFailed ? "unknown" : reloadResult.active} running session(s)`, value: "force", description: "apply the saved config immediately", danger: true, help: "Applies the saved config now. Running sessions are interrupted - a confirmation with session details follows." },
+        { title: "Keep waiting", value: "wait", description: "auto-reloads when all sessions finish" },
+      ],
+    })
+    if (picked === "force" && (await confirmForceReload(api))) {
+      const ok = await reloadNow(api)
+      api.ui.toast({ variant: ok ? "success" : "warning", title: ok ? "Config reloaded" : "Reload failed", message: ok ? "OpenCode config disposed and rebuilt." : "global.dispose unavailable - restart OpenCode to apply." })
+    }
+  }
 }
 
 function overviewText(): string {
@@ -4285,8 +4364,12 @@ async function backupsScreen(api: TuiPluginApi, state: StudioState): Promise<voi
     if (!confirmed) return backupsScreen(api, state)
     try {
       writeTextAtomic(entry.target, content)
-      await reloadOpenCode(api)
-      api.ui.toast({ variant: "info", title: "Restored", message: entry.target })
+      const reloadResult = await requestReload(api)
+      if (reloadResult.kind === "deferred") {
+        api.ui.toast({ variant: "warning", title: "Restored", message: `${entry.target} - reload deferred (${reloadResult.detectionFailed ? "unverified" : `${reloadResult.active} session(s) running`}); applies when they finish.` })
+      } else {
+        api.ui.toast({ variant: "info", title: "Restored", message: entry.target })
+      }
       await refreshedState(api, state)
     } catch (error) {
       await showAlert(api.ui, { title: "Restore failed", message: error instanceof Error ? error.message : String(error) })
@@ -4409,6 +4492,12 @@ async function uiScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
       description: "Width + height with live preview",
       help: "AV-style size picker: cycle width (medium/large/xlarge), slide the height with presets (compact/normal/tall/max) or 1% steps, watch a live mini preview of the resulting dialog box.",
     },
+    {
+      title: pendingReload() ? "Reload config now (reload pending)" : "Reload config now",
+      value: "reload-now",
+      description: "dispose + rebuild OpenCode config",
+      help: "Applies saved config immediately. If sessions are still running, a warning lists them before the reload interrupts their work.",
+    },
   ]
   for (const module of enabledModuleList()) {
     const entries = module.advancedEntries?.(moduleContext(api, state)) ?? []
@@ -4427,6 +4516,13 @@ async function uiScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
   if (!picked || picked === "__back__") return mainMenu(api, state)
   if (picked === "size-picker") {
     await showSizeSlider(api)
+    return uiScreen(api, state)
+  }
+  if (picked === "reload-now") {
+    if (await confirmForceReload(api)) {
+      const ok = await reloadNow(api)
+      api.ui.toast({ variant: ok ? "success" : "warning", title: ok ? "Config reloaded" : "Reload failed", message: ok ? "OpenCode config disposed and rebuilt." : "global.dispose unavailable - restart OpenCode to apply." })
+    }
     return uiScreen(api, state)
   }
   if (picked.startsWith("module-advanced:")) {
@@ -4533,32 +4629,42 @@ const tui: TuiPlugin = async (api) => {
   ;(startupCheckTimer as { unref?: () => void }).unref?.()
 
   const unregister = registerStudioCommand(api, async () => {
-    studioSettings = loadSettings(studioDataDir(api))
-    duplicateCheckDone = false
-    let state: StudioState | undefined
-    // Deferred busy indicator: warm caches skip the dialog entirely; only a
-    // genuinely slow load (cold start) flashes it after 150ms. The busy
-    // dialog MUST finish its teardown (dialog.clear) before the first menu
-    // opens - otherwise its clear() wipes the menu that replaced it.
-    let settled = false
-    const loading = refreshStudio(api).then((result) => {
-      settled = true
-      return result
-    })
-    let busyDone: Promise<void> | undefined
-    const busyTimer = setTimeout(() => {
-      if (!settled) busyDone = showBusy(api, "Loading config layers...", loading.then(() => undefined))
-    }, 150)
-    ;(busyTimer as { unref?: () => void }).unref?.()
+    // The deferred-reload watcher must not fire global.dispose while the
+    // studio is open (dispose reloads plugins and tears these dialogs down).
+    beginStudioFlow()
     try {
-      state = await loading
+      studioSettings = loadSettings(studioDataDir(api))
+      duplicateCheckDone = false
+      let state: StudioState | undefined
+      // Deferred busy indicator: warm caches skip the dialog entirely; only a
+      // genuinely slow load (cold start) flashes it after 150ms. The busy
+      // dialog MUST finish its teardown (dialog.clear) before the first menu
+      // opens - otherwise its clear() wipes the menu that replaced it.
+      let settled = false
+      const loading = refreshStudio(api).then((result) => {
+        settled = true
+        return result
+      })
+      let busyDone: Promise<void> | undefined
+      const busyTimer = setTimeout(() => {
+        if (!settled) busyDone = showBusy(api, "Loading config layers...", loading.then(() => undefined))
+      }, 150)
+      ;(busyTimer as { unref?: () => void }).unref?.()
+      try {
+        state = await loading
+      } finally {
+        clearTimeout(busyTimer)
+      }
+      if (busyDone) await busyDone
+      if (!state) return
+      await refreshAgentVariantsSource(api, state)
+      await mainMenu(api, state)
     } finally {
-      clearTimeout(busyTimer)
+      // Releasing the guard lets a pending deferred reload resume its watch;
+      // if everything went idle while the studio was open, it applies then
+      // (dialogs are closed at this point).
+      endStudioFlow()
     }
-    if (busyDone) await busyDone
-    if (!state) return
-    await refreshAgentVariantsSource(api, state)
-    await mainMenu(api, state)
   })
 
   api.lifecycle.onDispose(() => {
@@ -4582,6 +4688,10 @@ export const __testInternals = {
   },
   resetDuplicateCheck: () => {
     duplicateCheckDone = false
+  },
+  /** Test seam: injects deferred-reload pending state (the bundled reload copy). */
+  setReloadPendingForTest: (state: { since: number; active: number } | undefined) => {
+    setReloadPendingForTest(state)
   },
   /** Skips the startup duplicate dialog (tests: the walker must not answer it). */
   suppressDuplicateDialog: () => {

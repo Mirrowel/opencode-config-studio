@@ -221,6 +221,9 @@ async function runLayout(label, ownMenu) {
     })
     T.resetDuplicateCheck()
     T.suppressDuplicateDialog()
+    // Render the deferred-reload pending row so the walker exercises the
+    // Reload-now / Cancel auto-reload flow (the bundled reload copy).
+    T.setReloadPendingForTest({ since: Date.now(), active: 2 })
     const state = await T.refreshStudio(api)
     runs = 0
     await walk(api, state, [])
