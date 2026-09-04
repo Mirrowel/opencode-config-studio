@@ -56,8 +56,14 @@ export interface EditorKit {
   /** Host hooks with a return continuation (settings group re-entry). */
   openPluginsFrom?: (returnTo: () => Promise<void>) => Promise<void>
   openAgentsFrom?: (returnTo: () => Promise<void>) => Promise<void>
-  /** Live tool inventory (built-in + per MCP server), cached with TTL. */
+  /** Live tool inventory (built-in + plugin tools), cached with TTL. */
   tools?: () => Promise<import("./toollist.js").ToolBundle>
+  /** MCP probe results snapshot (runtime tool ids per server). */
+  mcpProbes?: () => Record<string, import("./mcpprobe.js").McpProbeResult>
+  /** Probe one MCP server (lazy fetch / manual re-fetch; force bypasses cache). */
+  mcpProbe?: (name: string, force?: boolean) => Promise<import("./mcpprobe.js").McpProbeResult | undefined>
+  /** Kick the enabled-servers auto-probe (fire-and-forget). */
+  mcpAutoProbe?: () => void
 }
 
 function preview(value: unknown, max = 46): string {
@@ -856,14 +862,17 @@ async function patternRuleEditor(kit: EditorKit, pointer: JSONPath, tool: string
 // ---------------------------------------------------------------------------
 
 export async function mcpScreen(kit: EditorKit): Promise<void> {
+  kit.mcpAutoProbe?.()
   while (true) {
     const mcp = kit.valueAt(["mcp"])
     const map = isPlainObject(mcp) ? mcp : {}
     const bundle = kit.tools ? await kit.tools() : undefined
+    const probes = kit.mcpProbes?.() ?? {}
     const options: WizardSelectOption<string>[] = []
     const names = new Set<string>(Object.keys(map))
     for (const id of bundle?.serverIds ?? []) names.add(id)
     const sorted = [...names].sort((a, b) => a.localeCompare(b))
+    let pendingProbes = 0
     for (const name of sorted) {
       const entry = map[name]
       const object = isPlainObject(entry) ? entry : {}
@@ -875,7 +884,19 @@ export async function mcpScreen(kit: EditorKit): Promise<void> {
         : type === "remote"
           ? typeof object["url"] === "string" ? `url: ${object["url"]}` : "url: (unset)"
           : Object.keys(object).length > 0 ? `keys: ${Object.keys(object).join(", ")}` : "empty"
-      const toolCount = bundle?.tools.filter((tool) => tool.id.startsWith(mcpToolPrefix(name))).length ?? 0
+      const probe = probes[name]
+      const probeable = type === "local" || type === "remote"
+      // Counts come from the direct probe: cached number, "unknown" on
+      // failure, "-" while unprobed (disabled servers probe on open).
+      const toolLabel = !probeable
+        ? "-"
+        : probe === undefined
+          ? (pendingProbes++, "-")
+          : probe.status === "ok"
+            ? String(probe.tools.length)
+            : probe.status === "auth"
+              ? "auth"
+              : "unknown"
       const status = mcpStatusLabel(bundle?.statuses?.[name])
       const statusNote = bundle?.statuses === undefined ? "" : ` - ${status.label}`
       const statusHelp = [
@@ -883,10 +904,17 @@ export async function mcpScreen(kit: EditorKit): Promise<void> {
         ...(status.error ? ["", `Error: ${status.error}`] : []),
         ...(status.kind === "auth" ? ["", `Authenticate with: opencode mcp auth ${name}`] : []),
       ]
+      const probeHelp = probe === undefined
+        ? ["", "Tool list: not probed yet (disabled servers probe when opened; use Fetch all tool lists to probe everything)."]
+        : probe.status === "ok"
+          ? ["", `Tool list: ${probe.tools.length} tool(s) probed directly from the server${probe.serverName ? ` (${probe.serverName}${probe.serverVersion ? ` ${probe.serverVersion}` : ""})` : ""}.`]
+          : probe.status === "auth"
+            ? ["", "Tool list: server requires authentication - cannot probe from the studio.", ...(probe.hint ? [`WWW-Authenticate: ${probe.hint}`] : [])]
+            : ["", `Tool list probe failed: ${probe.error}`]
       options.push({
         title: name,
         value: `server:${name}`,
-        description: `[${type}] ${enabled} - ${toolCount} tool(s)${statusNote} (${kit.sourceLabel(["mcp", name])})`,
+        description: `[${type}] ${enabled} - ${toolLabel} tool(s)${statusNote} (${kit.sourceLabel(["mcp", name])})`,
         edited: true,
         danger: status.kind === "failed",
         help: [
@@ -894,20 +922,32 @@ export async function mcpScreen(kit: EditorKit): Promise<void> {
           typeHelp,
           "",
           detail,
-          `Tools registered: ${toolCount}${bundle?.mode === "none" ? " (live tool list unavailable)" : ""}`,
+          `Tools registered: ${toolLabel}${probe?.status === "ok" ? "" : " (direct protocol probe)"}`,
           ...statusHelp,
+          ...probeHelp,
           `Source: ${kit.sourceLabel(["mcp", name])}`,
           "",
           "Restart-required: MCP servers connect at OpenCode startup; changes apply after a config reload or restart.",
         ].join("\n"),
       })
     }
+    options.push({ title: "Fetch all tool lists", value: "__fetch_all__", description: "probe every server directly (incl. disabled)" })
     options.push({ title: "+ Add local server", value: "add-local", description: "stdio command" })
     options.push({ title: "+ Add remote server", value: "add-remote", description: "HTTP endpoint" })
-    options.push({ title: "< Back", value: "__back__", description: sorted.length === 0 ? "(no servers configured)" : "" })
+    options.push({ title: "< Back", value: "__back__", description: sorted.length === 0 ? "(no servers configured)" : pendingProbes > 0 ? `(${pendingProbes} server(s) not probed yet)` : "" })
 
     const picked = await kit.showMenu({ title: "MCP servers", options })
     if (!picked || picked === "__back__") return
+
+    if (picked === "__fetch_all__") {
+      const entries = sorted
+        .map((name) => ({ name, entry: map[name] }))
+        .filter((item) => isPlainObject(item.entry) && (item.entry["type"] === "local" || item.entry["type"] === "remote"))
+      for (const item of entries) {
+        await kit.mcpProbe?.(item.name, true)
+      }
+      continue
+    }
 
     if (picked === "add-local" || picked === "add-remote") {
       const name = await kit.showPrompt({ title: "Server name", placeholder: "e.g. github" })
@@ -932,31 +972,57 @@ export async function mcpScreen(kit: EditorKit): Promise<void> {
   }
 }
 
-/** Prefix every tool of this server carries (OpenCode: sanitize(name) + "_"). */
-function mcpToolPrefix(name: string): string {
-  return `${name.replace(/[^a-zA-Z0-9_-]/g, "_")}_`
-}
-
 /** Tools of one MCP server: view parameters, allow/deny via root permission rules. */
-async function mcpServerToolsScreen(kit: EditorKit, name: string): Promise<void> {
+async function mcpServerToolsScreen(kit: EditorKit, name: string, probe: import("./mcpprobe.js").McpProbeResult): Promise<void> {
   while (true) {
-    const bundle = kit.tools ? await kit.tools() : undefined
-    const tools = (bundle?.tools ?? []).filter((tool) => tool.id.startsWith(mcpToolPrefix(name)))
     const permission = kit.valueAt(["permission"])
     const map = isPlainObject(permission) ? permission : {}
-    const options: WizardSelectOption<string>[] = tools.map((tool) => toolPermissionRow(map, tool))
-    if (tools.length === 0) {
-      options.push({ title: "(no tools registered)", value: "__none__", description: "server not connected or exposes none", help: "Connect the server (`opencode mcp`) and reload config; tools appear here once the server registers them." })
+    const options: WizardSelectOption<string>[] = []
+    if (probe.status === "ok") {
+      for (const tool of probe.tools) {
+        options.push(toolPermissionRow(map, { id: tool.runtimeId, description: tool.description, parameters: tool.inputSchema }))
+      }
+    } else if (probe.status === "auth") {
+      options.push({
+        title: "(authentication required)",
+        value: "__none__",
+        description: "cannot probe this server from the studio",
+        help: ["This server requires authentication (OAuth) - the studio cannot list its tools.", "Authenticate with: opencode mcp auth " + name].join("\n"),
+      })
+    } else {
+      options.push({
+        title: "(probe failed)",
+        value: "__none__",
+        description: probe.error.slice(0, 50),
+        help: ["Direct protocol probe failed:", "", probe.error].join("\n"),
+      })
     }
+    if (options.length === 0) {
+      options.push({ title: "(no tools registered)", value: "__none__", description: "server exposes none", help: "The server responded but reports no tools." })
+    }
+    options.push({ title: "Re-fetch tool list", value: "__refetch__", description: "probe the server again now" })
     options.push({ title: "< Back", value: "__back__", description: "" })
 
-    const picked = await kit.showMenu({ title: `MCP ${name} - tools (${tools.length})`, options })
+    const count = probe.status === "ok" ? probe.tools.length : 0
+    const picked = await kit.showMenu({ title: `MCP ${name} - tools (${count})`, options })
     if (!picked || picked === "__back__" || picked === "__none__") return
+    if (picked === "__refetch__") {
+      const fresh = await kit.mcpProbe?.(name, true)
+      if (fresh) probe = fresh
+      continue
+    }
     if (picked.startsWith("tool:")) {
       await toolRuleEditor(kit, ["permission"], picked.slice(5), "Permission (root)")
       continue
     }
   }
+}
+
+/** Ensures a probe result exists for a server, fetching it (even disabled) on first open. */
+async function ensureProbe(kit: EditorKit, name: string): Promise<import("./mcpprobe.js").McpProbeResult | undefined> {
+  const cached = kit.mcpProbes?.()[name]
+  if (cached) return cached
+  return await kit.mcpProbe?.(name)
 }
 
 async function mcpEntryScreen(kit: EditorKit, name: string): Promise<void> {
@@ -993,7 +1059,10 @@ async function mcpEntryScreen(kit: EditorKit, name: string): Promise<void> {
 
     const fields = type === "local" ? MCP_LOCAL_FIELDS : MCP_REMOTE_FIELDS
     const bundle = kit.tools ? await kit.tools() : undefined
-    const serverTools = (bundle?.tools ?? []).filter((tool) => tool.id.startsWith(mcpToolPrefix(name)))
+    // Lazy probe: disabled servers fetch their tool list on first open.
+    const probe = await ensureProbe(kit, name)
+    const toolCount = probe?.status === "ok" ? probe.tools.length : undefined
+    const toolCountLabel = toolCount === undefined ? "-" : String(toolCount)
     const status = mcpStatusLabel(bundle?.statuses?.[name])
     const options: WizardSelectOption<string>[] = [
       { title: object["enabled"] === false ? "Enable server" : "Disable server", value: "__toggle__", description: "disabled servers never connect", danger: object["enabled"] !== false },
@@ -1012,13 +1081,14 @@ async function mcpEntryScreen(kit: EditorKit, name: string): Promise<void> {
         ].join("\n"),
       },
       {
-        title: `Tools (${serverTools.length})`,
+        title: `Tools (${toolCountLabel})`,
         value: "__tools__",
-        description: serverTools.length === 0 ? "(none registered - connected?)" : "view parameters - allow/deny individually",
+        description: toolCount === undefined ? "(not probed / probe failed)" : toolCount === 0 ? "(none registered)" : "model-visible ids - allow/deny individually",
         help: [
-          `Tools registered by MCP server "${name}" (${serverTools.length}).`,
+          `Tools registered by MCP server "${name}"${toolCount === undefined ? " (probe pending or failed - open to fetch)" : ` (${toolCount}).`}`,
+          "Tool names shown are the exact runtime ids the model sees (server-prefixed).",
           "Each tool can be allowed or denied through root permission rules; denying hides it from every agent.",
-          bundle?.mode === "ids" ? "Tool details (descriptions/parameters) are unavailable in this OpenCode version." : "Press [i] on a tool for its full parameter schema.",
+          "The list comes from a direct protocol probe of the server (cached 60 min; re-fetch inside).",
         ].join("\n"),
       },
     ]
@@ -1053,7 +1123,8 @@ async function mcpEntryScreen(kit: EditorKit, name: string): Promise<void> {
       continue
     }
     if (picked === "__tools__") {
-      await mcpServerToolsScreen(kit, name)
+      if (probe) await mcpServerToolsScreen(kit, name, probe)
+      else await kit.showInfo({ title: `MCP ${name} - tools`, message: "The tool list could not be fetched (no probe result). Use Fetch all tool lists in the MCP overview, or open this server again." })
       continue
     }
     if (picked === "__toggle__") {

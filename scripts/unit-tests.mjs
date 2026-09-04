@@ -936,13 +936,26 @@ async function testToolGrouping() {
     { id: "deep_search_search", description: "" },
     { id: "deep_search_search_deep", description: "" },
   ]
+  // Registry grouping: builtin + plugins only; MCP-prefixed ids are EXCLUDED
+  // (probe groups own MCP data in this OpenCode generation).
   const groups = groupToolsBySource(tools, ["context7", "deep_search"])
-  assert(groups.length === 3, "three groups (builtin + two servers)")
-  assert(groups[0].source === "builtin" && groups[0].tools.length === 2, "unmatched tools land in built-in")
-  const bySource = Object.fromEntries(groups.map((group) => [group.source, group]))
-  assert(bySource["context7"].tools.map((tool) => tool.id).join(",") === "context7_get_docs,context7_resolve_library_id", "server tools grouped and sorted")
-  // Longest-prefix: deep_search_search_deep belongs to deep_search (server prefix wins over shorter).
-  assert(bySource["deep_search"].tools.length === 2, "underscore tool names attribute to the longest matching server")
+  assert(groups.length === 1, "registry grouping = builtin only (MCP ids excluded)")
+  assert(groups[0].source === "builtin" && groups[0].tools.length === 2, "known builtins grouped, MCP ids dropped")
+
+  // Probe groups append per server with runtime ids.
+  const { appendProbeGroups } = toollist
+  const probes = {
+    "deep_search": { status: "ok", at: 0, tools: [
+      { name: "search", runtimeId: "deep_search_search", description: "a" },
+      { name: "search_deep", runtimeId: "deep_search_search_deep", description: "b" },
+    ] },
+    failed_srv: { status: "failed", at: 0, error: "boom" },
+  }
+  const merged = appendProbeGroups(groups, probes)
+  assert(merged.length === 2, "one group per ok-probed server (failed servers add none)")
+  assert(merged[1].source === "mcp:deep_search" && merged[1].tools.length === 2, "probe tools carry runtime ids")
+  assert(merged[1].tools[0].id === "deep_search_search", "runtime id used as the group tool id")
+
   // Empty servers: MCP-named tools cannot be attributed -> plugin group.
   {
     const noServers = groupToolsBySource(tools, [])
@@ -955,8 +968,21 @@ async function testToolGrouping() {
   // also land there - their server is not in the passed list).
   const withPlugins = groupToolsBySource([...tools, { id: "magic_compact", description: "" }, { id: "souk_install", description: "" }], ["context7"])
   const pluginGroup = withPlugins.find((group) => group.source === "plugins")
-  assert(pluginGroup?.tools.length === 4, "plugin-registered tools get their own group")
+  assert(pluginGroup?.tools.length === 4, "plugin-registered tools get their own group (context7 ids excluded, deep_search ids unattributed)")
   assert(withPlugins.find((group) => group.source === "builtin")?.tools.length === 2, "known builtin ids stay in the builtin group")
+
+  // mcpprobe helpers: runtime id derivation, env expansion, fingerprint.
+  const mcpprobe = await import(new URL(`file://${path.join(root, "dist", "mcpprobe.js").replaceAll("\\", "/").replaceAll(" ", "%20")}`).href)
+  assert(mcpprobe.mcpRuntimeToolId("tavily", "tavily_search") === "tavily_tavily_search", "runtime id = server + tool")
+  assert(mcpprobe.mcpRuntimeToolId("my.server/x", "a b") === "my_server_x_a_b", "sanitization applied to both parts")
+  assert(mcpprobe.__testMcpProbeInternals.expandEnvValue("Bearer ${HOME}!", { HOME: "h" }) === "Bearer h!", "${VAR} expanded")
+  process.env.__PROBE_UNIT_TEST = "vv"
+  const env = mcpprobe.__testMcpProbeInternals.localServerEnv({ environment: { A: "x-${__PROBE_UNIT_TEST}", B: 2 } })
+  assert(env.A === "x-vv" && env.B === "2", "environment expansion with process.env fallback")
+  const fp = mcpprobe.__testMcpProbeInternals.configFingerprint
+  assert(fp({ type: "local", command: ["a"] }) === fp({ type: "local", command: ["a"], somethingElse: true }), "fingerprint ignores probe-irrelevant keys")
+  assert(fp({ type: "local", command: ["a"] }) !== fp({ type: "local", command: ["b"] }), "fingerprint changes with config")
+  assert(fp({ type: "remote", url: "u" }) !== fp({ type: "remote", url: "u", headers: { Authorization: "x" } }), "headers change invalidates")
 
   // Parameter schema rendering.
   const lines = describeToolParameters({ type: "object", description: "Query docs", required: ["library"], properties: { library: { type: "string", description: "Library name" }, depth: { type: "number", enum: [1, 2] } } })

@@ -77,9 +77,10 @@ export const KNOWN_BUILTIN_TOOLS: ReadonlySet<string> = new Set([
 ])
 
 /**
- * Groups tools by source: unmatched ids split into built-ins (known set) and
- * plugin-registered tools; MCP tools land in a group per server (longest
- * server-prefix match wins - server names may contain underscores).
+ * Groups registry tools: unmatched ids split into built-ins (known set) and
+ * plugin-registered tools. `serverIds` prefix-matching only EXCLUDES
+ * MCP-prefixed ids from the plugins group (their groups come from the direct
+ * probe, which owns MCP data in this generation).
  */
 export function groupToolsBySource(tools: StudioTool[], serverIds: string[]): ToolGroup[] {
   const prefixes = serverIds
@@ -87,26 +88,30 @@ export function groupToolsBySource(tools: StudioTool[], serverIds: string[]): To
     .sort((a, b) => b.prefix.length - a.prefix.length)
   const builtin: StudioTool[] = []
   const plugins: StudioTool[] = []
-  const perServer = new Map<string, StudioTool[]>()
-  for (const id of serverIds) perServer.set(id, [])
   for (const tool of tools) {
-    const hit = prefixes.find((entry) => tool.id.startsWith(entry.prefix))
-    if (hit) {
-      perServer.get(hit.id)?.push(tool)
-      continue
-    }
+    if (prefixes.some((entry) => tool.id.startsWith(entry.prefix))) continue
     if (KNOWN_BUILTIN_TOOLS.has(tool.id)) builtin.push(tool)
     else plugins.push(tool)
   }
   const groups: ToolGroup[] = []
   if (builtin.length > 0) groups.push({ source: "builtin", title: "Built-in tools", tools: [...builtin].sort((a, b) => a.id.localeCompare(b.id)) })
   if (plugins.length > 0) groups.push({ source: "plugins", title: `Plugin tools (${plugins.length})`, tools: [...plugins].sort((a, b) => a.id.localeCompare(b.id)) })
-  for (const id of [...serverIds].sort((a, b) => a.localeCompare(b))) {
-    const list = perServer.get(id) ?? []
-    if (list.length === 0) continue
-    groups.push({ source: id, title: `MCP server: ${id}`, tools: [...list].sort((a, b) => a.id.localeCompare(b.id)) })
-  }
   return groups
+}
+
+/** Appends one group per successfully probed MCP server. */
+export function appendProbeGroups(groups: ToolGroup[], probes: Record<string, import("./mcpprobe.js").McpProbeResult>): ToolGroup[] {
+  const out = [...groups]
+  for (const name of Object.keys(probes).sort((a, b) => a.localeCompare(b))) {
+    const probe = probes[name]
+    if (probe?.status !== "ok" || probe.tools.length === 0) continue
+    out.push({
+      source: `mcp:${name}`,
+      title: `MCP server: ${name}`,
+      tools: probe.tools.map((tool) => ({ id: tool.runtimeId, description: tool.description, parameters: tool.inputSchema })),
+    })
+  }
+  return out
 }
 
 type McpStatusLike = { status?: unknown; error?: unknown }
@@ -186,7 +191,7 @@ function unwrapPayload(result: unknown): unknown {
  * OpenCode injects into plugins) takes FLAT `{provider, model}` query args;
  * the v1-era client took `{query: {...}}`. Both are attempted.
  */
-export async function fetchToolBundle(api: TuiPluginApi, modelRef: string | undefined): Promise<ToolBundle> {
+export async function fetchToolBundle(api: TuiPluginApi, modelRef: string | undefined, probes?: Record<string, import("./mcpprobe.js").McpProbeResult>): Promise<ToolBundle> {
   const tool = toolNamespace(api)
   if (!tool) return emptyToolBundle("Tool API unavailable in this OpenCode version")
   const status = await fetchMcpStatus(api)
@@ -211,7 +216,7 @@ export async function fetchToolBundle(api: TuiPluginApi, modelRef: string | unde
         if (typeof record.id !== "string") continue
         tools.push({ id: record.id, description: typeof record.description === "string" ? record.description : "", parameters: record.parameters })
       }
-      return { tools, groups: groupToolsBySource(tools, serverIds), mode: "live", serverIds, statuses: status }
+      return { tools, groups: appendProbeGroups(groupToolsBySource(tools, serverIds), probes ?? {}), mode: "live", serverIds, statuses: status }
     }
   }
 
@@ -221,7 +226,7 @@ export async function fetchToolBundle(api: TuiPluginApi, modelRef: string | unde
     const data = unwrapPayload(result)
     if (Array.isArray(data)) {
       const tools: StudioTool[] = data.filter((id): id is string => typeof id === "string").map((id) => ({ id, description: "" }))
-      return { tools, groups: groupToolsBySource(tools, serverIds), mode: "ids", serverIds, statuses: status, note: "Tool details unavailable in this OpenCode version (ids only)" }
+      return { tools, groups: appendProbeGroups(groupToolsBySource(tools, serverIds), probes ?? {}), mode: "ids", serverIds, statuses: status, note: "Tool details unavailable in this OpenCode version (ids only)" }
     }
   }
 
@@ -239,10 +244,13 @@ export function clearToolCache(): void {
   toolCache = undefined
 }
 
-export async function getToolBundle(api: TuiPluginApi, modelRef: string | undefined): Promise<ToolBundle> {
-  if (toolCache && Date.now() - toolCache.at < TOOL_CACHE_TTL) return toolCache.bundle
-  const bundle = await fetchToolBundle(api, modelRef)
-  toolCache = { at: Date.now(), bundle }
+export async function getToolBundle(api: TuiPluginApi, modelRef: string | undefined, probes?: Record<string, import("./mcpprobe.js").McpProbeResult>): Promise<ToolBundle> {
+  if (toolCache && Date.now() - toolCache.at < TOOL_CACHE_TTL) {
+    // Groups merge live probe data even on a registry cache hit.
+    return probes ? { ...toolCache.bundle, groups: appendProbeGroups(toolCache.bundle.groups.filter((group) => !group.source.startsWith("mcp:")), probes) } : toolCache.bundle
+  }
+  const bundle = await fetchToolBundle(api, modelRef, probes)
+  toolCache = { at: Date.now(), bundle: probes ? { ...bundle, groups: bundle.groups.filter((group) => !group.source.startsWith("mcp:")) } : bundle }
   return bundle
 }
 

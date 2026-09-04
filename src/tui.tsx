@@ -47,7 +47,8 @@ import { providerCacheKey, getCachedProviders, setCachedProviders, providerCache
 import { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } from "./migration.js"
 import { DEFAULT_HIDDEN_SECTIONS, loadSettings, moduleOption, saveSettings, setModuleOption, settingsPath, PINNABLE_SCREENS, screenTitle, type StudioSettings } from "./settings.js"
 import { avOrigin, refreshAvSource } from "./av-source.js"
-import { getToolBundle } from "./toollist.js"
+import { getToolBundle, fetchMcpStatus } from "./toollist.js"
+import { autoProbeEnabledServers, getMcpProbe, mcpProbeSnapshot } from "./mcpprobe.js"
 import { beginStudioFlow, cancelPendingReload, endStudioFlow, fetchActiveSessions, fetchRunningSessions, pendingReload, reloadNow, requestReload, __testSetPending as setReloadPendingForTest, type RunningSession } from "./reload.js"
 import { enabledModules, moduleUsesOwnMenu, getModules, type ModuleContext } from "./modules.js"
 import { agentVariantsModuleId, agentVariantsHiddenAliases, resetAgentVariantsLens, setModuleAlertImplementation, setModulePickImplementation, __testTouchDraft } from "./modules/agent-variants.js"
@@ -91,7 +92,20 @@ function makeEditorKit(api: TuiPluginApi, state: StudioState): EditorKit {
       return [...names].sort()
     },
     providerUniverse: () => providerUniverse(state.providers, state.modelsDev, state.merge).map((row) => ({ ...row })),
-    tools: () => getToolBundle(api, studioDefaultModelRef(state)),
+    tools: () => getToolBundle(api, studioDefaultModelRef(state), mcpProbeSnapshot()),
+    mcpProbes: () => mcpProbeSnapshot(),
+    mcpProbe: (name, force) => {
+      const entry = getAtPath(state.merge.merged, ["mcp", name])
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return Promise.resolve(undefined)
+      return getMcpProbe(api, name, entry as Record<string, unknown>, force ? { force: true } : undefined)
+    },
+    mcpAutoProbe: () => {
+      const mcpConfig = getAtPath(state.merge.merged, ["mcp"])
+      const map = mcpConfig && typeof mcpConfig === "object" && !Array.isArray(mcpConfig) ? (mcpConfig as Record<string, unknown>) : undefined
+      void fetchMcpStatus(api).then((statuses) =>
+        autoProbeEnabledServers(api, map, statuses).catch(() => undefined),
+      )
+    },
     openPlugins: () => pluginManagerScreen(api, state),
     openAgents: () => agentsScreen(api, state),
     openPluginsFrom: (returnTo) => pluginManagerScreen(api, state, returnTo),

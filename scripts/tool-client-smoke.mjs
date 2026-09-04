@@ -55,10 +55,14 @@ assert(bundle.mode === "live", "expected live mode with flat params")
 assert(seen.toolList.some((query) => query.provider === "zai-coding-plan" && query.model === "glm-5.3"), "flat params must reach the wire as query strings")
 assert(bundle.groups.some((g) => g.source === "builtin" && g.tools.length === 2), "builtin group holds known ids")
 assert(bundle.groups.some((g) => g.source === "plugins" && g.tools.length === 1), "plugin tools separate from builtins")
-assert(bundle.groups.some((g) => g.source === "context7" && g.tools.length === 1), "MCP tools group under their server")
+assert(!bundle.groups.some((g) => g.source === "context7"), "registry MCP-prefixed ids are excluded (probes own MCP groups)")
 assert(bundle.statuses?.broken?.error === "spawn failed", "failed server status carries its verbatim error")
 const described = toollist.describeToolParameters({ type: "object", properties: { command: { type: "string", description: "The command" } }, required: ["command"] })
 assert(described.some((line) => line.includes("command (string, required)")), "parameter schema renders")
+const merged = toollist.appendProbeGroups(bundle.groups, {
+  context7: { status: "ok", tools: [{ name: "resolve", runtimeId: "context7_resolve", description: "d", inputSchema: { type: "object" } }], at: Date.now() },
+})
+assert(merged.some((g) => g.source === "mcp:context7" && g.tools.length === 1), "probe group appends under mcp:<server>")
 console.log("tool-client smoke passed")
 
 await new Promise((resolve) => server.close(resolve))
