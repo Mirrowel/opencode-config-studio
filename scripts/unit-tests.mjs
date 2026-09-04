@@ -26,6 +26,7 @@ const palette = await import(dist("palette-category"))
 const keymeta = await import(dist("keymeta"))
 const { resolveStandaloneDirIn, avOrigin, avSourceKind } = await import(dist("av-source"))
 const reload = await import(dist("reload"))
+const toollist = await import(dist("toollist"))
 const { variantAliasesOf } = await import(dist("modules/agent-variants"))
 function assert(condition, message) {
   if (!condition) throw new Error(`assert failed: ${message}`)
@@ -921,6 +922,47 @@ async function testAvSource() {
 
 testKeyMeta()
 await testAvSource()
+
+async function testToolGrouping() {
+  const { groupToolsBySource, sanitizeMcpName, describeToolParameters, mcpStatusLabel, toolInfoText } = toollist
+  // sanitize mirrors OpenCode mcp/catalog.ts.
+  assert(sanitizeMcpName("my.server:2") === "my_server_2", "sanitize replaces non [a-zA-Z0-9_-] with _")
+
+  const tools = [
+    { id: "bash", description: "Run a command" },
+    { id: "read", description: "Read a file" },
+    { id: "context7_resolve_library_id", description: "" },
+    { id: "context7_get_docs", description: "" },
+    { id: "deep_search_search", description: "" },
+    { id: "deep_search_search_deep", description: "" },
+  ]
+  const groups = groupToolsBySource(tools, ["context7", "deep_search"])
+  assert(groups.length === 3, "three groups (builtin + two servers)")
+  assert(groups[0].source === "builtin" && groups[0].tools.length === 2, "unmatched tools land in built-in")
+  const bySource = Object.fromEntries(groups.map((group) => [group.source, group]))
+  assert(bySource["context7"].tools.map((tool) => tool.id).join(",") === "context7_get_docs,context7_resolve_library_id", "server tools grouped and sorted")
+  // Longest-prefix: deep_search_search_deep belongs to deep_search (server prefix wins over shorter).
+  assert(bySource["deep_search"].tools.length === 2, "underscore tool names attribute to the longest matching server")
+  // Empty servers produce no group.
+  assert(groupToolsBySource(tools, []).length === 1, "no servers -> single builtin group")
+
+  // Parameter schema rendering.
+  const lines = describeToolParameters({ type: "object", description: "Query docs", required: ["library"], properties: { library: { type: "string", description: "Library name" }, depth: { type: "number", enum: [1, 2] } } })
+  assert(lines.some((line) => line.includes("Query docs")), "schema description included")
+  assert(lines.some((line) => line.trim().startsWith("library (string, required)")), "required param flagged")
+  assert(lines.some((line) => line.trim().startsWith("depth (number, optional)")), "optional param flagged")
+  assert(lines.some((line) => line.includes("values: 1, 2")), "enum values rendered")
+
+  // Status labels carry verbatim errors.
+  const failed = mcpStatusLabel({ status: "failed", error: "spawn failed" })
+  assert(failed.label === "failed" && failed.error === "spawn failed" && failed.kind === "failed", "failed status keeps its error")
+  assert(mcpStatusLabel(undefined).label === "unknown", "missing status reads unknown")
+
+  const info = toolInfoText({ id: "context7_get_docs", description: "Fetch docs", parameters: { type: "object", properties: { q: { type: "string" } } } }, "deny")
+  assert(info.includes("Tool: context7_get_docs") && info.includes("Permission rule: deny") && info.includes("Raw schema:"), "tool [i] carries rule, description, parameters, raw schema")
+}
+
+await testToolGrouping()
 
 async function testDeferredReload() {
   const tick = (ms = 25) => new Promise((resolve) => setTimeout(resolve, ms))

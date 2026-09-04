@@ -47,6 +47,7 @@ import { providerCacheKey, getCachedProviders, setCachedProviders, providerCache
 import { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } from "./migration.js"
 import { DEFAULT_HIDDEN_SECTIONS, loadSettings, moduleOption, saveSettings, setModuleOption, settingsPath, PINNABLE_SCREENS, screenTitle, type StudioSettings } from "./settings.js"
 import { avOrigin, refreshAvSource } from "./av-source.js"
+import { getToolBundle } from "./toollist.js"
 import { beginStudioFlow, cancelPendingReload, endStudioFlow, fetchActiveSessions, fetchRunningSessions, pendingReload, reloadNow, requestReload, __testSetPending as setReloadPendingForTest, type RunningSession } from "./reload.js"
 import { enabledModules, moduleUsesOwnMenu, getModules, type ModuleContext } from "./modules.js"
 import { agentVariantsModuleId, agentVariantsHiddenAliases, resetAgentVariantsLens, setModuleAlertImplementation, setModulePickImplementation } from "./modules/agent-variants.js"
@@ -55,6 +56,17 @@ import { findStandaloneAgentVariants, removeStandaloneHits } from "./standalone.
 // ---------------------------------------------------------------------------
 // Editor kit: dialog primitives + staging for the value-editors module
 // ---------------------------------------------------------------------------
+
+/** Default provider/model ref used for Tool.list visibility (any valid pair works). */
+function studioDefaultModelRef(state: StudioState): string | undefined {
+  const configured = (state.merge.merged as { model?: unknown })["model"]
+  if (typeof configured === "string" && configured.includes("/")) return configured
+  for (const provider of state.providers) {
+    const first = Object.keys(provider.models ?? {})[0]
+    if (first) return `${provider.id}/${first}`
+  }
+  return undefined
+}
 
 function makeEditorKit(api: TuiPluginApi, state: StudioState): EditorKit {
   return {
@@ -79,6 +91,7 @@ function makeEditorKit(api: TuiPluginApi, state: StudioState): EditorKit {
       return [...names].sort()
     },
     providerUniverse: () => providerUniverse(state.providers, state.modelsDev, state.merge).map((row) => ({ ...row })),
+    tools: () => getToolBundle(api, studioDefaultModelRef(state)),
     openPlugins: () => pluginManagerScreen(api, state),
     openAgents: () => agentsScreen(api, state),
     openPluginsFrom: (returnTo) => pluginManagerScreen(api, state, returnTo),

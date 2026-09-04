@@ -28,6 +28,7 @@ import {
 } from "./keymeta.js"
 import type { EditOp, JSONPath } from "./jsonc.js"
 import type { StudioState, WizardSelectOption } from "./tui.js"
+import { toolInfoText, mcpStatusLabel } from "./toollist.js"
 
 export interface EditorKit {
   state: StudioState
@@ -55,6 +56,8 @@ export interface EditorKit {
   /** Host hooks with a return continuation (settings group re-entry). */
   openPluginsFrom?: (returnTo: () => Promise<void>) => Promise<void>
   openAgentsFrom?: (returnTo: () => Promise<void>) => Promise<void>
+  /** Live tool inventory (built-in + per MCP server), cached with TTL. */
+  tools?: () => Promise<import("./toollist.js").ToolBundle>
 }
 
 function preview(value: unknown, max = 46): string {
@@ -608,8 +611,6 @@ export async function permissionEditor(kit: EditorKit, props: { title: string; p
   while (true) {
     const current = kit.valueAt(props.pointer)
     const map = isPlainObject(current) ? current : {}
-    const knownKeys = new Set<string>(PERMISSION_TOOL_KEYS)
-    const toolKeys = [...new Set([...PERMISSION_TOOL_KEYS, ...Object.keys(map)])].filter((key) => key !== "*")
 
     const options: WizardSelectOption<string>[] = []
     if (typeof current === "string") {
@@ -617,15 +618,36 @@ export async function permissionEditor(kit: EditorKit, props: { title: string; p
     } else {
       options.push({ title: "Shorthand (all tools)", value: "__shorthand__", description: map["*"] !== undefined ? `* = ${preview(map["*"])}` : "(not set)" })
     }
-    for (const tool of toolKeys) {
-      const rule = map[tool]
-      options.push({
-        title: tool,
-        value: `tool:${tool}`,
-        description: rule === undefined ? "(default: ask)" : typeof rule === "string" ? rule : rule !== null && typeof rule === "object" ? Object.entries(rule).map(([pattern, action]) => `${pattern}=${action}`).join(", ").slice(0, 60) : "?",
-        help: isPlainOnlyPermissionKey(tool) ? "Plain action only (no pattern rules) for this tool." : "Action for the whole tool, or per-pattern rules. Last matching rule wins; * and ? wildcards supported.",
-        edited: rule !== undefined,
-      })
+
+    // Live inventory: every tool grouped by source (built-in + each MCP
+    // server individually). Falls back to the flat known-keys list when the
+    // tool API is unavailable.
+    const bundle = kit.tools ? await kit.tools() : undefined
+    const covered = new Set<string>()
+    if (bundle && bundle.groups.length > 0) {
+      for (const group of bundle.groups) {
+        options.push({ title: `── ${group.title} (${group.tools.length}) ──`, value: `__group__:${group.source}`, description: "", divider: true })
+        for (const tool of group.tools) {
+          covered.add(tool.id)
+          options.push(toolPermissionRow(map, tool))
+        }
+      }
+    }
+
+    const toolKeys = [...new Set([...PERMISSION_TOOL_KEYS, ...Object.keys(map)])].filter((key) => key !== "*" && !covered.has(key))
+    if (toolKeys.length > 0) {
+      options.push({ title: `── Other configured tools (${toolKeys.length}) ──`, value: "__group__:other", description: "", divider: true })
+      for (const tool of toolKeys) {
+        const rule = map[tool]
+        options.push({
+          title: tool,
+          value: `tool:${tool}`,
+          description: rule === undefined ? "(default: ask)" : typeof rule === "string" ? rule : rule !== null && typeof rule === "object" ? Object.entries(rule).map(([pattern, action]) => `${pattern}=${action}`).join(", ").slice(0, 60) : "?",
+          help: isPlainOnlyPermissionKey(tool) ? "Plain action only (no pattern rules) for this tool. Not in the current live tool list (server disabled or OpenCode version without tool listing)." : "Action for the whole tool, or per-pattern rules. Last matching rule wins; * and ? wildcards supported.",
+          edited: rule !== undefined,
+          danger: rule === "deny",
+        })
+      }
     }
     options.push({ title: "+ Add custom tool rule", value: "add-tool", description: "e.g. an MCP tool name" })
     options.push({ title: "i How matching works", value: "__help__", description: "" })
@@ -678,6 +700,8 @@ export async function permissionEditor(kit: EditorKit, props: { title: string; p
           "Precedence: built-in defaults < root permission < agent permission < session approvals.",
           "Agent-level rules override root rules for that agent.",
           "Hidden tools: a deny with pattern * removes the tool from the model entirely.",
+          "",
+          bundle && bundle.mode === "none" ? "Live tool listing unavailable - showing configured rules only." : "Tools are grouped by source: built-in first, then each MCP server.",
         ].join("\n"),
       })
       continue
@@ -694,6 +718,21 @@ export async function permissionEditor(kit: EditorKit, props: { title: string; p
       await toolRuleEditor(kit, props.pointer, picked.slice(5), props.title)
       continue
     }
+  }
+}
+
+/** One tool row in the permission editor: rule state + rich [i] with parameters. */
+function toolPermissionRow(map: Record<string, unknown>, tool: { id: string; description: string; parameters?: unknown }): WizardSelectOption<string> {
+  const rule = map[tool.id]
+  const ruleLabel = rule === undefined ? "(default: ask)" : typeof rule === "string" ? rule : Object.entries(rule as Record<string, unknown>).map(([pattern, action]) => `${pattern}=${action}`).join(", ").slice(0, 40)
+  const toolInfo = { id: tool.id, description: tool.description, parameters: tool.parameters }
+  return {
+    title: tool.id,
+    value: `tool:${tool.id}`,
+    description: ruleLabel,
+    help: toolInfoText(toolInfo, ruleLabel),
+    edited: rule !== undefined && rule !== "deny",
+    danger: rule === "deny",
   }
 }
 
@@ -820,7 +859,13 @@ export async function mcpScreen(kit: EditorKit): Promise<void> {
   while (true) {
     const mcp = kit.valueAt(["mcp"])
     const map = isPlainObject(mcp) ? mcp : {}
-    const options: WizardSelectOption<string>[] = Object.entries(map).map(([name, entry]) => {
+    const bundle = kit.tools ? await kit.tools() : undefined
+    const options: WizardSelectOption<string>[] = []
+    const names = new Set<string>(Object.keys(map))
+    for (const id of bundle?.serverIds ?? []) names.add(id)
+    const sorted = [...names].sort((a, b) => a.localeCompare(b))
+    for (const name of sorted) {
+      const entry = map[name]
       const object = isPlainObject(entry) ? entry : {}
       const type = object["type"] === "remote" ? "remote" : object["type"] === "local" ? "local" : "overlay"
       const enabled = object["enabled"] === false ? "disabled" : "enabled"
@@ -830,25 +875,36 @@ export async function mcpScreen(kit: EditorKit): Promise<void> {
         : type === "remote"
           ? typeof object["url"] === "string" ? `url: ${object["url"]}` : "url: (unset)"
           : Object.keys(object).length > 0 ? `keys: ${Object.keys(object).join(", ")}` : "empty"
-      return {
+      const toolCount = bundle?.tools.filter((tool) => tool.id.startsWith(mcpToolPrefix(name))).length ?? 0
+      const status = mcpStatusLabel(bundle?.statuses?.[name])
+      const statusNote = bundle?.statuses === undefined ? "" : ` - ${status.label}`
+      const statusHelp = [
+        `Runtime status: ${bundle?.statuses === undefined ? "unavailable (older OpenCode)" : status.label}`,
+        ...(status.error ? ["", `Error: ${status.error}`] : []),
+        ...(status.kind === "auth" ? ["", `Authenticate with: opencode mcp auth ${name}`] : []),
+      ]
+      options.push({
         title: name,
         value: `server:${name}`,
-        description: `[${type}] ${enabled} (${kit.sourceLabel(["mcp", name])})`,
+        description: `[${type}] ${enabled} - ${toolCount} tool(s)${statusNote} (${kit.sourceLabel(["mcp", name])})`,
         edited: true,
+        danger: status.kind === "failed",
         help: [
           `MCP server "${name}"`,
           typeHelp,
           "",
           detail,
+          `Tools registered: ${toolCount}${bundle?.mode === "none" ? " (live tool list unavailable)" : ""}`,
+          ...statusHelp,
           `Source: ${kit.sourceLabel(["mcp", name])}`,
           "",
-          "Restart-required: MCP servers connect at OpenCode startup; changes apply after restart.",
+          "Restart-required: MCP servers connect at OpenCode startup; changes apply after a config reload or restart.",
         ].join("\n"),
-      }
-    })
+      })
+    }
     options.push({ title: "+ Add local server", value: "add-local", description: "stdio command" })
     options.push({ title: "+ Add remote server", value: "add-remote", description: "HTTP endpoint" })
-    options.push({ title: "< Back", value: "__back__", description: Object.keys(map).length === 0 ? "(no servers configured)" : "" })
+    options.push({ title: "< Back", value: "__back__", description: sorted.length === 0 ? "(no servers configured)" : "" })
 
     const picked = await kit.showMenu({ title: "MCP servers", options })
     if (!picked || picked === "__back__") return
@@ -871,6 +927,33 @@ export async function mcpScreen(kit: EditorKit): Promise<void> {
     }
     if (picked.startsWith("server:")) {
       await mcpEntryScreen(kit, picked.slice(7))
+      continue
+    }
+  }
+}
+
+/** Prefix every tool of this server carries (OpenCode: sanitize(name) + "_"). */
+function mcpToolPrefix(name: string): string {
+  return `${name.replace(/[^a-zA-Z0-9_-]/g, "_")}_`
+}
+
+/** Tools of one MCP server: view parameters, allow/deny via root permission rules. */
+async function mcpServerToolsScreen(kit: EditorKit, name: string): Promise<void> {
+  while (true) {
+    const bundle = kit.tools ? await kit.tools() : undefined
+    const tools = (bundle?.tools ?? []).filter((tool) => tool.id.startsWith(mcpToolPrefix(name)))
+    const permission = kit.valueAt(["permission"])
+    const map = isPlainObject(permission) ? permission : {}
+    const options: WizardSelectOption<string>[] = tools.map((tool) => toolPermissionRow(map, tool))
+    if (tools.length === 0) {
+      options.push({ title: "(no tools registered)", value: "__none__", description: "server not connected or exposes none", help: "Connect the server (`opencode mcp`) and reload config; tools appear here once the server registers them." })
+    }
+    options.push({ title: "< Back", value: "__back__", description: "" })
+
+    const picked = await kit.showMenu({ title: `MCP ${name} - tools (${tools.length})`, options })
+    if (!picked || picked === "__back__" || picked === "__none__") return
+    if (picked.startsWith("tool:")) {
+      await toolRuleEditor(kit, ["permission"], picked.slice(5), "Permission (root)")
       continue
     }
   }
@@ -909,8 +992,35 @@ async function mcpEntryScreen(kit: EditorKit, name: string): Promise<void> {
     }
 
     const fields = type === "local" ? MCP_LOCAL_FIELDS : MCP_REMOTE_FIELDS
+    const bundle = kit.tools ? await kit.tools() : undefined
+    const serverTools = (bundle?.tools ?? []).filter((tool) => tool.id.startsWith(mcpToolPrefix(name)))
+    const status = mcpStatusLabel(bundle?.statuses?.[name])
     const options: WizardSelectOption<string>[] = [
       { title: object["enabled"] === false ? "Enable server" : "Disable server", value: "__toggle__", description: "disabled servers never connect", danger: object["enabled"] !== false },
+      {
+        title: `Status: ${bundle?.statuses === undefined ? "(unavailable)" : status.label}`,
+        value: "__status__",
+        description: status.error ? status.error.slice(0, 46) : "runtime connection state",
+        danger: status.kind === "failed",
+        help: [
+          `Runtime status for MCP server "${name}"`,
+          `State: ${bundle?.statuses === undefined ? "unavailable (older OpenCode)" : status.label}`,
+          ...(status.error ? ["", `Error: ${status.error}`] : []),
+          ...(status.kind === "auth" ? ["", `Authenticate with: opencode mcp auth ${name}`] : []),
+          "",
+          "Status reflects the live connection; config changes apply after a reload.",
+        ].join("\n"),
+      },
+      {
+        title: `Tools (${serverTools.length})`,
+        value: "__tools__",
+        description: serverTools.length === 0 ? "(none registered - connected?)" : "view parameters - allow/deny individually",
+        help: [
+          `Tools registered by MCP server "${name}" (${serverTools.length}).`,
+          "Each tool can be allowed or denied through root permission rules; denying hides it from every agent.",
+          bundle?.mode === "ids" ? "Tool details (descriptions/parameters) are unavailable in this OpenCode version." : "Press [i] on a tool for its full parameter schema.",
+        ].join("\n"),
+      },
     ]
     for (const field of fields) {
       if (field.key === "enabled") continue
@@ -929,6 +1039,23 @@ async function mcpEntryScreen(kit: EditorKit, name: string): Promise<void> {
 
     const picked = await kit.showMenu({ title: `MCP ${name} (${type})`, options })
     if (!picked || picked === "__back__") return
+    if (picked === "__status__") {
+      await kit.showInfo({
+        title: `MCP ${name} - status`,
+        message: [
+          `State: ${bundle?.statuses === undefined ? "unavailable (older OpenCode)" : status.label}`,
+          ...(status.error ? ["", `Error: ${status.error}`] : []),
+          ...(status.kind === "auth" ? ["", `Authenticate with: opencode mcp auth ${name}`] : []),
+          "",
+          "The runtime state is read-only here. Live connect/disconnect/reconnect lives in the `opencode mcp` command; this editor only changes config.",
+        ].join("\n"),
+      })
+      continue
+    }
+    if (picked === "__tools__") {
+      await mcpServerToolsScreen(kit, name)
+      continue
+    }
     if (picked === "__toggle__") {
       await kit.stage([{ op: "set", path: ["mcp", name, "enabled"], value: object["enabled"] === false }], `mcp ${name} ${object["enabled"] === false ? "enabled" : "disabled"}`)
       continue
