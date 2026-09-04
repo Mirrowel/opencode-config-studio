@@ -61,7 +61,7 @@ T.__setMenuProbe({
   onMenu: (title, options) => {
     calls.menus.push(title)
     // Answer the write-target picker (values are file paths); cancel others.
-    const fileOption = options.find((option) => typeof option.value === "string" && /^[A-Za-z]:[\\/]/.test(option.value))
+    const fileOption = options.find((option) => typeof option.value === "string" && /^([A-Za-z]:[\\/]|\/)/.test(option.value))
     if (fileOption) return fileOption.value
     return undefined
   },
@@ -94,7 +94,7 @@ T.__setMenuProbe({
   onPaged: () => undefined,
   onMenu: (title, options) => {
     calls.menus.push(title)
-    const fileOption = options.find((option) => typeof option.value === "string" && /^[A-Za-z]:[\\/]/.test(option.value))
+    const fileOption = options.find((option) => typeof option.value === "string" && /^([A-Za-z]:[\\/]|\/)/.test(option.value))
     if (fileOption) return fileOption.value
     return undefined
   },
