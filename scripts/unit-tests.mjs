@@ -925,37 +925,52 @@ await testAvSource()
 async function testDeferredReload() {
   const tick = (ms = 25) => new Promise((resolve) => setTimeout(resolve, ms))
 
-  function fakeReloadApi({ active, sessions = {}, waitControl = false } = {}) {
-    const state = { disposed: 0, toasts: [], activeMap: active, waitResolvers: [] }
+  // The host SDK client uses CLASS methods that dereference `this` (e.g.
+  // dispose() { return this._client.post(...) }). The fakes mirror that: every
+  // method reads `this._store`, so a detached call throws - proving the
+  // coordinator never detaches methods from their namespace object.
+  function fakeReloadApi({ active, statusMap, sessions = {}, waitControl = false, disposeNamespace = "global", surface = "active" } = {}) {
+    const store = { disposed: 0, toasts: [], activeMap: active, statusMap, waitResolvers: [] }
+    class FakeSession {
+      async status() {
+        if (store.statusMap === "fail") throw new Error("unreachable")
+        return { data: store.statusMap ?? {} }
+      }
+      async get({ sessionID } = {}) {
+        return { data: sessions[sessionID] ?? { id: sessionID } }
+      }
+      wait() {
+        return new Promise((resolve) => {
+          if (waitControl) store.waitResolvers.push(resolve)
+          else resolve(undefined)
+        })
+      }
+    }
+    class FakeSessionWithActive extends FakeSession {
+      async active() {
+        if (store.activeMap === "fail") throw new Error("unreachable")
+        return { data: store.activeMap ?? {} }
+      }
+    }
+    const sessionInstance = surface === "status" ? new FakeSession() : new FakeSessionWithActive()
+    class FakeDispose {
+      async dispose() {
+        store.disposed++
+        return { data: undefined }
+      }
+    }
+    const disposeGroup = new FakeDispose()
+    const client = { session: sessionInstance }
+    if (disposeNamespace) client[disposeNamespace] = disposeGroup
+    const state = store
     return {
-      api: {
-        client: {
-          global: {
-            dispose: async () => {
-              state.disposed++
-            },
-          },
-          session: {
-            active: async () => {
-              if (state.activeMap === "fail") throw new Error("unreachable")
-              return { data: state.activeMap ?? {} }
-            },
-            get: async ({ sessionID }) => ({ data: sessions[sessionID] ?? { id: sessionID } }),
-            wait: () =>
-              new Promise((resolve) => {
-                if (waitControl) state.waitResolvers.push(resolve)
-                else resolve(undefined)
-              }),
-          },
-        },
-        ui: { toast: (input) => state.toasts.push(input) },
-      },
+      api: { client, ui: { toast: (input) => store.toasts.push(input) } },
       state,
       setActive: (next) => {
-        state.activeMap = next
+        store.activeMap = next
       },
       releaseWaits: () => {
-        const resolvers = state.waitResolvers.splice(0)
+        const resolvers = store.waitResolvers.splice(0)
         resolvers.forEach((resolve) => resolve(undefined))
       },
     }
@@ -1002,9 +1017,32 @@ async function testDeferredReload() {
     assert(state.disposed === 1, "reloads only when every session finished")
   }
 
-  // Detection failure: defers (never interrupts on uncertainty).
+  // Older host clients lack session.active(): fall back to session.status()
+  // (idle/retry/busy map) - busy and retry count as running, idle does not.
   {
-    const { api, state } = fakeReloadApi({ active: "fail" })
+    const { api } = fakeReloadApi({ surface: "status", statusMap: { ses_a: { type: "busy" }, ses_b: { type: "retry" }, ses_c: { type: "idle" } } })
+    const ids = await reload.fetchActiveSessions(api)
+    assert(Array.isArray(ids) && ids.includes("ses_a") && ids.includes("ses_b") && !ids.includes("ses_c"), "status fallback counts busy/retry, skips idle")
+  }
+
+  // The dispose namespace moved between SDK generations (global -> instance).
+  {
+    const { api, state } = fakeReloadApi({ active: {}, disposeNamespace: "instance" })
+    const result = await reload.requestReload(api)
+    assert(result.kind === "reloaded" && state.disposed === 1, "instance.dispose namespace works")
+  }
+
+  // No dispose surface at all: best-effort (reported reloaded, nothing thrown).
+  {
+    const { api, state } = fakeReloadApi({ active: {}, disposeNamespace: null })
+    const result = await reload.requestReload(api)
+    assert(result.kind === "reloaded" && state.disposed === 0, "missing dispose surface degrades gracefully")
+  }
+
+  // Detection failure (no usable session surface): defers - never interrupts
+  // on uncertainty.
+  {
+    const { api, state } = fakeReloadApi({ surface: "status", statusMap: "fail" })
     const result = await reload.requestReload(api)
     assert(result.kind === "deferred" && result.detectionFailed === true, "detection failure defers")
     assert(state.disposed === 0, "no dispose when detection fails")

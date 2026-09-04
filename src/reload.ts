@@ -76,16 +76,39 @@ function sessionClient(api: TuiPluginApi): Record<string, unknown> | undefined {
   return session as Record<string, unknown>
 }
 
-/** IDs of currently running sessions; `undefined` when detection failed. */
+/**
+ * IDs of currently running sessions; `undefined` when detection failed.
+ * The host client's session surface varies by OpenCode version, so probe in
+ * order: session.active() (newest, map of running drains) then
+ * session.status() (older, sessionID -> idle|retry|busy; busy/retry count as
+ * running). All calls stay attached to their namespace object - SDK methods
+ * are class methods that dereference `this`, so detaching them throws.
+ */
 export async function fetchActiveSessions(api: TuiPluginApi): Promise<string[] | undefined> {
   const session = sessionClient(api)
-  const active = session?.active
-  if (typeof active !== "function") return undefined
-  const result = await callWithTimeout(() => (active as () => Promise<unknown>).call(session))
-  if (!result || typeof result !== "object") return undefined
-  const data = (result as { data?: unknown }).data
-  if (!data || typeof data !== "object" || Array.isArray(data)) return undefined
-  return Object.keys(data as Record<string, unknown>)
+  if (!session) return undefined
+  const active = session["active"]
+  if (typeof active === "function") {
+    const result = await callWithTimeout(() => (active as (args?: unknown) => Promise<unknown>).call(session))
+    const data = result && typeof result === "object" ? (result as { data?: unknown }).data : undefined
+    if (data && typeof data === "object" && !Array.isArray(data)) {
+      return Object.keys(data as Record<string, unknown>)
+    }
+  }
+  const status = session["status"]
+  if (typeof status === "function") {
+    const result = await callWithTimeout(() => (status as (args?: unknown) => Promise<unknown>).call(session))
+    const data = result && typeof result === "object" ? (result as { data?: unknown }).data : undefined
+    if (data && typeof data === "object" && !Array.isArray(data)) {
+      const running: string[] = []
+      for (const [id, value] of Object.entries(data as Record<string, unknown>)) {
+        const type = value && typeof value === "object" ? (value as { type?: unknown }).type : value
+        if (type === undefined || type === "busy" || type === "retry") running.push(id)
+      }
+      return running
+    }
+  }
+  return undefined
 }
 
 /** Details of running sessions for confirmation dialogs. */
@@ -118,9 +141,7 @@ export async function fetchRunningSessions(api: TuiPluginApi): Promise<RunningSe
     })
   }
   return sessions
-}
-
-export function pendingReload(): PendingState | undefined {
+}export function pendingReload(): PendingState | undefined {
   return pending
 }
 
@@ -134,14 +155,23 @@ export function endStudioFlow(): void {
 
 async function disposeNow(api: TuiPluginApi): Promise<boolean> {
   const client = (api as { client?: unknown }).client
-  const dispose = client && typeof client === "object" ? (client as { global?: { dispose?: unknown } }).global?.dispose : undefined
-  if (typeof dispose !== "function") return false
-  try {
-    await (dispose as () => Promise<unknown>)()
-    return true
-  } catch {
-    return false
+  if (!client || typeof client !== "object") return false
+  // The dispose namespace moved between SDK generations (global -> instance).
+  // Methods MUST be called on their namespace object - they are class methods
+  // that dereference `this`; a detached call throws immediately.
+  for (const namespace of ["global", "instance"] as const) {
+    const group = (client as Record<string, unknown>)[namespace]
+    if (!group || typeof group !== "object") continue
+    const dispose = (group as Record<string, unknown>)["dispose"]
+    if (typeof dispose !== "function") continue
+    try {
+      await (dispose as (args?: unknown) => Promise<unknown>).call(group)
+      return true
+    } catch {
+      return false
+    }
   }
+  return false
 }
 
 /** Disposes immediately; clears any pending auto-reload. Returns whether the dispose call succeeded. */
