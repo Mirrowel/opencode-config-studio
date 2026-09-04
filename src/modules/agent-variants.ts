@@ -662,8 +662,13 @@ const agentVariantsModule: StudioModule = {
   },
 }
 
-/**
- * Variant aliases a sidecar config injects as task-tool agent clones
+/** Test seam: dirties the sidecar draft the same way wizard edits do. */
+export function __testTouchDraft(): void {
+  const draft = ensureDraft()
+  ;(draft as { ui?: { height_percent?: number } }).ui = { ...(draft.ui as { height_percent?: number }), height_percent: 40 }
+}
+
+/** Variant aliases a sidecar config injects as task-tool agent clones
  * (mirrors agent-variants' assembly: name override or parent-key; disabled
  * parents/variants produce no alias). Pure - no sidecar I/O.
  */

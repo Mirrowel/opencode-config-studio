@@ -943,8 +943,20 @@ async function testToolGrouping() {
   assert(bySource["context7"].tools.map((tool) => tool.id).join(",") === "context7_get_docs,context7_resolve_library_id", "server tools grouped and sorted")
   // Longest-prefix: deep_search_search_deep belongs to deep_search (server prefix wins over shorter).
   assert(bySource["deep_search"].tools.length === 2, "underscore tool names attribute to the longest matching server")
-  // Empty servers produce no group.
-  assert(groupToolsBySource(tools, []).length === 1, "no servers -> single builtin group")
+  // Empty servers: MCP-named tools cannot be attributed -> plugin group.
+  {
+    const noServers = groupToolsBySource(tools, [])
+    assert(noServers.length === 2, "no servers -> builtin + plugins groups")
+    assert(noServers[0].source === "builtin" && noServers[0].tools.length === 2, "known builtins still grouped")
+    assert(noServers[1].source === "plugins" && noServers[1].tools.length === 4, "unattributed ids fall to plugins")
+  }
+
+  // Unknown non-MCP ids separate into a plugin-tools group (deep_search tools
+  // also land there - their server is not in the passed list).
+  const withPlugins = groupToolsBySource([...tools, { id: "magic_compact", description: "" }, { id: "souk_install", description: "" }], ["context7"])
+  const pluginGroup = withPlugins.find((group) => group.source === "plugins")
+  assert(pluginGroup?.tools.length === 4, "plugin-registered tools get their own group")
+  assert(withPlugins.find((group) => group.source === "builtin")?.tools.length === 2, "known builtin ids stay in the builtin group")
 
   // Parameter schema rendering.
   const lines = describeToolParameters({ type: "object", description: "Query docs", required: ["library"], properties: { library: { type: "string", description: "Library name" }, depth: { type: "number", enum: [1, 2] } } })

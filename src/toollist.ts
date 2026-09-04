@@ -45,24 +45,62 @@ export function sanitizeMcpName(value: string): string {
 }
 
 /**
- * Groups tools by source: unmatched tools land in "builtin", MCP tools in a
- * group per server (longest server-prefix match wins - server names may
- * contain underscores themselves).
+ * Canonical OpenCode built-in tool ids (from the tool sources: shell, edit,
+ * read, write, glob, grep, list, patch, apply_patch, todo, webfetch,
+ * websearch, task, question, skill, lsp, plan, probe). Everything else that
+ * is not MCP-prefixed is treated as a plugin-registered tool. Best-effort:
+ * new built-ins simply show under "Plugin tools" until this list is updated.
+ */
+export const KNOWN_BUILTIN_TOOLS: ReadonlySet<string> = new Set([
+  "bash",
+  "edit",
+  "read",
+  "write",
+  "glob",
+  "grep",
+  "list",
+  "patch",
+  "apply_patch",
+  "applypatch",
+  "todowrite",
+  "todoread",
+  "todo",
+  "task",
+  "webfetch",
+  "websearch",
+  "question",
+  "skill",
+  "lsp",
+  "plan",
+  "probe",
+  "code_mode",
+])
+
+/**
+ * Groups tools by source: unmatched ids split into built-ins (known set) and
+ * plugin-registered tools; MCP tools land in a group per server (longest
+ * server-prefix match wins - server names may contain underscores).
  */
 export function groupToolsBySource(tools: StudioTool[], serverIds: string[]): ToolGroup[] {
   const prefixes = serverIds
     .map((id) => ({ id, prefix: `${sanitizeMcpName(id)}_` }))
     .sort((a, b) => b.prefix.length - a.prefix.length)
   const builtin: StudioTool[] = []
+  const plugins: StudioTool[] = []
   const perServer = new Map<string, StudioTool[]>()
   for (const id of serverIds) perServer.set(id, [])
   for (const tool of tools) {
     const hit = prefixes.find((entry) => tool.id.startsWith(entry.prefix))
-    if (hit) perServer.get(hit.id)?.push(tool)
-    else builtin.push(tool)
+    if (hit) {
+      perServer.get(hit.id)?.push(tool)
+      continue
+    }
+    if (KNOWN_BUILTIN_TOOLS.has(tool.id)) builtin.push(tool)
+    else plugins.push(tool)
   }
   const groups: ToolGroup[] = []
   if (builtin.length > 0) groups.push({ source: "builtin", title: "Built-in tools", tools: [...builtin].sort((a, b) => a.id.localeCompare(b.id)) })
+  if (plugins.length > 0) groups.push({ source: "plugins", title: `Plugin tools (${plugins.length})`, tools: [...plugins].sort((a, b) => a.id.localeCompare(b.id)) })
   for (const id of [...serverIds].sort((a, b) => a.localeCompare(b))) {
     const list = perServer.get(id) ?? []
     if (list.length === 0) continue
@@ -131,10 +169,22 @@ function toolNamespace(api: TuiPluginApi): Record<string, unknown> | undefined {
   return tool as Record<string, unknown>
 }
 
+/** Accepts both the {data} envelope and a raw response body. */
+function unwrapPayload(result: unknown): unknown {
+  if (!result || typeof result !== "object") return undefined
+  const record = result as { data?: unknown }
+  if (record.data !== undefined) return record.data
+  return result
+}
+
 /**
  * Fetches the live tool inventory. `modelRef` ("provider/model") selects the
  * tool visibility for Tool.list; any valid default works. Fails soft: ids
  * fallback, then an empty bundle.
+ *
+ * Param shapes differ across client generations: the v2 client (what current
+ * OpenCode injects into plugins) takes FLAT `{provider, model}` query args;
+ * the v1-era client took `{query: {...}}`. Both are attempted.
  */
 export async function fetchToolBundle(api: TuiPluginApi, modelRef: string | undefined): Promise<ToolBundle> {
   const tool = toolNamespace(api)
@@ -145,8 +195,14 @@ export async function fetchToolBundle(api: TuiPluginApi, modelRef: string | unde
 
   const list = tool["list"]
   if (typeof list === "function" && provider && model) {
-    const result = await fetchWithTimeout(() => (list as (args: unknown) => Promise<unknown>).call(tool, { query: { provider, model } }))
-    const data = result && typeof result === "object" ? (result as { data?: unknown }).data : undefined
+    // v2 shape (flat query args) first - matches the current plugin client.
+    let result = await fetchWithTimeout(() => (list as (args: unknown) => Promise<unknown>).call(tool, { provider, model }))
+    let data = unwrapPayload(result)
+    if (!Array.isArray(data)) {
+      // v1-era shape (nested query object) fallback.
+      result = await fetchWithTimeout(() => (list as (args: unknown) => Promise<unknown>).call(tool, { query: { provider, model } }))
+      data = unwrapPayload(result)
+    }
     if (Array.isArray(data)) {
       const tools: StudioTool[] = []
       for (const item of data) {
@@ -162,7 +218,7 @@ export async function fetchToolBundle(api: TuiPluginApi, modelRef: string | unde
   const ids = tool["ids"]
   if (typeof ids === "function") {
     const result = await fetchWithTimeout(() => (ids as (args?: unknown) => Promise<unknown>).call(tool))
-    const data = result && typeof result === "object" ? (result as { data?: unknown }).data : undefined
+    const data = unwrapPayload(result)
     if (Array.isArray(data)) {
       const tools: StudioTool[] = data.filter((id): id is string => typeof id === "string").map((id) => ({ id, description: "" }))
       return { tools, groups: groupToolsBySource(tools, serverIds), mode: "ids", serverIds, statuses: status, note: "Tool details unavailable in this OpenCode version (ids only)" }

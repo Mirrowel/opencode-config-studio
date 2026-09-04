@@ -50,7 +50,7 @@ import { avOrigin, refreshAvSource } from "./av-source.js"
 import { getToolBundle } from "./toollist.js"
 import { beginStudioFlow, cancelPendingReload, endStudioFlow, fetchActiveSessions, fetchRunningSessions, pendingReload, reloadNow, requestReload, __testSetPending as setReloadPendingForTest, type RunningSession } from "./reload.js"
 import { enabledModules, moduleUsesOwnMenu, getModules, type ModuleContext } from "./modules.js"
-import { agentVariantsModuleId, agentVariantsHiddenAliases, resetAgentVariantsLens, setModuleAlertImplementation, setModulePickImplementation } from "./modules/agent-variants.js"
+import { agentVariantsModuleId, agentVariantsHiddenAliases, resetAgentVariantsLens, setModuleAlertImplementation, setModulePickImplementation, __testTouchDraft } from "./modules/agent-variants.js"
 import { findStandaloneAgentVariants, removeStandaloneHits } from "./standalone.js"
 
 // ---------------------------------------------------------------------------
@@ -2507,23 +2507,27 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
       return reviewChangesScreen(api, state)
     case "save":
       return saveAndExit(api, state)
-    default: {
-      const hasModulePending = enabledModuleList().some((module) => module.hasPendingChanges(moduleContext(api, state)))
-      if (state.pending.length > 0 || hasModulePending) {
-        const discard = await showConfirm(api.ui, {
-          title: "Discard staged changes?",
-          message: `${state.pending.length} staged file change(s) plus module changes have not been written to disk.\n\nDiscard them and exit?`,
-          confirmLabel: "Discard & exit",
-        })
-        if (!discard) return mainMenu(api, state)
-        state.pending = []
+    default:
+      return studioExit(api, state)
+  }
+}
+
+/** The main-menu Back/Esc path: discard-confirm when anything is staged. */
+async function studioExit(api: TuiPluginApi, state: StudioState): Promise<void> {
+  const hasModulePending = enabledModuleList().some((module) => module.hasPendingChanges(moduleContext(api, state)))
+  if (state.pending.length > 0 || hasModulePending) {
+    const discard = await showConfirm(api.ui, {
+      title: "Discard staged changes?",
+      message: `${state.pending.length} staged file change(s) plus module changes have not been written to disk.\n\nDiscard them and exit?`,
+      confirmLabel: "Discard & exit",
+    })
+    if (!discard) return mainMenu(api, state)
+    state.pending = []
     stagedBases.clear()
     configRestartReasons.length = 0
-        for (const module of enabledModuleList()) module.discard?.()
-      }
-      return
-    }
+    for (const module of enabledModuleList()) module.discard?.()
   }
+  return
 }
 
 async function showOverview(api: TuiPluginApi): Promise<void> {
@@ -4772,6 +4776,10 @@ export const __testInternals = {
   SizeSliderDialog,
   PagedDialog,
   scanCleanupFindings,
+  saveAndExitForTest: (api: TuiPluginApi, state: StudioState) => saveAndExit(api, state),
+  studioExitForTest: (api: TuiPluginApi, state: StudioState) => studioExit(api, state),
+  applyEditsForTest: (api: TuiPluginApi, state: StudioState, ops: EditOp[], reason: string) => applyEdits({ api, state }, ops, reason),
+  touchAvDraftForTest: () => __testTouchDraft(),
   setStudioSettings: (settings: StudioSettings) => {
     studioSettings = settings
   },
