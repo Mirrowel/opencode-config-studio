@@ -9,11 +9,12 @@ import type { TuiPluginApi } from "@opencode-ai/plugin/tui"
  *
  * - requestReload(): empty `session.active()` map -> dispose now (old behavior);
  *   sessions running OR detection failed -> mark pending + start the watcher.
- * - The watcher long-polls `session.wait()` per running session, re-checks
- *   `session.active()` (new sessions may start), and disposes once idle.
- *   It holds off while a Config Studio flow is open (dispose would tear the
- *   studio dialogs down mid-display) and gives up after repeated failures,
- *   leaving the pending state + manual reload available.
+ * - The watcher NEVER stops until the reload applies or is cancelled: every
+ *   cycle fully re-fetches the active set (new sessions included), waits on
+ *   the known sessions with a 30s cap per round, and retries detection or
+ *   dispose failures on an escalating 5s->30s interval forever. It holds off
+ *   while a Config Studio flow is open (dispose would tear the studio dialogs
+ *   down mid-display).
  * - reloadNow(): forces the dispose immediately (used by the red post-save
  *   shortcut and the manual menu entries, both behind user confirmation).
  */
@@ -34,14 +35,23 @@ export type ReloadRequestResult =
 type PendingState = { since: number; active: number }
 
 const CALL_TIMEOUT = 3000
-const WAIT_TIMEOUT = 300000
+// Full revalidation cadence: per-session waits are capped so the watcher
+// re-fetches the ENTIRE active set at least every 30s - sessions that started
+// since the last check are picked up, never only the previously-known list.
+const WAIT_TIMEOUT = 30000
 const STUDIO_HOLD_POLL = 5000
-const FAILURE_RETRY = 10000
-const MAX_CONSECUTIVE_FAILURES = 5
+const FAILURE_BASE = 5000
+const FAILURE_MAX = 30000
 
 let pending: PendingState | undefined
 let watching = false
 let studioDepth = 0
+let timings = { studioHoldPoll: STUDIO_HOLD_POLL, failureBase: FAILURE_BASE, failureMax: FAILURE_MAX }
+
+/** Test seam: shrink watcher sleep intervals so failure/recovery paths are testable. */
+export function __testSetTimings(next: { studioHoldPoll?: number; failureBase?: number; failureMax?: number }): void {
+  timings = { ...timings, ...next }
+}
 
 function callWithTimeout<T>(fn: () => Promise<T>, timeoutMs: number = CALL_TIMEOUT): Promise<T | undefined> {
   return new Promise<T | undefined>((resolve) => {
@@ -174,10 +184,15 @@ async function disposeNow(api: TuiPluginApi): Promise<boolean> {
   return false
 }
 
-/** Disposes immediately; clears any pending auto-reload. Returns whether the dispose call succeeded. */
+/**
+ * Disposes immediately (manual force). Pending state is only cleared when the
+ * dispose actually succeeded - on failure the never-stop watcher keeps the
+ * deferred reload alive. Returns whether the dispose call succeeded.
+ */
 export async function reloadNow(api: TuiPluginApi): Promise<boolean> {
-  pending = undefined
-  return disposeNow(api)
+  const ok = await disposeNow(api)
+  if (ok) pending = undefined
+  return ok
 }
 
 /** Drops the pending auto-reload without disposing. */
@@ -185,10 +200,25 @@ export function cancelPendingReload(): void {
   pending = undefined
 }
 
-async function watchUntilIdle(api: TuiPluginApi): Promise<"idle" | "cancelled" | "gave-up"> {
+function escalatedDelay(failures: number): number {
+  // 5s, 10s, 20s, 30s cap - retries never stop, they only slow down.
+  const steps = [timings.failureBase, timings.failureBase * 2, timings.failureBase * 4]
+  return Math.min(steps[Math.min(failures - 1, steps.length - 1)] ?? timings.failureMax, timings.failureMax)
+}
+
+/**
+ * Watch loop: NEVER stops until the reload applies or is cancelled.
+ * Every cycle fully re-fetches the active set (a session that started since
+ * the last check is included, not just the previously-known list). Per-session
+ * waits are capped at WAIT_TIMEOUT so a full revalidation happens at least
+ * every ~30s even while sessions keep running. Detection and dispose failures
+ * back off (escalatedDelay) and retry forever.
+ */
+async function watchUntilApplied(api: TuiPluginApi): Promise<"applied" | "cancelled"> {
   const session = sessionClient(api)
   const wait = session?.wait
   let failures = 0
+  let disposeWarned = false
   for (;;) {
     if (!pending) return "cancelled"
     if (studioDepth > 0) {
@@ -198,15 +228,30 @@ async function watchUntilIdle(api: TuiPluginApi): Promise<"idle" | "cancelled" |
     const ids = await fetchActiveSessions(api)
     if (ids === undefined) {
       failures++
-      if (failures >= MAX_CONSECUTIVE_FAILURES) return "gave-up"
-      await sleep(timings.failureRetry)
+      await sleep(escalatedDelay(failures))
+      continue
+    }
+    if (ids.length === 0) {
+      const ok = await disposeNow(api)
+      if (ok) return "applied"
+      if (!disposeWarned) {
+        disposeWarned = true
+        try {
+          ;(api as { ui?: { toast?: (input: unknown) => unknown } }).ui?.toast?.({ variant: "warning", title: "Config Studio", message: "Config reload failed - retrying every 30s until it applies" })
+        } catch {
+          // best effort
+        }
+      }
+      failures++
+      await sleep(escalatedDelay(failures))
       continue
     }
     failures = 0
-    if (ids.length === 0) return "idle"
+    disposeWarned = false
     pending = { since: pending.since, active: ids.length }
     if (typeof wait !== "function") {
-      await sleep(timings.failureRetry)
+      // No long-poll surface: plain interval polling.
+      await sleep(Math.min(timings.failureMax, WAIT_TIMEOUT))
       continue
     }
     await Promise.all(
@@ -219,24 +264,15 @@ async function startWatcher(api: TuiPluginApi): Promise<void> {
   if (watching) return
   watching = true
   try {
-    const outcome = await watchUntilIdle(api)
-    if (outcome === "idle") {
+    const outcome = await watchUntilApplied(api)
+    if (outcome === "applied") {
       pending = undefined
-      const toast = (api as { ui?: { toast?: (input: unknown) => unknown } }).ui?.toast
-      const reloaded = await disposeNow(api)
       try {
-        toast?.({
-          variant: reloaded ? "success" : "warning",
+        ;(api as { ui?: { toast?: (input: unknown) => unknown } }).ui?.toast?.({
+          variant: "success",
           title: "Config Studio",
-          message: reloaded ? "Config reloaded - all sessions finished" : "Config reload failed - reload manually from the studio menu",
+          message: "Config reloaded - all sessions finished",
         })
-      } catch {
-        // best effort
-      }
-    } else if (outcome === "gave-up") {
-      const toast = (api as { ui?: { toast?: (input: unknown) => unknown } }).ui?.toast
-      try {
-        toast?.({ variant: "warning", title: "Config Studio", message: "Auto-reload watch failed - reload manually when ready" })
       } catch {
         // best effort
       }
@@ -254,20 +290,19 @@ async function startWatcher(api: TuiPluginApi): Promise<void> {
 export async function requestReload(api: TuiPluginApi): Promise<ReloadRequestResult> {
   const ids = await fetchActiveSessions(api)
   if (ids !== undefined && ids.length === 0) {
-    pending = undefined
-    await disposeNow(api)
-    return { kind: "reloaded" }
+    const ok = await disposeNow(api)
+    if (ok) {
+      pending = undefined
+      return { kind: "reloaded" }
+    }
+    // Dispose failed (busy instance): hand it to the never-stop watcher.
+    pending = { since: Date.now(), active: 0 }
+    void startWatcher(api)
+    return { kind: "deferred", active: 0, detectionFailed: false }
   }
   pending = { since: Date.now(), active: ids?.length ?? 0 }
   void startWatcher(api)
   return { kind: "deferred", active: ids?.length ?? 0, detectionFailed: ids === undefined }
-}
-
-let timings = { studioHoldPoll: STUDIO_HOLD_POLL, failureRetry: FAILURE_RETRY }
-
-/** Test seam: shrink watcher sleep intervals so failure/hold paths are testable. */
-export function __testSetTimings(next: { studioHoldPoll?: number; failureRetry?: number }): void {
-  timings = { ...timings, ...next }
 }
 
 /** Test seam: injects/removes the pending state without side effects. */

@@ -1463,27 +1463,74 @@ function showAlert(ui: UI, props: { title: string; message: string }): Promise<v
   })
 }
 
-function showInfo(api: TuiPluginApi, props: { title: string; message: string }): Promise<void> {
+/** Optional in-dialog action button (rendered next to `ok`, red when danger). */
+type DialogAction = { title: string; value: string; danger?: boolean; key?: string }
+
+function showInfo(api: TuiPluginApi, props: { title: string; message: string; actions?: DialogAction[] }): Promise<string | undefined> {
   if (menuProbe) {
     menuProbe.onInfo?.(props.title, props.message)
-    return Promise.resolve()
+    return Promise.resolve(undefined)
   }
   return new Promise((resolve) => {
     let settled = false
-    const done = () => {
+    const done = (action?: string) => {
       if (settled) return
       settled = true
-      resolve()
+      resolve(action)
       api.ui.dialog.clear()
     }
     api.ui.dialog.replace(
-      () => <InfoDialog api={api} title={props.title} message={props.message} onDone={done} />,
-      done,
+      () => <InfoDialog api={api} title={props.title} message={props.message} actions={props.actions} onDone={done} />,
+      () => done(),
     )
   })
 }
 
-function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; onDone: () => void }) {
+function dialogActionBindings(
+  actions: DialogAction[] | undefined,
+  prefix: string,
+  onDone: (action?: string) => void,
+): { commands: { name: string; title: string; run: (ctx: KeyContext) => void }[]; bindings: { key: string; cmd: string; desc: string }[] } {
+  const commands: { name: string; title: string; run: (ctx: KeyContext) => void }[] = []
+  const bindings: { key: string; cmd: string; desc: string }[] = []
+  for (const [index, action] of (actions ?? []).entries()) {
+    if (!action.key) continue
+    const name = `${prefix}.action.${index}`
+    commands.push({ name, title: action.title, run: (ctx: KeyContext) => { blockKey(ctx); onDone(action.value) } })
+    bindings.push({ key: action.key, cmd: name, desc: action.title })
+  }
+  return { commands, bindings }
+}
+
+function DialogActionFooter(props: { actions: DialogAction[] | undefined; theme: () => { primary: RGBA; error: RGBA; accent: RGBA; background: RGBA; textMuted: RGBA }; onAction: (value: string) => void; onOk: () => void }) {
+  return (
+    <box flexDirection="row" justifyContent="space-between" width="100%">
+      <box flexDirection="row" gap={1}>
+        <For each={props.actions ?? []}>
+          {(action) => (
+            <Show when={action.key}>
+              <text fg={action.danger ? props.theme().error : props.theme().accent}>{`${action.key}: ${action.title}`}</text>
+            </Show>
+          )}
+        </For>
+      </box>
+      <box flexDirection="row" gap={1}>
+        <For each={props.actions ?? []}>
+          {(action) => (
+            <box paddingLeft={2} paddingRight={2} backgroundColor={action.danger ? props.theme().error : props.theme().primary} onMouseUp={() => props.onAction(action.value)}>
+              <text fg={props.theme().background}><b>{action.title}</b></text>
+            </box>
+          )}
+        </For>
+        <box paddingLeft={3} paddingRight={3} backgroundColor={props.theme().primary} onMouseUp={props.onOk}>
+          <text fg={props.theme().background}><b>ok</b></text>
+        </box>
+      </box>
+    </box>
+  )
+}
+
+function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; actions?: DialogAction[]; onDone: (action?: string) => void }) {
   const theme = () => props.api.theme.current
   useWizardDialogSize(props.api)
   useHidePromptCursor(props.api)
@@ -1495,6 +1542,7 @@ function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; 
   let scroll: ScrollBoxRenderable | undefined
   const page = () => Math.max(1, (scroll?.height ?? bodyHeight()) - 1)
   const commandPrefix = `config-studio.info.${Math.random().toString(36).slice(2)}`
+  const actionKeys = dialogActionBindings(props.actions, commandPrefix, props.onDone)
   const unregister = props.api.keymap.registerLayer({
     priority: 10000,
     commands: [
@@ -1506,6 +1554,7 @@ function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; 
       { name: `${commandPrefix}.home`, title: "Scroll top", run: (ctx: KeyContext) => { blockKey(ctx); scroll?.scrollTo(0) } },
       { name: `${commandPrefix}.end`, title: "Scroll bottom", run: (ctx: KeyContext) => { blockKey(ctx); scroll?.scrollTo(scroll.scrollHeight) } },
       { name: `${commandPrefix}.shield`, title: "Block background input", run: blockKey },
+      ...actionKeys.commands,
     ],
     bindings: [
       { key: "enter", cmd: `${commandPrefix}.close`, desc: "Close" },
@@ -1520,6 +1569,7 @@ function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; 
       { key: "ctrl+f", cmd: `${commandPrefix}.pageDown`, desc: "Page down" },
       { key: "home", cmd: `${commandPrefix}.home`, desc: "Scroll top" },
       { key: "end", cmd: `${commandPrefix}.end`, desc: "Scroll bottom" },
+      ...actionKeys.bindings,
       ...shieldBindings(`${commandPrefix}.shield`, ["home", "end"]),
     ],
   })
@@ -1532,19 +1582,14 @@ function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; 
     <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
       <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
         <text fg={isRestartRequired(props.title) ? theme().error : theme().accent}><b>{props.title}</b></text>
-        <text fg={theme().textMuted} onMouseUp={props.onDone}>esc</text>
+        <text fg={theme().textMuted} onMouseUp={() => props.onDone()}>esc</text>
       </box>
       <scrollbox maxHeight={bodyHeight()} ref={(element: ScrollBoxRenderable) => (scroll = element)}>
       <box flexDirection="column" gap={0}>
         {renderContentLines(lines(), theme)}
       </box>
       </scrollbox>
-      <box flexDirection="row" justifyContent="space-between" width="100%">
-        <text fg={theme().textMuted}>{visualRows() > bodyHeight() ? "up/down scroll" : ""}</text>
-        <box paddingLeft={3} paddingRight={3} backgroundColor={theme().primary} onMouseUp={props.onDone}>
-          <text fg={theme().background}><b>ok</b></text>
-        </box>
-      </box>
+      <DialogActionFooter actions={props.actions} theme={theme} onAction={(value) => props.onDone(value)} onOk={() => props.onDone()} />
     </box>
   )
 }
@@ -1575,22 +1620,22 @@ function showBusy(api: TuiPluginApi, title: string, work: Promise<void>): Promis
 
 export type PagedSection = { title: string; lines: string[] }
 
-function showPagedInfo(api: TuiPluginApi, props: { title: string; sections: PagedSection[] }): Promise<void> {
+function showPagedInfo(api: TuiPluginApi, props: { title: string; sections: PagedSection[]; actions?: DialogAction[] }): Promise<string | undefined> {
   if (menuProbe) {
     menuProbe.onPaged?.(props.title, props.sections)
-    return Promise.resolve()
+    return Promise.resolve(undefined)
   }
   return new Promise((resolve) => {
     let settled = false
-    const done = () => {
+    const done = (action?: string) => {
       if (settled) return
       settled = true
-      resolve()
+      resolve(action)
       api.ui.dialog.clear()
     }
     api.ui.dialog.replace(
-      () => <PagedDialog api={api} title={props.title} sections={props.sections} onDone={done} />,
-      done,
+      () => <PagedDialog api={api} title={props.title} sections={props.sections} actions={props.actions} onDone={done} />,
+      () => done(),
     )
   })
 }
@@ -1638,7 +1683,7 @@ function renderContentLines(lines: string[], theme: () => ThemePalette) {
   )
 }
 
-function PagedDialog(props: { api: TuiPluginApi; title: string; sections: PagedSection[]; onDone: () => void }) {
+function PagedDialog(props: { api: TuiPluginApi; title: string; sections: PagedSection[]; actions?: DialogAction[]; onDone: (action?: string) => void }) {
   const theme = () => props.api.theme.current
   useWizardDialogSize(props.api)
   useHidePromptCursor(props.api)
@@ -1694,6 +1739,7 @@ function PagedDialog(props: { api: TuiPluginApi; title: string; sections: PagedS
 
   const page = () => Math.max(1, (scroll?.height ?? height()) - 1)
   const commandPrefix = `config-studio.paged.${Math.random().toString(36).slice(2)}`
+  const pagedActionKeys = dialogActionBindings(props.actions, commandPrefix, props.onDone)
   const unregister = props.api.keymap.registerLayer({
     priority: 10000,
     commands: [
@@ -1715,6 +1761,7 @@ function PagedDialog(props: { api: TuiPluginApi; title: string; sections: PagedS
         },
       })),
       { name: `${commandPrefix}.shield`, title: "Block background input", run: blockKey },
+      ...pagedActionKeys.commands,
     ],
     bindings: [
       { key: "enter", cmd: `${commandPrefix}.close`, desc: "Close" },
@@ -1732,6 +1779,7 @@ function PagedDialog(props: { api: TuiPluginApi; title: string; sections: PagedS
       { key: "home", cmd: `${commandPrefix}.home`, desc: "Scroll top" },
       { key: "end", cmd: `${commandPrefix}.end`, desc: "Scroll bottom" },
       ...jumpKeys().map(({ key }) => ({ key, cmd: `${commandPrefix}.jump${key}`, desc: "Jump to section" })),
+      ...pagedActionKeys.bindings,
       ...shieldBindings(`${commandPrefix}.shield`, ["home", "end"]),
     ],
   })
@@ -1741,16 +1789,18 @@ function PagedDialog(props: { api: TuiPluginApi; title: string; sections: PagedS
   })
 
   const footerHint = createMemo(() => {
-    if (sections().length <= 1) return "up/down scroll"
-    const keys = jumpKeys().map(({ key, section }) => `${key}=${truncate(section.title, 12)}`).join("  ")
-    return [`p < ${current() + 1}/${sections().length} > n`, keys].filter(Boolean).join("   ")
+    const actionHints = (props.actions ?? [])
+      .filter((action) => action.key)
+      .map((action) => `${action.key}=${truncate(action.title, 20)}`)
+    const base = sections().length <= 1 ? "up/down scroll" : [`p < ${current() + 1}/${sections().length} > n`, jumpKeys().map(({ key, section }) => `${key}=${truncate(section.title, 12)}`).join("  ")].filter(Boolean).join("   ")
+    return [base, ...actionHints].filter(Boolean).join("   ")
   })
 
   return (
     <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
       <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
         <text fg={isRestartRequired(props.title) ? theme().error : theme().accent}><b>{props.title}</b></text>
-        <text fg={theme().textMuted} onMouseUp={props.onDone}>esc</text>
+        <text fg={theme().textMuted} onMouseUp={() => props.onDone()}>esc</text>
       </box>
       <scrollbox maxHeight={height()} ref={(element: ScrollBoxRenderable) => (scroll = element)}>
         <box flexDirection="column" gap={0}>
@@ -1773,8 +1823,17 @@ function PagedDialog(props: { api: TuiPluginApi; title: string; sections: PagedS
       </scrollbox>
       <box flexDirection="row" justifyContent="space-between" width="100%" marginTop={1}>
         <text fg={theme().textMuted}>{footerHint()}</text>
-        <box paddingLeft={3} paddingRight={3} backgroundColor={theme().primary} onMouseUp={props.onDone}>
-          <text fg={theme().background}><b>ok</b></text>
+        <box flexDirection="row" gap={1}>
+          <For each={props.actions ?? []}>
+            {(action) => (
+              <box paddingLeft={2} paddingRight={2} backgroundColor={action.danger ? theme().error : theme().primary} onMouseUp={() => props.onDone(action.value)}>
+                <text fg={theme().background}><b>{action.title}</b></text>
+              </box>
+            )}
+          </For>
+          <box paddingLeft={3} paddingRight={3} backgroundColor={theme().primary} onMouseUp={() => props.onDone()}>
+            <text fg={theme().background}><b>ok</b></text>
+          </box>
         </box>
       </box>
     </box>
@@ -2924,11 +2983,21 @@ async function confirmForceReload(api: TuiPluginApi): Promise<boolean> {
 
 /** Main-menu entry for a deferred reload: force (with warning) or cancel the auto-reload. */
 async function reloadPendingMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
-  const active = await fetchActiveSessions(api)
-  const count = active?.length ?? pendingReload()?.active ?? 0
+  const running = await fetchRunningSessions(api)
+  const count = running?.length ?? pendingReload()?.active ?? 0
+  const detailRows: WizardSelectOption<string>[] = []
+  if (running && running.length > 0) {
+    detailRows.push({ title: `─ ${count} session(s) running ${"─".repeat(30)}`, value: "__detail_head__", description: "", divider: true })
+    for (const line of describeRunningSessions(running)) detailRows.push({ title: line.trim(), value: `__detail_${detailRows.length}`, description: "", divider: true })
+  } else if (running !== undefined) {
+    detailRows.push({ title: `─ no running sessions detected ${"─".repeat(26)}`, value: "__detail_head__", description: "", divider: true })
+  } else {
+    detailRows.push({ title: `─ could not verify running sessions ${"─".repeat(22)}`, value: "__detail_head__", description: "", divider: true })
+  }
   const picked = await showMenu(api, {
     title: "Config reload pending",
     options: [
+      ...detailRows,
       { title: `Reload NOW - interrupts ${count} running session(s)`, value: "force", description: "red button - stops in-progress work", danger: true, help: "Forces the deferred config reload immediately. Running sessions are interrupted." },
       { title: "Cancel auto-reload", value: "cancel", description: "keep the saved config on disk, never apply it automatically", help: "Drops the pending reload. The saved files stay on disk but are NOT applied until the next manual reload or OpenCode restart." },
       { title: "< Back", value: "__back__", description: "keep waiting" },
@@ -2937,7 +3006,7 @@ async function reloadPendingMenu(api: TuiPluginApi, state: StudioState): Promise
   if (picked === "force") {
     if (await confirmForceReload(api)) {
       const ok = await reloadNow(api)
-      api.ui.toast({ variant: ok ? "success" : "warning", title: ok ? "Config reloaded" : "Reload failed", message: ok ? "OpenCode config disposed and rebuilt." : "global.dispose unavailable - restart OpenCode to apply." })
+      api.ui.toast({ variant: ok ? "success" : "warning", title: ok ? "Config reloaded" : "Reload failed", message: ok ? "OpenCode config disposed and rebuilt." : "Config reload failed - the watcher keeps retrying." })
     }
     return mainMenu(api, state)
   }
@@ -2990,55 +3059,62 @@ async function saveAndExit(api: TuiPluginApi, state: StudioState): Promise<void>
   const activeNow = await fetchActiveSessions(api)
   const deferred = activeNow === undefined || activeNow.length > 0
   const deferredCount = activeNow?.length ?? 0
+  const runningSessions = deferred ? await fetchRunningSessions(api) : undefined
+  const sessionLines =
+    runningSessions === undefined
+      ? []
+      : runningSessions.length === 0
+        ? []
+        : ["Running sessions:", ...describeRunningSessions(runningSessions)]
   const reloadLine = deferred
-    ? `Config reload DEFERRED - ${activeNow === undefined ? "could not verify" : `${deferredCount} session(s) running`}. It applies automatically once they finish, or reload now below.`
+    ? `Config reload DEFERRED - ${activeNow === undefined ? "could not verify" : `${deferredCount} session(s) running`}. It applies automatically once they finish; press r below to apply now.`
     : "OpenCode config reloads now; running sessions keep their previous settings."
   api.ui.toast({ variant: uniqueReasons.length > 0 ? "warning" : "success", title: "Config saved", message: uniqueReasons.length > 0 ? "Restart OpenCode to apply task-list/UI changes." : deferred ? "Reload deferred until sessions finish." : "All changes written." })
   // Summary dialog BEFORE the config reload: dispose reloads plugins and
-  // would tear this dialog down mid-display otherwise.
-  if (uniqueReasons.length > 0) {
-    await showPagedInfo(api, {
-      title: "Saved - restart required",
-      sections: [
-        {
-          title: "Restart",
-          lines: [
-            `Wrote staged changes to ${result.saved} file(s) plus ${moduleSummaries.length} module change(s).`,
-            "",
-            "RESTART REQUIRED for these changes:",
-            ...uniqueReasons.map((reason) => `  - ${reason}`),
-            "",
-            reloadLine,
-          ],
-        },
-      ],
-    })
-  } else {
-    await showInfo(api, {
-      title: "Saved",
-      message: [
-        `Wrote staged changes to ${result.saved} file(s) plus ${moduleSummaries.length} module change(s).`,
-        "",
-        reloadLine,
-        "Restart OpenCode if anything looks stale.",
-      ].join("\n"),
-    })
-  }
-  const reloadResult = await requestReload(api)
-  if (reloadResult.kind === "deferred") {
-    // Red shortcut right after the save: force the reload before the studio closes.
-    const picked = await showMenu(api, {
-      title: "Reload deferred",
-      options: [
-        { title: `Reload NOW - interrupts ${reloadResult.detectionFailed ? "unknown" : reloadResult.active} running session(s)`, value: "force", description: "apply the saved config immediately", danger: true, help: "Applies the saved config now. Running sessions are interrupted - a confirmation with session details follows." },
-        { title: "Keep waiting", value: "wait", description: "auto-reloads when all sessions finish" },
-      ],
-    })
-    if (picked === "force" && (await confirmForceReload(api))) {
+  // would tear this dialog down mid-display otherwise. The deferred case
+  // carries the red in-dialog Reload NOW action (r key or click) instead of a
+  // follow-up menu.
+  const reloadAction: DialogAction[] | undefined = deferred
+    ? [{ title: `Reload NOW (${deferredCount === 0 ? "unverified" : `${deferredCount} session(s)`})`, value: "reload-now", danger: true, key: "r" }]
+    : undefined
+  const dialogAction: string | undefined = uniqueReasons.length > 0
+    ? await showPagedInfo(api, {
+        title: "Saved - restart required",
+        sections: [
+          {
+            title: "Restart",
+            lines: [
+              `Wrote staged changes to ${result.saved} file(s) plus ${moduleSummaries.length} module change(s).`,
+              "",
+              "RESTART REQUIRED for these changes:",
+              ...uniqueReasons.map((reason) => `  - ${reason}`),
+              "",
+              reloadLine,
+              ...sessionLines,
+            ],
+          },
+        ],
+        actions: reloadAction,
+      })
+    : await showInfo(api, {
+        title: "Saved",
+        message: [
+          `Wrote staged changes to ${result.saved} file(s) plus ${moduleSummaries.length} module change(s).`,
+          "",
+          reloadLine,
+          ...sessionLines,
+          "Restart OpenCode if anything looks stale.",
+        ].join("\n"),
+        actions: reloadAction,
+      })
+  if (dialogAction === "reload-now") {
+    if (await confirmForceReload(api)) {
       const ok = await reloadNow(api)
-      api.ui.toast({ variant: ok ? "success" : "warning", title: ok ? "Config reloaded" : "Reload failed", message: ok ? "OpenCode config disposed and rebuilt." : "global.dispose unavailable - restart OpenCode to apply." })
+      api.ui.toast({ variant: ok ? "success" : "warning", title: ok ? "Config reloaded" : "Reload failed", message: ok ? "OpenCode config disposed and rebuilt." : "Config reload failed - the watcher keeps retrying." })
+      return
     }
   }
+  await requestReload(api)
 }
 
 function overviewText(): string {
@@ -4521,7 +4597,7 @@ async function uiScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
   if (picked === "reload-now") {
     if (await confirmForceReload(api)) {
       const ok = await reloadNow(api)
-      api.ui.toast({ variant: ok ? "success" : "warning", title: ok ? "Config reloaded" : "Reload failed", message: ok ? "OpenCode config disposed and rebuilt." : "global.dispose unavailable - restart OpenCode to apply." })
+      api.ui.toast({ variant: ok ? "success" : "warning", title: ok ? "Config reloaded" : "Reload failed", message: ok ? "OpenCode config disposed and rebuilt." : "Config reload failed - the watcher keeps retrying." })
     }
     return uiScreen(api, state)
   }

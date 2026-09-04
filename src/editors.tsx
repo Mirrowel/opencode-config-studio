@@ -35,7 +35,7 @@ export interface EditorKit {
   showPrompt: (props: { title: string; description?: string; placeholder?: string; value?: string }) => Promise<string | undefined>
   showConfirm: (props: { title: string; message: string; confirmLabel?: string }) => Promise<boolean>
   showAlert: (props: { title: string; message: string }) => Promise<void>
-  showInfo: (props: { title: string; message: string }) => Promise<void>
+  showInfo: (props: { title: string; message: string }) => Promise<string | undefined>
   showJSONEditor: (title: string, value: unknown) => Promise<Record<string, unknown> | undefined | "__delete__">
   pickModel: (title: string) => Promise<{ providerID: string; modelID: string } | undefined>
   stage: (ops: EditOp[], reason: string) => Promise<boolean>

@@ -929,8 +929,8 @@ async function testDeferredReload() {
   // dispose() { return this._client.post(...) }). The fakes mirror that: every
   // method reads `this._store`, so a detached call throws - proving the
   // coordinator never detaches methods from their namespace object.
-  function fakeReloadApi({ active, statusMap, sessions = {}, waitControl = false, disposeNamespace = "global", surface = "active" } = {}) {
-    const store = { disposed: 0, toasts: [], activeMap: active, statusMap, waitResolvers: [] }
+  function fakeReloadApi({ active, statusMap, sessions = {}, waitControl = false, disposeNamespace = "global", surface = "active", disposeFails = 0 } = {}) {
+    const store = { disposed: 0, toasts: [], activeMap: active, statusMap, waitResolvers: [], disposeFails }
     class FakeSession {
       async status() {
         if (store.statusMap === "fail") throw new Error("unreachable")
@@ -955,6 +955,10 @@ async function testDeferredReload() {
     const sessionInstance = surface === "status" ? new FakeSession() : new FakeSessionWithActive()
     class FakeDispose {
       async dispose() {
+        if (store.disposeFails > 0) {
+          store.disposeFails--
+          throw new Error("instance busy")
+        }
         store.disposed++
         return { data: undefined }
       }
@@ -978,7 +982,7 @@ async function testDeferredReload() {
 
   // Idle: reload happens immediately.
   reload.__testReset()
-  reload.__testSetTimings({ studioHoldPoll: 5, failureRetry: 5 })
+  reload.__testSetTimings({ studioHoldPoll: 5, failureBase: 5, failureMax: 10 })
   {
     const { api, state } = fakeReloadApi({ active: {} })
     const result = await reload.requestReload(api)
@@ -1017,6 +1021,33 @@ async function testDeferredReload() {
     assert(state.disposed === 1, "reloads only when every session finished")
   }
 
+  // Dispose failure on the immediate path: hands off to the never-stop
+  // watcher, which retries (warning once) and eventually applies.
+  {
+    const { api, state } = fakeReloadApi({ active: {}, disposeFails: 2 })
+    const result = await reload.requestReload(api)
+    assert(result.kind === "deferred", "failed immediate dispose defers to the watcher")
+    assert(state.disposed === 0, "nothing applied on the failed attempt")
+    await tick(40)
+    assert(state.disposed === 1, "watcher retried the dispose and applied")
+    assert(reload.pendingReload() === undefined, "pending cleared once applied")
+    const warnings = state.toasts.filter((toast) => String(toast.variant) === "warning")
+    const successes = state.toasts.filter((toast) => String(toast.message).includes("reloaded"))
+    assert(warnings.length === 1, "exactly one retry warning toast")
+    assert(successes.length === 1, "one success toast after applying")
+  }
+
+  // Detection failure recovers: the watcher retries forever, then applies.
+  {
+    const { api, state } = fakeReloadApi({ surface: "status", statusMap: "fail" })
+    const result = await reload.requestReload(api)
+    assert(result.kind === "deferred" && result.detectionFailed === true, "detection failure defers")
+    state.statusMap = {}
+    await tick(40)
+    assert(state.disposed === 1, "watcher applied the reload after detection recovered")
+    assert(reload.pendingReload() === undefined, "pending cleared after recovery")
+  }
+
   // Older host clients lack session.active(): fall back to session.status()
   // (idle/retry/busy map) - busy and retry count as running, idle does not.
   {
@@ -1032,11 +1063,13 @@ async function testDeferredReload() {
     assert(result.kind === "reloaded" && state.disposed === 1, "instance.dispose namespace works")
   }
 
-  // No dispose surface at all: best-effort (reported reloaded, nothing thrown).
+  // No dispose surface at all: defers to the watcher (never silently drops).
   {
     const { api, state } = fakeReloadApi({ active: {}, disposeNamespace: null })
     const result = await reload.requestReload(api)
-    assert(result.kind === "reloaded" && state.disposed === 0, "missing dispose surface degrades gracefully")
+    assert(result.kind === "deferred" && state.disposed === 0, "missing dispose surface defers instead of claiming success")
+    assert(reload.pendingReload() !== undefined, "pending state kept while dispose is impossible")
+    reload.cancelPendingReload()
   }
 
   // Detection failure (no usable session surface): defers - never interrupts
@@ -1044,7 +1077,7 @@ async function testDeferredReload() {
   {
     const { api, state } = fakeReloadApi({ surface: "status", statusMap: "fail" })
     const result = await reload.requestReload(api)
-    assert(result.kind === "deferred" && result.detectionFailed === true, "detection failure defers")
+    assert(result.kind === "deferred" && result.detectionFailed === true, "status-surface detection failure defers")
     assert(state.disposed === 0, "no dispose when detection fails")
     reload.cancelPendingReload()
   }
@@ -1055,7 +1088,7 @@ async function testDeferredReload() {
       // A prior block left an immortal watcher (its fake wait never settles
       // after that block's assertions); reset so this scenario starts clean.
       reload.__testReset()
-      reload.__testSetTimings({ studioHoldPoll: 5, failureRetry: 5 })
+      reload.__testSetTimings({ studioHoldPoll: 5, failureBase: 5, failureMax: 10 })
     }
     const { api, state } = fakeReloadApi({ active: { ses_a: { type: "running" } } })
     reload.beginStudioFlow()
@@ -1110,7 +1143,7 @@ async function testDeferredReload() {
   }
 
   reload.__testReset()
-  reload.__testSetTimings({ studioHoldPoll: 5000, failureRetry: 10000 })
+  reload.__testSetTimings({ studioHoldPoll: 5000, failureBase: 5000, failureMax: 30000 })
 }
 
 await testDeferredReload()
