@@ -180,7 +180,9 @@ function makeApi(globalDir) {
   return {
     state: {
       path: { config: globalDir, directory: globalDir, worktree: globalDir },
-      config: {},
+      // Runtime-contributed MCP server (plugin config() hook pattern, e.g.
+      // closedrouter): no file entry; bogus port so probes fail instantly.
+      config: { mcp: { rtprobe: { type: "remote", url: "http://127.0.0.1:9/mcp", headers: { Authorization: "Bearer x" } } } },
       provider: [],
     },
     kv: { get: () => undefined, set: () => {} },

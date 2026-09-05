@@ -456,12 +456,25 @@ export function mcpProbeSnapshot(): Record<string, McpProbeResult> {
   return out
 }
 
+/** Number of probes currently in flight (incl. shared/auto ones). */
+export function probeInflightCount(): number {
+  return inflight.size
+}
+
+/** Resolves when every in-flight probe settles (or the cap elapses). */
+export async function waitForProbes(capMs = 15_000): Promise<void> {
+  const deadline = Date.now() + capMs
+  while (inflight.size > 0 && Date.now() < deadline) {
+    await Promise.race([...inflight.values()].map((work) => work.catch(() => undefined)))
+  }
+}
+
 /**
  * Auto-probes every enabled server (config enabled !== false and runtime
  * status not disabled). Concurrency-capped; failures are cached with their
  * error so the UI can show "unknown" instead of a wrong 0.
  */
-export async function autoProbeEnabledServers(api: TuiPluginApi | undefined, mcpConfig: Record<string, unknown> | undefined, statuses: Record<string, { status?: unknown }> | undefined): Promise<void> {
+export async function autoProbeEnabledServers(api: TuiPluginApi | undefined, mcpConfig: Record<string, unknown> | undefined, statuses: Record<string, { status?: unknown }> | undefined, options?: { force?: boolean }): Promise<void> {
   const targets: Array<[string, McpConfigEntry]> = []
   for (const [name, entry] of Object.entries(mcpConfig ?? {})) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue
@@ -476,7 +489,7 @@ export async function autoProbeEnabledServers(api: TuiPluginApi | undefined, mcp
     while (queue.length > 0) {
       const next = queue.shift()
       if (!next) break
-      await getMcpProbe(api, next[0], next[1]).catch(() => undefined)
+      await getMcpProbe(api, next[0], next[1], options?.force ? { force: true } : undefined).catch(() => undefined)
     }
   })
   await Promise.all(workers)

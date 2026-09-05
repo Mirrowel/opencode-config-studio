@@ -255,6 +255,62 @@ export async function getToolBundle(api: TuiPluginApi, modelRef: string | undefi
 }
 
 // ---------------------------------------------------------------------------
+// File/runtime MCP source union (runtime entries are contributed by plugin
+// config() hooks or OPENCODE_CONFIG and are invisible in config files)
+// ---------------------------------------------------------------------------
+
+export type McpSourceRow = {
+  name: string
+  /** Merged-file entry (from discovered config layers), when present. */
+  file: Record<string, unknown> | undefined
+  /** Runtime entry from api.state.config.mcp, when present. */
+  runtime: Record<string, unknown> | undefined
+  status: McpStatusLike | undefined
+  /** Entry used for probing: file entry with a server type wins, else runtime. */
+  effective: Record<string, unknown> | undefined
+  /** "file" = editable config entry; "runtime" = plugin/env contributed; "overlay" = partial file entry. */
+  kind: "file" | "runtime" | "overlay"
+  runtimeOnly: boolean
+}
+
+function hasServerType(entry: Record<string, unknown> | undefined): boolean {
+  return entry?.["type"] === "local" || entry?.["type"] === "remote"
+}
+
+/**
+ * Unions file config, runtime config, and runtime status keys into rows.
+ * File entries own editing; runtime entries own probe data for
+ * runtime-contributed servers (e.g. plugins registering MCP via config()).
+ */
+export function mergeMcpSources(
+  fileMcp: Record<string, unknown> | undefined,
+  runtimeMcp: Record<string, unknown> | undefined,
+  statusKeys: string[] | undefined,
+): McpSourceRow[] {
+  const names = new Set<string>([...Object.keys(fileMcp ?? {}), ...Object.keys(runtimeMcp ?? {}), ...(statusKeys ?? [])])
+  const rows: McpSourceRow[] = []
+  for (const name of [...names].sort((a, b) => a.localeCompare(b))) {
+    const file = fileMcp?.[name]
+    const runtime = runtimeMcp?.[name]
+    const fileEntry = file && typeof file === "object" && !Array.isArray(file) ? (file as Record<string, unknown>) : undefined
+    const runtimeEntry = runtime && typeof runtime === "object" && !Array.isArray(runtime) ? (runtime as Record<string, unknown>) : undefined
+    const kind: McpSourceRow["kind"] = fileEntry === undefined ? "runtime" : hasServerType(fileEntry) ? "file" : "overlay"
+    const effective = hasServerType(fileEntry) ? fileEntry : hasServerType(runtimeEntry) ? runtimeEntry : undefined
+    rows.push({ name, file: fileEntry, runtime: runtimeEntry, status: undefined, effective, kind, runtimeOnly: fileEntry === undefined })
+  }
+  return rows
+}
+
+/** Renders a headers map with values masked (`Authorization: (set)`). */
+export function maskSecretHeaders(entry: Record<string, unknown> | undefined): string {
+  const headers = entry?.["headers"]
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) return "(not set)"
+  const keys = Object.keys(headers as Record<string, unknown>)
+  if (keys.length === 0) return "(empty)"
+  return keys.map((key) => `${key}: (set)`).join(", ")
+}
+
+// ---------------------------------------------------------------------------
 // Parameter schema rendering
 // ---------------------------------------------------------------------------
 

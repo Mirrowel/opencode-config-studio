@@ -984,6 +984,25 @@ async function testToolGrouping() {
   assert(fp({ type: "local", command: ["a"] }) !== fp({ type: "local", command: ["b"] }), "fingerprint changes with config")
   assert(fp({ type: "remote", url: "u" }) !== fp({ type: "remote", url: "u", headers: { Authorization: "x" } }), "headers change invalidates")
 
+  // File/runtime MCP union: runtime-contributed servers (plugin config()
+  // hooks) merge with file entries; file wins for editing, runtime fills gaps.
+  const { mergeMcpSources, maskSecretHeaders } = toollist
+  const rows = mergeMcpSources(
+    { filesrv: { type: "remote", url: "http://file" }, overlayonly: { enabled: false } },
+    { filesrv: { type: "remote", url: "http://runtime" }, closedrouter: { type: "remote", url: "https://router/mcp", headers: { Authorization: "Bearer secret" } } },
+    ["ghoststatus"],
+  )
+  const byName = Object.fromEntries(rows.map((row) => [row.name, row]))
+  assert(rows.length === 4, "union covers file + runtime + status keys")
+  assert(byName.filesrv.kind === "file" && byName.filesrv.effective?.url === "http://file", "file entry with server type wins for probing")
+  assert(byName.filesrv.runtime?.url === "http://runtime", "runtime entry preserved alongside file")
+  assert(byName.closedrouter.kind === "runtime" && byName.closedrouter.runtimeOnly, "runtime-only server flagged (closedrouter case)")
+  assert(byName.closedrouter.effective?.url === "https://router/mcp", "runtime-only server still probeable via runtime entry")
+  assert(byName.overlayonly.kind === "overlay" && byName.overlayonly.effective === undefined, "partial file entry stays an overlay, not probeable")
+  assert(byName.ghoststatus.kind === "runtime" && byName.ghoststatus.effective === undefined, "status-only ghost listed but not probeable")
+  assert(maskSecretHeaders(byName.closedrouter.runtime) === "Authorization: (set)", "header values masked to (set)")
+  assert(maskSecretHeaders(undefined) === "(not set)", "missing headers labeled")
+
   // Parameter schema rendering.
   const lines = describeToolParameters({ type: "object", description: "Query docs", required: ["library"], properties: { library: { type: "string", description: "Library name" }, depth: { type: "number", enum: [1, 2] } } })
   assert(lines.some((line) => line.includes("Query docs")), "schema description included")

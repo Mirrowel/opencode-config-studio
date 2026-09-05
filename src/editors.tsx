@@ -28,7 +28,7 @@ import {
 } from "./keymeta.js"
 import type { EditOp, JSONPath } from "./jsonc.js"
 import type { StudioState, WizardSelectOption } from "./tui.js"
-import { toolInfoText, mcpStatusLabel } from "./toollist.js"
+import { toolInfoText, mcpStatusLabel, maskSecretHeaders } from "./toollist.js"
 
 export interface EditorKit {
   state: StudioState
@@ -64,6 +64,14 @@ export interface EditorKit {
   mcpProbe?: (name: string, force?: boolean) => Promise<import("./mcpprobe.js").McpProbeResult | undefined>
   /** Kick the enabled-servers auto-probe (fire-and-forget). */
   mcpAutoProbe?: () => void
+  /** Drop tool caches + force re-probe of all enabled MCP servers. */
+  mcpRefresh?: () => Promise<void>
+  /** Load-gate: self-closing dialog while tool probes are in flight. */
+  mcpWaitReady?: (title: string) => Promise<void>
+  /** Runtime MCP map (plugin config() contributions). */
+  mcpRuntimeMcp?: () => Record<string, unknown> | undefined
+  /** Effective MCP rows: file ∪ runtime ∪ status keys. */
+  mcpEffectiveRows?: () => import("./toollist.js").McpSourceRow[]
 }
 
 function preview(value: unknown, max = 46): string {
@@ -614,6 +622,8 @@ function rootSpecToFieldSpec(meta: RootKeyMeta): ObjectFieldSpec {
 // ---------------------------------------------------------------------------
 
 export async function permissionEditor(kit: EditorKit, props: { title: string; pointer: JSONPath; doc: string }): Promise<void> {
+  const isRootPermission = props.pointer.length === 1 && props.pointer[0] === "permission"
+  if (isRootPermission) await kit.mcpWaitReady?.(props.title)
   while (true) {
     const current = kit.valueAt(props.pointer)
     const map = isPlainObject(current) ? current : {}
@@ -624,10 +634,11 @@ export async function permissionEditor(kit: EditorKit, props: { title: string; p
     } else {
       options.push({ title: "Shorthand (all tools)", value: "__shorthand__", description: map["*"] !== undefined ? `* = ${preview(map["*"])}` : "(not set)" })
     }
+    options.push({ title: "Re-fetch tool lists", value: "__refetch_tools__", description: "drop caches - re-fetch registry tools + all enabled MCPs" })
 
-    // Live inventory: every tool grouped by source (built-in + each MCP
-    // server individually). Falls back to the flat known-keys list when the
-    // tool API is unavailable.
+    // Live inventory: every tool grouped by source (built-in + plugin tools +
+    // each probed MCP server). Falls back to the flat known-keys list when
+    // the tool API is unavailable.
     const bundle = kit.tools ? await kit.tools() : undefined
     const covered = new Set<string>()
     if (bundle && bundle.groups.length > 0) {
@@ -659,8 +670,13 @@ export async function permissionEditor(kit: EditorKit, props: { title: string; p
     options.push({ title: "i How matching works", value: "__help__", description: "" })
     options.push({ title: "< Back", value: "__back__", description: "" })
 
-    const picked = await kit.showMenu({ title: props.title, options })
+    const picked = await kit.showMenu({ title: props.title, options, pinId: isRootPermission ? "settings:Tools & files:permission" : undefined })
     if (!picked || picked === "__back__") return
+
+    if (picked === "__refetch_tools__") {
+      await kit.mcpRefresh?.()
+      continue
+    }
 
     if (picked === "__shorthand__") {
       const action = await kit.showMenu({
@@ -863,95 +879,101 @@ async function patternRuleEditor(kit: EditorKit, pointer: JSONPath, tool: string
 
 export async function mcpScreen(kit: EditorKit): Promise<void> {
   kit.mcpAutoProbe?.()
+  await kit.mcpWaitReady?.("MCP servers")
   while (true) {
-    const mcp = kit.valueAt(["mcp"])
-    const map = isPlainObject(mcp) ? mcp : {}
     const bundle = kit.tools ? await kit.tools() : undefined
     const probes = kit.mcpProbes?.() ?? {}
+    const rows = kit.mcpEffectiveRows?.() ?? []
     const options: WizardSelectOption<string>[] = []
-    const names = new Set<string>(Object.keys(map))
-    for (const id of bundle?.serverIds ?? []) names.add(id)
-    const sorted = [...names].sort((a, b) => a.localeCompare(b))
-    let pendingProbes = 0
-    for (const name of sorted) {
-      const entry = map[name]
-      const object = isPlainObject(entry) ? entry : {}
+    for (const row of rows) {
+      const object = row.effective ?? {}
+      const fileObject = row.file ?? {}
       const type = object["type"] === "remote" ? "remote" : object["type"] === "local" ? "local" : "overlay"
       const enabled = object["enabled"] === false ? "disabled" : "enabled"
       const typeHelp = type === "local" ? "Local stdio server: command + args array." : type === "remote" ? "Remote HTTP server." : "Partial entry (usually an enabled:false overlay of a lower layer)."
-      const detail = type === "local"
-        ? Array.isArray(object["command"]) ? `command: ${object["command"].join(" ")}` : "command: (unset)"
-        : type === "remote"
-          ? typeof object["url"] === "string" ? `url: ${object["url"]}` : "url: (unset)"
-          : Object.keys(object).length > 0 ? `keys: ${Object.keys(object).join(", ")}` : "empty"
-      const probe = probes[name]
-      const probeable = type === "local" || type === "remote"
-      // Counts come from the direct probe: cached number, "unknown" on
-      // failure, "-" while unprobed (disabled servers probe on open).
+      const sourceTag = row.runtimeOnly ? "runtime" : kit.sourceLabel(["mcp", row.name])
+      const detail =
+        row.runtimeOnly
+          ? type === "remote"
+            ? `url: ${typeof object["url"] === "string" ? object["url"] : "(unset)"}`
+            : `command: ${Array.isArray(object["command"]) ? (object["command"] as unknown[]).slice(0, 3).join(" ") : "(unset)"}`
+          : type === "local"
+            ? Array.isArray(fileObject["command"]) ? `command: ${fileObject["command"].join(" ")}` : "command: (unset)"
+            : type === "remote"
+              ? typeof fileObject["url"] === "string" ? `url: ${fileObject["url"]}` : "url: (unset)"
+              : Object.keys(fileObject).length > 0 ? `keys: ${Object.keys(fileObject).join(", ")}` : "empty"
+      const probe = probes[row.name]
+      const probeable = row.effective !== undefined
       const toolLabel = !probeable
         ? "-"
         : probe === undefined
-          ? (pendingProbes++, "-")
+          ? "-"
           : probe.status === "ok"
             ? String(probe.tools.length)
             : probe.status === "auth"
               ? "auth"
               : "unknown"
-      const status = mcpStatusLabel(bundle?.statuses?.[name])
+      const status = mcpStatusLabel(bundle?.statuses?.[row.name])
       const statusNote = bundle?.statuses === undefined ? "" : ` - ${status.label}`
       const statusHelp = [
         `Runtime status: ${bundle?.statuses === undefined ? "unavailable (older OpenCode)" : status.label}`,
         ...(status.error ? ["", `Error: ${status.error}`] : []),
-        ...(status.kind === "auth" ? ["", `Authenticate with: opencode mcp auth ${name}`] : []),
+        ...(status.kind === "auth" ? ["", `Authenticate with: opencode mcp auth ${row.name}`] : []),
       ]
       const probeHelp = probe === undefined
-        ? ["", "Tool list: not probed yet (disabled servers probe when opened; use Fetch all tool lists to probe everything)."]
+        ? ["", "Tool list: not probed yet (disabled servers probe when opened; use Re-fetch tool lists to probe everything)."]
         : probe.status === "ok"
           ? ["", `Tool list: ${probe.tools.length} tool(s) probed directly from the server${probe.serverName ? ` (${probe.serverName}${probe.serverVersion ? ` ${probe.serverVersion}` : ""})` : ""}.`]
           : probe.status === "auth"
             ? ["", "Tool list: server requires authentication - cannot probe from the studio.", ...(probe.hint ? [`WWW-Authenticate: ${probe.hint}`] : [])]
             : ["", `Tool list probe failed: ${probe.error}`]
       options.push({
-        title: name,
-        value: `server:${name}`,
-        description: `[${type}] ${enabled} - ${toolLabel} tool(s)${statusNote} (${kit.sourceLabel(["mcp", name])})`,
+        title: row.name,
+        value: `server:${row.name}`,
+        description: `[${type}] ${enabled} - ${toolLabel} tool(s)${statusNote} (${sourceTag})`,
         edited: true,
         danger: status.kind === "failed",
         help: [
-          `MCP server "${name}"`,
+          `MCP server "${row.name}"`,
           typeHelp,
           "",
           detail,
+          ...(row.runtimeOnly
+            ? [
+                "This server has NO config-file entry - it is contributed at runtime by a plugin's config() hook or OPENCODE_CONFIG.",
+                `Headers: ${maskSecretHeaders(row.runtime)}`,
+              ]
+            : []),
           `Tools registered: ${toolLabel}${probe?.status === "ok" ? "" : " (direct protocol probe)"}`,
           ...statusHelp,
           ...probeHelp,
-          `Source: ${kit.sourceLabel(["mcp", name])}`,
+          ...(row.runtimeOnly ? [`Config source: runtime only (read-only here)`] : [`Source: ${kit.sourceLabel(["mcp", row.name])}`]),
           "",
           "Restart-required: MCP servers connect at OpenCode startup; changes apply after a config reload or restart.",
         ].join("\n"),
       })
     }
-    options.push({ title: "Fetch all tool lists", value: "__fetch_all__", description: "probe every server directly (incl. disabled)" })
+    options.push({ title: "Re-fetch tool lists", value: "__fetch_all__", description: "force re-probe every server (incl. disabled)" })
     options.push({ title: "+ Add local server", value: "add-local", description: "stdio command" })
     options.push({ title: "+ Add remote server", value: "add-remote", description: "HTTP endpoint" })
-    options.push({ title: "< Back", value: "__back__", description: sorted.length === 0 ? "(no servers configured)" : pendingProbes > 0 ? `(${pendingProbes} server(s) not probed yet)` : "" })
+    options.push({ title: "< Back", value: "__back__", description: rows.length === 0 ? "(no servers configured)" : "" })
 
-    const picked = await kit.showMenu({ title: "MCP servers", options })
+    const picked = await kit.showMenu({ title: "MCP servers", options, pinId: "settings:Tools & files:mcp" })
     if (!picked || picked === "__back__") return
 
     if (picked === "__fetch_all__") {
-      const entries = sorted
-        .map((name) => ({ name, entry: map[name] }))
-        .filter((item) => isPlainObject(item.entry) && (item.entry["type"] === "local" || item.entry["type"] === "remote"))
-      for (const item of entries) {
-        await kit.mcpProbe?.(item.name, true)
+      const entries = rows.filter((row) => row.effective !== undefined)
+      for (const row of entries) {
+        await kit.mcpProbe?.(row.name, true)
       }
       continue
     }
 
     if (picked === "add-local" || picked === "add-remote") {
+      const mcp = kit.valueAt(["mcp"])
+      const fileMap = isPlainObject(mcp) ? mcp : {}
       const name = await kit.showPrompt({ title: "Server name", placeholder: "e.g. github" })
-      if (name === undefined || name.trim() === "" || map[name.trim()] !== undefined) continue
+      if (name === undefined || name.trim() === "" || fileMap[name.trim()] !== undefined) continue
       const pointer: JSONPath = ["mcp", name.trim()]
       if (picked === "add-local") {
         const command = await kit.showPrompt({ title: "Command", placeholder: "e.g. npx -y @modelcontextprotocol/server-github", description: "Tokens are split on spaces into the command array (edit precisely after creation)." })
@@ -1025,7 +1047,82 @@ async function ensureProbe(kit: EditorKit, name: string): Promise<import("./mcpp
   return await kit.mcpProbe?.(name)
 }
 
+/** Read-only view for runtime-contributed servers (no file entry to edit). */
+async function mcpRuntimeEntryScreen(kit: EditorKit, name: string): Promise<void> {
+  while (true) {
+    const row = kit.mcpEffectiveRows?.().find((item) => item.name === name)
+    const object = row?.runtime ?? {}
+    const type = object["type"] === "remote" ? "remote" : "local"
+    const probe = await ensureProbe(kit, name)
+    const toolCount = probe?.status === "ok" ? probe.tools.length : undefined
+    const bundle = kit.tools ? await kit.tools() : undefined
+    const status = mcpStatusLabel(bundle?.statuses?.[name])
+    const picked = await kit.showMenu({
+      title: `MCP ${name} (${type}, runtime)`,
+      options: [
+        {
+          title: `Status: ${bundle?.statuses === undefined ? "(unavailable)" : status.label}`,
+          value: "__status__",
+          description: status.error ? status.error.slice(0, 46) : "runtime connection state",
+          danger: status.kind === "failed",
+          help: [
+            `Runtime status for MCP server "${name}"`,
+            `State: ${bundle?.statuses === undefined ? "unavailable (older OpenCode)" : status.label}`,
+            ...(status.error ? ["", `Error: ${status.error}`] : []),
+            "",
+            "Status reflects the live connection; this entry cannot be edited here.",
+          ].join("\n"),
+        },
+        {
+          title: `Tools (${toolCount === undefined ? "-" : toolCount})`,
+          value: "__tools__",
+          description: toolCount === undefined ? "(not probed / probe failed)" : "model-visible ids - allow/deny individually",
+          help: `Tools registered by MCP server "${name}". Permission rules are root-level and fully editable.`,
+        },
+        {
+          title: type === "remote" ? `URL: ${typeof object["url"] === "string" ? object["url"] : "(unset)"}` : "Command (runtime)",
+          value: "__field__",
+          description: type === "remote" ? "remote endpoint" : Array.isArray(object["command"]) ? object["command"].join(" ").slice(0, 40) : "(unset)",
+          help: [
+            `Server definition contributed at runtime:`,
+            type === "remote" ? `url: ${typeof object["url"] === "string" ? object["url"] : "(unset)"}` : `command: ${Array.isArray(object["command"]) ? object["command"].join(" ") : "(unset)"}`,
+            `Headers: ${maskSecretHeaders(object)}`,
+            "",
+            "This entry is injected by a plugin's config() hook (or OPENCODE_CONFIG).",
+            "It is read-only here: editing would create a separate config-file entry and fork the server definition. Configure it in the contributing plugin instead.",
+          ].join("\n"),
+        },
+        { title: "< Back", value: "__back__", description: "" },
+      ],
+    })
+    if (!picked || picked === "__back__") return
+    if (picked === "__tools__") {
+      if (probe) await mcpServerToolsScreen(kit, name, probe)
+      continue
+    }
+    if (picked === "__status__") {
+      await kit.showInfo({
+        title: `MCP ${name} - status`,
+        message: [
+          `State: ${bundle?.statuses === undefined ? "unavailable (older OpenCode)" : status.label}`,
+          ...(status.error ? ["", `Error: ${status.error}`] : []),
+          "",
+          "Runtime-contributed server - read-only in the studio.",
+        ].join("\n"),
+      })
+      continue
+    }
+  }
+}
+
 async function mcpEntryScreen(kit: EditorKit, name: string): Promise<void> {
+  // Runtime-contributed servers (plugin config() hooks / OPENCODE_CONFIG) have
+  // no file entry - read-only view instead of the editor.
+  const entryRow = kit.mcpEffectiveRows?.().find((item) => item.name === name)
+  if (entryRow?.runtimeOnly) {
+    await mcpRuntimeEntryScreen(kit, name)
+    return
+  }
   while (true) {
     const entry = kit.valueAt(["mcp", name])
     const object = isPlainObject(entry) ? entry : {}
@@ -1214,7 +1311,7 @@ export async function commandScreen(kit: EditorKit): Promise<void> {
     options.push({ title: "+ Add command", value: "add", description: "" })
     options.push({ title: "< Back", value: "__back__", description: Object.keys(map).length === 0 ? "(no custom commands)" : "" })
 
-    const picked = await kit.showMenu({ title: "Slash commands", options })
+    const picked = await kit.showMenu({ title: "Slash commands", options, pinId: "settings:Tools & files:command" })
     if (!picked || picked === "__back__") return
     if (picked === "add") {
       const name = await kit.showPrompt({ title: "Command name", placeholder: "e.g. review (shown as /review)" })
@@ -1275,7 +1372,7 @@ export async function referenceScreen(kit: EditorKit): Promise<void> {
     options.push({ title: "+ Add reference", value: "add", description: "git repository or local path" })
     options.push({ title: "< Back", value: "__back__", description: Object.keys(map).length === 0 ? "(no references)" : "" })
 
-    const picked = await kit.showMenu({ title: "References", options })
+    const picked = await kit.showMenu({ title: "References", options, pinId: "settings:Tools & files:references" })
     if (!picked || picked === "__back__") return
     if (picked === "add") {
       const name = await kit.showPrompt({ title: "Reference name", placeholder: "e.g. docs" })

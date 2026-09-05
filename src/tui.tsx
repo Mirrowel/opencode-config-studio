@@ -47,8 +47,8 @@ import { providerCacheKey, getCachedProviders, setCachedProviders, providerCache
 import { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } from "./migration.js"
 import { DEFAULT_HIDDEN_SECTIONS, loadSettings, moduleOption, saveSettings, setModuleOption, settingsPath, PINNABLE_SCREENS, screenTitle, type StudioSettings } from "./settings.js"
 import { avOrigin, refreshAvSource } from "./av-source.js"
-import { getToolBundle, fetchMcpStatus } from "./toollist.js"
-import { autoProbeEnabledServers, getMcpProbe, mcpProbeSnapshot } from "./mcpprobe.js"
+import { getToolBundle, fetchMcpStatus, mergeMcpSources, maskSecretHeaders, clearToolCache, type McpSourceRow } from "./toollist.js"
+import { autoProbeEnabledServers, getMcpProbe, mcpProbeSnapshot, probeInflightCount, waitForProbes } from "./mcpprobe.js"
 import { beginStudioFlow, cancelPendingReload, endStudioFlow, fetchActiveSessions, fetchRunningSessions, pendingReload, reloadNow, requestReload, __testSetPending as setReloadPendingForTest, type RunningSession } from "./reload.js"
 import { enabledModules, moduleUsesOwnMenu, getModules, type ModuleContext } from "./modules.js"
 import { agentVariantsModuleId, agentVariantsHiddenAliases, resetAgentVariantsLens, setModuleAlertImplementation, setModulePickImplementation, __testTouchDraft } from "./modules/agent-variants.js"
@@ -67,6 +67,72 @@ function studioDefaultModelRef(state: StudioState): string | undefined {
     if (first) return `${provider.id}/${first}`
   }
   return undefined
+}
+
+/** Runtime MCP map from OpenCode's merged config (plugin config() contributions live here). */
+export function runtimeMcpMap(api: TuiPluginApi): Record<string, unknown> | undefined {
+  const config = (api.state as { config?: { mcp?: unknown } }).config
+  const mcp = config?.mcp
+  if (!mcp || typeof mcp !== "object" || Array.isArray(mcp)) return undefined
+  return mcp as Record<string, unknown>
+}
+
+/** Effective MCP rows: file config ∪ runtime config ∪ status keys. */
+export function effectiveMcpRows(api: TuiPluginApi, state: StudioState): McpSourceRow[] {
+  const fileMcp = getAtPath(state.merge.merged, ["mcp"])
+  const fileMap = fileMcp && typeof fileMcp === "object" && !Array.isArray(fileMcp) ? (fileMcp as Record<string, unknown>) : undefined
+  return mergeMcpSources(fileMap, runtimeMcpMap(api), undefined)
+}
+
+/**
+ * Studio-open prefetch: registry tool bundle + tool probes for every enabled
+ * MCP server (effective union). Fire-and-forget so the main menu opens
+ * instantly; screens gate on the in-flight set when needed.
+ */
+export function prefetchToolInventory(api: TuiPluginApi, state: StudioState): void {
+  void (async () => {
+    try {
+      await getToolBundle(api, studioDefaultModelRef(state))
+    } catch {
+      // Fail soft.
+    }
+    try {
+      const rows = effectiveMcpRows(api, state)
+      const statuses = await fetchMcpStatus(api)
+      const effectiveMap: Record<string, unknown> = {}
+      for (const row of rows) {
+        if (row.effective) effectiveMap[row.name] = row.effective
+      }
+      await autoProbeEnabledServers(api, effectiveMap, statuses)
+    } catch {
+      // Fail soft.
+    }
+  })()
+}
+
+/** Load-gate: shows a self-closing dialog while probes are in flight. */
+async function waitToolsReady(api: TuiPluginApi, title: string): Promise<void> {
+  if (probeInflightCount() === 0) return
+  const message = ["Fetching MCP tool lists.", "", "This dialog closes automatically when the fetch finishes (10s worst case)."].join("\n")
+  if (menuProbe) {
+    menuProbe.onInfo?.(title, message)
+    await waitForProbes(1500)
+    return
+  }
+  await new Promise<void>((resolve) => {
+    let settled = false
+    const done = () => {
+      if (settled) return
+      settled = true
+      resolve()
+      api.ui.dialog.clear()
+    }
+    api.ui.dialog.replace(
+      () => <InfoDialog api={api} title={title} message={message} onDone={done} />,
+      () => done(),
+    )
+    void waitForProbes(15_000).then(() => done())
+  })
 }
 
 function makeEditorKit(api: TuiPluginApi, state: StudioState): EditorKit {
@@ -95,17 +161,32 @@ function makeEditorKit(api: TuiPluginApi, state: StudioState): EditorKit {
     tools: () => getToolBundle(api, studioDefaultModelRef(state), mcpProbeSnapshot()),
     mcpProbes: () => mcpProbeSnapshot(),
     mcpProbe: (name, force) => {
-      const entry = getAtPath(state.merge.merged, ["mcp", name])
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return Promise.resolve(undefined)
-      return getMcpProbe(api, name, entry as Record<string, unknown>, force ? { force: true } : undefined)
+      const row = effectiveMcpRows(api, state).find((item) => item.name === name)
+      if (!row?.effective) return Promise.resolve(undefined)
+      return getMcpProbe(api, name, row.effective, force ? { force: true } : undefined)
     },
     mcpAutoProbe: () => {
-      const mcpConfig = getAtPath(state.merge.merged, ["mcp"])
-      const map = mcpConfig && typeof mcpConfig === "object" && !Array.isArray(mcpConfig) ? (mcpConfig as Record<string, unknown>) : undefined
+      const effectiveMap: Record<string, unknown> = {}
+      for (const row of effectiveMcpRows(api, state)) {
+        if (row.effective) effectiveMap[row.name] = row.effective
+      }
       void fetchMcpStatus(api).then((statuses) =>
-        autoProbeEnabledServers(api, map, statuses).catch(() => undefined),
+        autoProbeEnabledServers(api, effectiveMap, statuses).catch(() => undefined),
       )
     },
+    /** Refresh row handler: drop caches, force re-probe of enabled servers. */
+    mcpRefresh: async () => {
+      clearToolCache()
+      const effectiveMap: Record<string, unknown> = {}
+      for (const row of effectiveMcpRows(api, state)) {
+        if (row.effective) effectiveMap[row.name] = row.effective
+      }
+      const statuses = await fetchMcpStatus(api).catch(() => undefined)
+      await autoProbeEnabledServers(api, effectiveMap, statuses, { force: true })
+    },
+    mcpWaitReady: (title) => waitToolsReady(api, title),
+    mcpRuntimeMcp: () => runtimeMcpMap(api),
+    mcpEffectiveRows: () => effectiveMcpRows(api, state),
     openPlugins: () => pluginManagerScreen(api, state),
     openAgents: () => agentsScreen(api, state),
     openPluginsFrom: (returnTo) => pluginManagerScreen(api, state, returnTo),
@@ -4765,6 +4846,11 @@ const tui: TuiPlugin = async (api) => {
       if (busyDone) await busyDone
       if (!state) return
       await refreshAgentVariantsSource(api, state)
+      // Fire-and-forget prefetch: registry tool bundle + MCP tool probes for
+      // every enabled server. By the time the user reaches the MCP screen or
+      // the permission editor, the lists are usually cached; screens show a
+      // self-closing wait dialog when probes are still in flight.
+      prefetchToolInventory(api, state)
       await mainMenu(api, state)
     } finally {
       // Releasing the guard lets a pending deferred reload resume its watch;

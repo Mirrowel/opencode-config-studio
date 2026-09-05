@@ -7,7 +7,7 @@
 ## Conventions
 
 - **Menu** = a list of selectable options. **View** = read-only info (paged text). Only menus can be pinned.
-- **Pin depth rule**: Quick access holds (a) two fixed defaults — Providers & models explorer, Agents — that are always present and cannot be unpinned, and (b) pinned **Menu-2+** screens (children of a main-menu screen). Menu-1 screens cannot be pinned (they are the main menu). Views (Diagnostics, How it works, capture bodies) cannot be pinned.
+- **Pin depth rule**: Quick access holds (a) two fixed defaults — Providers & models explorer, Agents — that are always present and cannot be unpinned, and (b) pinned **Menu-2+** screens (children of a main-menu screen). Menu-1 screens cannot be pinned (they are the main menu). Views (Diagnostics, How it works, capture bodies) cannot be pinned. Pinnable list screens include the MCP server list, root Permissions editor, Slash commands, and References (press `f` there).
 - `f` on a pinnable menu toggles its Quick access pin; `/` searches any menu; `i` shows help.
 - **One home per editor**: when a setting appears in two places, one is a *link* that opens the single editor (marked → below). No parallel implementations.
 
@@ -59,16 +59,23 @@ Config Studio (main menu)
 │   │   ├── instructions (concat-merge stringList)
 │   │   ├── skills {paths, urls}
 │   │   ├── references (map; git/local entries)
-│   │   ├── mcp ....................... MCP manager: server list →
-│   │   │                              local {command, cwd, environment, timeout}
-│   │   │                              remote {url, headers, oauth, timeout}
-│   │   │                              {enabled:false} overlays
-│   │   ├── command ................... slash commands: template, description,
-│   │   │                              agent, model, variant (live suggestions),
-│   │   │                              subtask
-│   │   ├── permission ................ rules editor: shorthand + per-tool
-│   │   │                              pattern lists (ask/allow/deny)
-│   │   ├── formatter (built-ins + custom command/extensions)
+ │   │   ├── mcp ....................... MCP manager: server list (pinnable) →
+ │   │   │                              local {command, cwd, environment, timeout}
+ │   │   │                              remote {url, headers, oauth, timeout}
+ │   │   │                              {enabled:false} overlays; runtime-contributed
+ │   │   │                              servers (plugin config() hooks, e.g.
+ │   │   │                              closedrouter) shown read-only with real tool
+ │   │   │                              lists via direct protocol probe (60 min cache,
+ │   │   │                              re-fetch row); counts are model-visible ids
+ │   │   ├── command ................... slash commands: template, description,
+ │   │   │                              agent, model, variant (live suggestions),
+ │   │   │                              subtask (list pinnable)
+ │   │   ├── permission ................ rules editor: shorthand + per-tool
+ │   │   │                              pattern lists (ask/allow/deny); tool groups
+ │   │   │                              = built-ins + plugin tools + probed MCP
+ │   │   │                              servers; re-fetch row (root list pinnable)
+ │   │   ├── references (map; git/local entries; list pinnable)
+ │   │   ├── formatter (built-ins + custom command/extensions)
 │   │   ├── lsp (built-ins + custom command/extensions)
 │   │   └── watcher {ignore}
 │   ├── Session behavior
