@@ -11,9 +11,9 @@
  */
 
 import { existsSync, readFileSync } from "node:fs"
-import { dirname, join } from "node:path"
+import { basename, dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { editConfigFile, isPlainObject } from "./jsonc.js"
+import { editConfigFile, isPlainObject, type EditOp } from "./jsonc.js"
 import { discoverConfigFiles, type ConfigFileEntry } from "./discovery.js"
 
 export const PLUGIN_NPM_NAME = "@mirrowel/opencode-config-studio"
@@ -32,19 +32,37 @@ function samePath(a: string, b: string): boolean {
   return normalize(a) === normalize(b)
 }
 
-export function isOwnSpec(spec: unknown, ourRoot: string): boolean {
+export function isOwnSpec(spec: unknown, ourRoot?: string): boolean {
   if (typeof spec !== "string" || spec.length === 0) return false
   if (spec === PLUGIN_NPM_NAME || spec.startsWith(`${PLUGIN_NPM_NAME}@`)) return true
   if (spec.startsWith("file:")) {
     try {
       let url = spec
       if (!url.startsWith("file:///") && url.startsWith("file://")) url = `file:///${url.slice("file://".length)}`
-      return samePath(fileURLToPath(url), ourRoot)
+      const path = new URL(url).pathname.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()
+      // Identity, not instance: ANY checkout of this plugin counts, regardless
+      // of which copy is currently running (npm cache vs local repo). Without
+      // this, switching between local and npm installs made the selfwire stack
+      // a second registration because the other copy's path looked foreign.
+      if (path.endsWith("/opencode-config-studio")) return true
+      if (ourRoot && samePath(fileURLToPath(url), ourRoot)) return true
+      return false
     } catch {
       return false
     }
   }
   return false
+}
+
+/** Local checkouts win over npm specs when both are registered. */
+function preferLocal(specs: string[]): string[] {
+  const local = specs.filter(isLocalSpec)
+  const npm = specs.filter((spec) => !local.includes(spec))
+  return [...local, ...npm]
+}
+
+function isLocalSpec(spec: string): boolean {
+  return spec.startsWith("file:") || /^([a-zA-Z]:[\\/]|\/)/.test(spec)
 }
 
 function pluginArray(data: Record<string, unknown>): unknown[] {
@@ -122,16 +140,7 @@ function stripJsonc(text: string): string {
   return out
 }
 
-function findInLayers(layers: Array<{ path: string; data: Record<string, unknown> }>, ourRoot: string): string | undefined {
-  for (const layer of layers) {
-    for (const spec of specStrings(layer.data)) {
-      if (isOwnSpec(spec, ourRoot)) return spec
-    }
-  }
-  return undefined
-}
-
-function tuiLayers(input: { globalConfigDir: string; directory?: string; worktree?: string; env?: NodeJS.ProcessEnv }): Array<{ path: string; data: Record<string, unknown> }> {
+function tuiLayersOf(input: { globalConfigDir: string; directory?: string; worktree?: string; env?: NodeJS.ProcessEnv }): Array<{ path: string; data: Record<string, unknown> }> {
   const layers: Array<{ path: string; data: Record<string, unknown> }> = []
   layers.push({ path: join(input.globalConfigDir, "tui.json"), data: readData(join(input.globalConfigDir, "tui.json")) })
   const envTui = input.env?.["OPENCODE_TUI_CONFIG"]
@@ -164,26 +173,137 @@ function opencodeLayers(input: { globalConfigDir: string; directory?: string; wo
 export type WireResult =
   | { status: "already-wired"; spec: string }
   | { status: "wired"; spec: string; target: string }
+  | { status: "corrected"; spec: string; target: string; removed: string[] }
   | { status: "not-registered" }
   | { status: "failed"; error: string }
 
-export function ensureTuiRegistration(input: { globalConfigDir: string; ourRoot: string; directory?: string; worktree?: string; env?: NodeJS.ProcessEnv }): WireResult {
-  const already = findInLayers(tuiLayers(input), input.ourRoot)
-  if (already) return { status: "already-wired", spec: already }
+/** Config level directory for a config file path (`.opencode/` nests up). */
+function levelDirOf(configPath: string): string {
+  let dir = dirname(configPath)
+  if (basename(dir) === ".opencode") dir = dirname(dir)
+  return dir
+}
 
-  const spec = findInLayers(opencodeLayers(input).map((file) => ({ path: file.path, data: isPlainObject(file.data) ? file.data : {} })), input.ourRoot)
-  if (!spec) return { status: "not-registered" }
+function tuiPathForLevel(input: { globalConfigDir: string }, levelDir: string): string {
+  if (samePath(levelDir, input.globalConfigDir)) return join(input.globalConfigDir, "tui.json")
+  return join(levelDir, "tui.json")
+}
 
-  const target = join(input.globalConfigDir, "tui.json")
-  const existing = readData(target)
-  const index = pluginArray(existing).length
-  const result = editConfigFile(target, [{ op: "set", path: ["plugin", index], value: spec }], {
-    stateDir: join(input.globalConfigDir, "config-studio"),
-    reason: "self-wire config-studio TUI registration",
+/** Own-spec indices inside a tui.json-style file's plugin array. */
+function ownIndicesIn(tuiPath: string, ourRoot: string): number[] {
+  const data = readData(tuiPath)
+  const plugin = pluginArray(data)
+  const indices: number[] = []
+  plugin.forEach((entry, index) => {
+    const spec =
+      typeof entry === "string"
+        ? entry
+        : Array.isArray(entry) && typeof entry[0] === "string"
+          ? (entry[0] as string)
+          : entry && typeof entry === "object" && typeof (entry as { package?: unknown }).package === "string"
+            ? (entry as { package: string }).package
+            : undefined
+    if (spec !== undefined && isOwnSpec(spec, ourRoot)) indices.push(index)
   })
-  if (!result.ok) {
-    if (result.error?.includes("No changes")) return { status: "already-wired", spec }
-    return { status: "failed", error: result.error ?? "unknown error" }
+  return indices
+}
+
+type PlannedEdit = { file: string; ops: EditOp[]; kind: "wire" | "correct" | "prune" }
+
+export function ensureTuiRegistration(input: { globalConfigDir: string; ourRoot: string; directory?: string; worktree?: string; env?: NodeJS.ProcessEnv }): WireResult {
+  // Server-side registrations, grouped per config level.
+  const opencodeOwn = opencodeLayers(input)
+    .map((file) => ({
+      path: file.path,
+      level: levelDirOf(file.path),
+      specs: specStrings(isPlainObject(file.data) ? file.data : {}).filter((spec) => isOwnSpec(spec, input.ourRoot)),
+    }))
+    .filter((layer) => layer.specs.length > 0)
+  if (opencodeOwn.length === 0) return { status: "not-registered" }
+
+  // Local checkouts win over npm installs; discovery order (strongest layer
+  // first) breaks ties. This is "the loaded one" the TUI must mirror.
+  const preferAt = (layers: typeof opencodeOwn): string | undefined => {
+    const ordered = [...layers].sort((a, b) => {
+      const aLocal = a.specs.some(isLocalSpec)
+      const bLocal = b.specs.some(isLocalSpec)
+      if (aLocal !== bLocal) return aLocal ? -1 : 1
+      return 0
+    })
+    const first = ordered[0]
+    if (!first) return undefined
+    return preferLocal(first.specs)[0]
   }
-  return { status: "wired", spec, target }
+  const wanted = preferAt(opencodeOwn)
+  if (!wanted) return { status: "not-registered" }
+  const wantedLevel = opencodeOwn.find((layer) => layer.specs.includes(wanted))?.level ?? input.globalConfigDir
+  const target = tuiPathForLevel(input, wantedLevel)
+
+  // Per tui layer: a level with a server registration mirrors it exactly
+  // (one entry, the preferred spec); a level WITHOUT a registration must not
+  // carry our entry at all (stale mirror removed).
+  const planned: PlannedEdit[] = []
+  const seenFiles = new Set<string>()
+  const planForTuiFile = (tuiPath: string, level: string) => {
+    if (seenFiles.has(tuiPath)) return
+    seenFiles.add(tuiPath)
+    if (!existsSync(tuiPath)) return
+    const indices = ownIndicesIn(tuiPath, input.ourRoot)
+    if (indices.length === 0) return
+    const levelLayers = opencodeOwn.filter((layer) => samePath(layer.level, level))
+    if (levelLayers.length === 0) {
+      // Stale mirror: no server registration at this level anymore.
+      planned.push({
+        file: tuiPath,
+        kind: "prune",
+        ops: [...indices].sort((a, b) => b - a).map((index) => ({ op: "delete" as const, path: ["plugin", index] })),
+      })
+      return
+    }
+    const wantedHere = preferAt(levelLayers) ?? wanted
+    if (indices.length === 1) {
+      const data = readData(tuiPath)
+      const entry = pluginArray(data)[indices[0]!]
+      const spec = typeof entry === "string" ? entry : Array.isArray(entry) && typeof entry[0] === "string" ? (entry[0] as string) : undefined
+      if (spec === wantedHere) return
+      planned.push({ file: tuiPath, kind: "correct", ops: [{ op: "set", path: ["plugin", indices[0]!], value: wantedHere }] })
+      return
+    }
+    const [keep, ...drop] = indices
+    const ops: EditOp[] = [{ op: "set", path: ["plugin", keep!], value: wantedHere }]
+    for (const index of [...drop].sort((a, b) => b - a)) ops.push({ op: "delete", path: ["plugin", index] })
+    planned.push({ file: tuiPath, kind: "correct", ops })
+  }
+
+  const tuiLayers = tuiLayersOf(input)
+  for (const layer of tuiLayers) planForTuiFile(layer.path, levelDirOf(layer.path))
+
+  // Ensure the registration level carries its mirror.
+  if (!seenFiles.has(target) || !existsSync(target)) {
+    const indices = existsSync(target) ? ownIndicesIn(target, input.ourRoot) : []
+    if (indices.length === 0) {
+      const data = readData(target)
+      planned.push({ file: target, kind: "wire", ops: [{ op: "set", path: ["plugin", pluginArray(data).length], value: wanted }] })
+    }
+  }
+
+  if (planned.length === 0) return { status: "already-wired", spec: wanted }
+
+  const removed: string[] = []
+  for (const edit of planned) {
+    const result = editConfigFile(edit.file, edit.ops, {
+      stateDir: join(input.globalConfigDir, "config-studio"),
+      reason: "self-wire config-studio TUI registration",
+    })
+    if (!result.ok) {
+      if (result.error?.includes("No changes")) continue
+      return { status: "failed", error: `${edit.file}: ${result.error ?? "unknown error"}` }
+    }
+    removed.push(`${edit.file} (${edit.kind})`)
+  }
+  if (removed.length === 0) return { status: "already-wired", spec: wanted }
+  if (planned.every((edit) => edit.kind === "wire")) {
+    return { status: "wired", spec: wanted, target }
+  }
+  return { status: "corrected", spec: wanted, target, removed }
 }

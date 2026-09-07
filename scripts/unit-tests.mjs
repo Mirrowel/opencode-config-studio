@@ -24,7 +24,7 @@ const cache = await import(dist("providercache"))
 const { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } = await import(dist("migration"))
 const palette = await import(dist("palette-category"))
 const keymeta = await import(dist("keymeta"))
-const { resolveStandaloneDirIn, avOrigin, avSourceKind } = await import(dist("av-source"))
+const { resolveStandaloneDirIn, avOrigin, avSourceKind, refreshAvSource } = await import(dist("av-source"))
 const reload = await import(dist("reload"))
 const toollist = await import(dist("toollist"))
 const { variantAliasesOf } = await import(dist("modules/agent-variants"))
@@ -390,6 +390,9 @@ function section(name) {
     assert(!isOwnSpec("file:///C:/other/plugin", ownRoot), "foreign file spec should not match")
     assert(!isOwnSpec("@mirrowel/opencode-agent-variants", "C:/irrelevant"), "foreign npm name should not match")
     assert(!isOwnSpec(42, "C:/irrelevant"), "non-string should not match")
+    // Identity, not instance: any checkout folder counts even when a
+    // different copy is running.
+    assert(isOwnSpec("file:///C:/Projects/OC%20Plugins/opencode-config-studio", "C:/npm-cache/other-copy"), "local checkout folder matches regardless of running root")
     assert(ourRootDir().length > 0, "ourRootDir should resolve")
   } finally {
     rmSync(ownRoot, { recursive: true, force: true })
@@ -432,11 +435,16 @@ function section(name) {
     writeFileSync(path.join(globalDir, "opencode.json"), JSON.stringify({ plugin: [PLUGIN_NPM_NAME] }), "utf8")
     const first = ensureTuiRegistration({ globalConfigDir: globalDir, ourRoot: "C:/somewhere" })
     if (first.status !== "wired" || first.spec !== PLUGIN_NPM_NAME) throw new Error(`npm wiring failed: ${JSON.stringify(first)}`)
-    // Project-level tui.json also counts as wired.
+    // A project-level tui entry without a project-level server registration is
+    // a stale mirror: the global entry is (re)created and the stale project
+    // entry is removed.
     rmSync(path.join(globalDir, "tui.json"))
     writeFileSync(path.join(project, "tui.json"), JSON.stringify({ plugin: [[PLUGIN_NPM_NAME, {}]] }), "utf8")
     const second = ensureTuiRegistration({ globalConfigDir: globalDir, ourRoot: "C:/somewhere", directory: project, worktree: path.join(dir, "project") })
-    if (second.status !== "already-wired") throw new Error(`project tui.json not detected: ${second.status}`)
+    if (second.status !== "corrected") throw new Error(`expected corrected (re-wire + stale prune), got ${second.status}`)
+    if (!readFileSync(path.join(globalDir, "tui.json"), "utf8").includes(PLUGIN_NPM_NAME)) throw new Error("global tui.json must carry the mirror")
+    const projectTui = JSON.parse(readFileSync(path.join(project, "tui.json"), "utf8"))
+    if (projectTui.plugin.length !== 0) throw new Error(`stale project tui entry must be removed, got ${JSON.stringify(projectTui)}`)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -452,6 +460,79 @@ function section(name) {
     const result = ensureTuiRegistration({ globalConfigDir: globalDir, ourRoot: "C:/somewhere" })
     if (result.status !== "not-registered") throw new Error(`expected not-registered, got ${result.status}`)
     if (existsSync(path.join(globalDir, "tui.json"))) throw new Error("tui.json should not be created")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+{
+  section("selfwire: tui entry auto-corrects to match the server registration")
+  const dir = mkdtempSync(path.join(tmpdir(), "config-studio-test-"))
+  const globalDir = path.join(dir, "global")
+  const pluginRoot = path.join(dir, "plugins", "opencode-config-studio")
+  mkdirSync(globalDir, { recursive: true })
+  mkdirSync(pluginRoot, { recursive: true })
+  try {
+    const localSpec = pathToFileURL(pluginRoot).href
+    // Server runs the LOCAL copy (opencode.json), tui.json still has the npm
+    // entry - the exact local-vs-npm mismatch that used to stack duplicates.
+    writeFileSync(path.join(globalDir, "opencode.json"), JSON.stringify({ plugin: ["@cortexkit/other", localSpec] }), "utf8")
+    writeFileSync(path.join(globalDir, "tui.json"), JSON.stringify({ plugin: ["@cortexkit/other", `${PLUGIN_NPM_NAME}@latest`] }), "utf8")
+    const result = ensureTuiRegistration({ globalConfigDir: globalDir, ourRoot: "C:/npm-cache/different-copy" })
+    if (result.status !== "corrected") throw new Error(`expected corrected, got ${result.status} (${result.error ?? ""})`)
+    if (result.spec !== localSpec) throw new Error(`wanted the local spec, got ${result.spec}`)
+    const tui = JSON.parse(readFileSync(path.join(globalDir, "tui.json"), "utf8"))
+    if (tui.plugin.filter((entry) => entry.includes("opencode-config-studio")).length !== 1) throw new Error(`expected exactly one own entry, got ${JSON.stringify(tui.plugin)}`)
+    if (!tui.plugin.includes(localSpec)) throw new Error(`tui.json does not contain the local spec: ${JSON.stringify(tui.plugin)}`)
+    if (tui.plugin.includes("@cortexkit/other") === false) throw new Error("foreign entries must survive the correction")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+{
+  section("selfwire: project-level registration mirrors to project tui.json")
+  const dir = mkdtempSync(path.join(tmpdir(), "config-studio-test-"))
+  const globalDir = path.join(dir, "global")
+  const project = path.join(dir, "project", "src")
+  mkdirSync(globalDir, { recursive: true })
+  mkdirSync(project, { recursive: true })
+  try {
+    const localSpec = pathToFileURL(path.join(dir, "plugins", "opencode-config-studio")).href
+    mkdirSync(path.join(dir, "plugins", "opencode-config-studio"), { recursive: true })
+    writeFileSync(path.join(globalDir, "opencode.json"), JSON.stringify({ plugin: ["@cortexkit/other"] }), "utf8")
+    writeFileSync(path.join(project, "opencode.json"), JSON.stringify({ plugin: [localSpec] }), "utf8")
+    const result = ensureTuiRegistration({ globalConfigDir: globalDir, ourRoot: "C:/npm-cache", directory: project, worktree: path.join(dir, "project") })
+    if (result.status !== "wired") throw new Error(`expected wired, got ${result.status} (${result.error ?? ""})`)
+    if (result.spec !== localSpec) throw new Error(`spec mismatch: ${result.spec}`)
+    // The mirror lands at the SAME level as the registration: next to the
+    // project opencode.json that carries it.
+    const projectTui = readFileSync(path.join(project, "tui.json"), "utf8")
+    if (!projectTui.includes(decodeURIComponent(localSpec))) throw new Error(`project tui.json must carry the spec: ${projectTui}`)
+    if (existsSync(path.join(globalDir, "tui.json"))) throw new Error("global tui.json must stay absent for a project-level registration")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+{
+  section("selfwire: local checkout wins over npm when both are registered")
+  const dir = mkdtempSync(path.join(tmpdir(), "config-studio-test-"))
+  const globalDir = path.join(dir, "global")
+  const pluginRoot = path.join(dir, "plugins", "opencode-config-studio")
+  mkdirSync(globalDir, { recursive: true })
+  mkdirSync(pluginRoot, { recursive: true })
+  try {
+    const localSpec = pathToFileURL(pluginRoot).href
+    writeFileSync(path.join(globalDir, "opencode.json"), JSON.stringify({ plugin: [`${PLUGIN_NPM_NAME}@latest`, localSpec] }), "utf8")
+    writeFileSync(path.join(globalDir, "tui.json"), JSON.stringify({ plugin: [localSpec, `${PLUGIN_NPM_NAME}@latest`, "@cortexkit/other"] }), "utf8")
+    const result = ensureTuiRegistration({ globalConfigDir: globalDir, ourRoot: pluginRoot })
+    if (result.status !== "corrected") throw new Error(`expected corrected, got ${result.status}`)
+    if (result.spec !== localSpec) throw new Error(`local must win, got ${result.spec}`)
+    const tui = JSON.parse(readFileSync(path.join(globalDir, "tui.json"), "utf8"))
+    const own = tui.plugin.filter((entry) => entry.includes("opencode-config-studio"))
+    if (own.length !== 1 || own[0] !== localSpec) throw new Error(`expected exactly the local spec, got ${JSON.stringify(tui.plugin)}`)
+    if (!tui.plugin.includes("@cortexkit/other")) throw new Error("foreign entries must survive the dedup")
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -918,6 +999,26 @@ async function testAvSource() {
   assert(resolveStandaloneDirIn(path.join(dir, "empty-cache"), "@mirrowel/opencode-agent-variants@dev") === undefined, "empty cache resolves nothing")
   assert(avSourceKind() === "embedded", "studio starts on the embedded implementation")
   assert(avOrigin().includes("embedded"), "origin reports embedded by default")
+
+  // A local checkout (repo folder named plain "agent-variants") registered
+  // via file:// is a valid standalone source and WINS over npm specs. The
+  // dir carries a minimal dist with the two required exports.
+  const repo = path.join(dir, "agent-variants")
+  mkdirSync(path.join(repo, "dist"), { recursive: true })
+  writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "@mirrowel/opencode-agent-variants", version: "9.9.9-local" }), "utf8")
+  writeFileSync(path.join(repo, "dist", "wizard.js"), "export function mainMenu() {}\n", "utf8")
+  writeFileSync(path.join(repo, "dist", "config.js"), "export function loadSidecar() {}\nexport const defaultSidecarPath = () => \"\"\n", "utf8")
+  const repoSpec = pathToFileURL(repo).href
+  const loaded = await refreshAvSource("standalone", ["@mirrowel/opencode-agent-variants@latest", repoSpec])
+  assert(loaded.ok, `local checkout must load: ${loaded.error}`)
+  assert(loaded.origin.includes("standalone") && loaded.origin.includes("9.9.9-local"), `origin reports the local standalone: ${loaded.origin}`)
+  assert(avSourceKind() === "standalone", "source kind flips to standalone")
+  // No candidate specs at all -> embedded fallback with a clear error.
+  const none = await refreshAvSource("standalone", ["@cortexkit/other"])
+  assert(!none.ok && none.error.includes("No standalone"), "missing registration reports clearly")
+  // Embedded resets the active implementation.
+  const reset = await refreshAvSource("embedded", [repoSpec])
+  assert(reset.ok && avSourceKind() === "embedded", "embedded source resets")
 }
 
 testKeyMeta()

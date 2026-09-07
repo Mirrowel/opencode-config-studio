@@ -14,6 +14,7 @@ import { join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import type * as EmbeddedWizard from "@mirrowel/opencode-agent-variants/wizard"
 import type * as EmbeddedConfig from "@mirrowel/opencode-agent-variants/config"
+import { isStandaloneAgentVariantsSpec } from "./standalone.js"
 import * as embeddedWizardModule from "@mirrowel/opencode-agent-variants/wizard"
 import * as embeddedConfigModule from "@mirrowel/opencode-agent-variants/config"
 
@@ -160,21 +161,34 @@ export async function refreshAvSource(source: "embedded" | "standalone", pluginS
     active = undefined
     return { ok: true, origin: avOrigin() }
   }
-  const spec = pluginSpecs.find((entry) => entry.includes("opencode-agent-variants"))
-  if (!spec) {
+  // Identity matching (npm specs AND local checkouts - a repo folder named
+  // plain "agent-variants" is a valid standalone registration). Local
+  // checkouts win over npm installs when both are registered: local usually
+  // means active development.
+  const candidates = pluginSpecs.filter((entry) => isStandaloneAgentVariantsSpec(entry))
+  const ordered = [
+    ...candidates.filter((entry) => entry.startsWith("file:") || /^([a-zA-Z]:[\\/]|\/)/.test(entry)),
+    ...candidates.filter((entry) => !(entry.startsWith("file:") || /^([a-zA-Z]:[\\/]|\/)/.test(entry))),
+  ]
+  if (ordered.length === 0) {
     active = undefined
     return { ok: false, origin: avOrigin(), error: "No standalone agent-variants plugin entry found in any config file; using the embedded copy." }
   }
-  const dir = resolveStandaloneDir(spec)
-  if (!dir) {
-    active = undefined
-    return { ok: false, origin: avOrigin(), error: `Standalone plugin "${spec}" is not installed yet (restart OpenCode to install it); using the embedded copy.` }
+  const errors: string[] = []
+  for (const spec of ordered) {
+    const dir = resolveStandaloneDir(spec)
+    if (!dir) {
+      errors.push(`"${spec}" is not installed yet (restart OpenCode to install it)`)
+      continue
+    }
+    const impl = await loadFromDir(spec, dir)
+    if (!impl) {
+      errors.push(`"${spec}" could not be loaded (missing or incompatible dist/wizard.js - if the cached copy is stale, remove ~/.cache/opencode/packages/@mirrowel/opencode-agent-variants@<tag> or pin an exact version)`)
+      continue
+    }
+    active = impl
+    return { ok: true, origin: avOrigin() }
   }
-  const impl = await loadFromDir(spec, dir)
-  if (!impl) {
-    active = undefined
-    return { ok: false, origin: avOrigin(), error: `Standalone plugin "${spec}" could not be loaded (missing or incompatible dist/wizard.js - if the cached copy is stale, remove ~/.cache/opencode/packages/@mirrowel/opencode-agent-variants@<tag> or pin an exact version); using the embedded copy.` }
-  }
-  active = impl
-  return { ok: true, origin: avOrigin() }
+  active = undefined
+  return { ok: false, origin: avOrigin(), error: `${errors.join("; ")}; using the embedded copy.` }
 }

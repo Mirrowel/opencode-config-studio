@@ -52,7 +52,7 @@ import { autoProbeEnabledServers, getMcpProbe, mcpProbeSnapshot, probeInflightCo
 import { beginStudioFlow, cancelPendingReload, endStudioFlow, fetchActiveSessions, fetchRunningSessions, pendingReload, reloadNow, requestReload, __testSetPending as setReloadPendingForTest, type RunningSession } from "./reload.js"
 import { enabledModules, moduleUsesOwnMenu, getModules, type ModuleContext } from "./modules.js"
 import { agentVariantsModuleId, agentVariantsHiddenAliases, resetAgentVariantsLens, setModuleAlertImplementation, setModulePickImplementation, __testTouchDraft } from "./modules/agent-variants.js"
-import { findStandaloneAgentVariants, removeStandaloneHits } from "./standalone.js"
+import { findStandaloneAgentVariants, isStandaloneAgentVariantsSpec, removeStandaloneHits } from "./standalone.js"
 
 // ---------------------------------------------------------------------------
 // Editor kit: dialog primitives + staging for the value-editors module
@@ -2712,11 +2712,14 @@ function strongestEditableFile(state: StudioState): { path: string; data: Record
 function allPluginSpecs(state: StudioState): string[] {
   const specs: string[] = []
   for (const file of state.files) {
-    const plugin = getAtPath(file.data, ["plugin"])
-    if (!Array.isArray(plugin)) continue
-    for (const entry of plugin) {
-      const spec = Array.isArray(entry) ? String(entry[0]) : String(entry)
-      if (spec && !specs.includes(spec)) specs.push(spec)
+    // v1 configs use `plugin`, v2 uses `plugins` ({package} entries).
+    for (const key of ["plugin", "plugins"] as const) {
+      const plugin = getAtPath(file.data, [key])
+      if (!Array.isArray(plugin)) continue
+      for (const entry of plugin) {
+        const spec = Array.isArray(entry) ? String(entry[0]) : typeof entry === "object" && entry !== null && typeof (entry as { package?: unknown }).package === "string" ? String((entry as { package: string }).package) : String(entry)
+        if (spec && !specs.includes(spec)) specs.push(spec)
+      }
     }
   }
   return specs
@@ -2735,18 +2738,21 @@ async function refreshAgentVariantsSource(api: TuiPluginApi, state: StudioState)
 function standalonePluginEntries(state: StudioState): Array<{ file: string; index: number; spec: string; tuple: boolean }> {
   const hits: Array<{ file: string; index: number; spec: string; tuple: boolean }> = []
   for (const file of state.files) {
-    const plugin = getAtPath(file.data, ["plugin"])
-    if (!Array.isArray(plugin)) continue
-    plugin.forEach((entry, index) => {
-      const tuple = Array.isArray(entry)
-      const spec = String(tuple ? entry[0] : entry)
-      if (spec.includes("opencode-agent-variants") && !spec.includes("opencode-config-studio")) hits.push({ file: file.path, index, spec, tuple })
-    })
+    for (const key of ["plugin", "plugins"] as const) {
+      const plugin = getAtPath(file.data, [key])
+      if (!Array.isArray(plugin)) continue
+      plugin.forEach((entry, index) => {
+        const tuple = Array.isArray(entry)
+        const spec = String(tuple ? entry[0] : entry)
+        if (spec !== "" && isStandaloneAgentVariantsSpec(spec)) hits.push({ file: file.path, index, spec, tuple })
+      })
+    }
   }
   return hits
 }
 
 function avChannelOf(spec: string): string {
+  if (spec.startsWith("file:") || /^([a-zA-Z]:[\\/]|\/)/.test(spec)) return "local checkout"
   const at = spec.indexOf("@", 1)
   return at === -1 ? "latest" : spec.slice(at + 1)
 }
@@ -2802,12 +2808,16 @@ async function agentVariantsSourceScreen(api: TuiPluginApi, state: StudioState):
       if (!target || target === "__cancel__") continue
       const hit = typeof target === "object" ? target : hits.find((item) => String(item.index) === target)
       if (!hit) continue
+      const isLocalSpec = hit.spec.startsWith("file:") || /^([a-zA-Z]:[\\/]|\/)/.test(hit.spec)
       const channel = await showMenu(api, {
         title: `Channel for ${hit.spec}`,
         options: [
           { title: "latest (stable)", value: "latest", description: avChannelOf(hit.spec) === "latest" ? "current" : "" },
           { title: "dev (prerelease)", value: "dev", description: avChannelOf(hit.spec) === "dev" ? "current" : "" },
           { title: "Exact version...", value: "__exact__", description: "type e.g. 0.9.0-dev.1" },
+          ...(isLocalSpec
+            ? [{ title: "Note: this is a local checkout", value: "__cancel__", description: "picking a channel replaces the file:// spec with the npm install form" } as WizardSelectOption<string>]
+            : []),
           { title: "< Cancel", value: "__cancel__", description: "" },
         ],
       })
