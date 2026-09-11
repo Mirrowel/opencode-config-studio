@@ -50,8 +50,11 @@ import { avOrigin, refreshAvSource } from "./av-source.js"
 import { getToolBundle, fetchMcpStatus, mergeMcpSources, maskSecretHeaders, clearToolCache, type McpSourceRow } from "./toollist.js"
 import { autoProbeEnabledServers, getMcpProbe, mcpProbeSnapshot, probeInflightCount, waitForProbes } from "./mcpprobe.js"
 import { beginStudioFlow, cancelPendingReload, endStudioFlow, fetchActiveSessions, fetchRunningSessions, pendingReload, reloadNow, requestReload, __testSetPending as setReloadPendingForTest, type RunningSession } from "./reload.js"
-import { enabledModules, moduleUsesOwnMenu, getModules, type ModuleContext } from "./modules.js"
+import { enabledModules, moduleUsesOwnMenu, getModules, type ModuleContext, type MenuEntry as MenuEntryShape } from "./modules.js"
 import { agentVariantsModuleId, agentVariantsHiddenAliases, resetAgentVariantsLens, setModuleAlertImplementation, setModulePickImplementation, __testTouchDraft } from "./modules/agent-variants.js"
+import "./modules/subagent-explorer.js"
+import { isStandaloneSubagentExplorerSpec, refreshSeSource, seOrigin } from "./se-source.js"
+import { runExplorer } from "./modules/subagent-explorer.js"
 import { findStandaloneAgentVariants, isStandaloneAgentVariantsSpec, removeStandaloneHits } from "./standalone.js"
 
 // ---------------------------------------------------------------------------
@@ -2496,6 +2499,12 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
       help: "Add/remove plugins (npm specs or file:// paths, with optional options tuples) across opencode.json and tui.json layers. Restart required after changes.",
     },
     {
+      title: "Tools",
+      value: "tools",
+      description: `${toolsEntryCount(api, state)} module tool(s) - subagent sessions, ...`,
+      help: "Task-focused tools contributed by enabled modules (Subagent Explorer, ...). Modules add their tools here when integrated; disable a module on the Modules screen to remove its tools.",
+    },
+    {
       title: "Cleanup & migrations",
       value: "cleanup",
       description: "Deprecated keys: detect and migrate",
@@ -2583,6 +2592,8 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
       return tuiSettingsScreen(api, state)
     case "plugins":
       return pluginManagerScreen(api, state)
+    case "tools":
+      return toolsScreen(api, state)
     case "cleanup":
       return cleanupScreen(api, state)
     case "agents":
@@ -2631,6 +2642,44 @@ async function showOverview(api: TuiPluginApi): Promise<void> {
     ...enabledModuleList().flatMap((module) => module.infoSections?.() ?? []),
   ]
   await showPagedInfo(api, { title: "Config Studio", sections })
+}
+
+function toolsEntryCount(api: TuiPluginApi, state: StudioState): number {
+  return enabledModuleList().reduce((count, module) => count + (module.toolsEntries?.(moduleContext(api, state)).length ?? 0), 0)
+}
+
+/** Tools screen: task-focused tools contributed by enabled modules. */
+async function toolsScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
+  const entries: Array<{ moduleTitle: string; title: string; entry: MenuEntryShape & { run: (ctx: ModuleContext) => Promise<void> } }> = []
+  for (const module of enabledModuleList()) {
+    for (const entry of module.toolsEntries?.(moduleContext(api, state)) ?? []) {
+      entries.push({ moduleTitle: module.title, title: entry.title, entry })
+    }
+  }
+  const opts: WizardSelectOption<string>[] = entries.map((item, index) => ({
+    title: item.title,
+    value: `tool:${index}`,
+    description: `${item.moduleTitle} - ${item.entry.description ?? ""}`,
+    help: item.entry.help,
+    edited: item.entry.edited,
+    danger: item.entry.danger,
+  }))
+  if (opts.length === 0) {
+    opts.push({
+      title: "No module tools available",
+      value: "__empty__",
+      description: "enable modules on the Modules screen",
+      help: "Modules contribute task-focused tools here when enabled. The Subagent Explorer ships as a studio module; enable or disable it on the Modules screen.",
+    })
+  }
+  opts.push({ title: "< Back", value: "__back__", description: "" })
+  while (true) {
+    const choice = await showMenu(api, { title: "Tools", options: opts })
+    if (!choice || choice === "__back__" || choice === "__empty__") return mainMenu(api, state)
+    const item = entries[Number(choice.slice("tool:".length))]
+    if (!item) continue
+    await item.entry.run(moduleContext(api, state))
+  }
 }
 
 async function modulesScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
@@ -2687,6 +2736,32 @@ async function modulesScreen(api: TuiPluginApi, state: StudioState): Promise<voi
     }
     return modulesScreen(api, state)
   }
+  if (module.id === "subagent-explorer") {
+    // Same treatment as Agent Variants, except there is no layout toggle:
+    // the module's home is the Tools screen. The "native" option opens the
+    // explorer's own TUI (standalone sizing scope + its own size picker).
+    const choice = await showMenu(api, {
+      title: module.title,
+      options: [
+        { title: "Toggle enabled", value: "enabled", description: "Show/hide this module everywhere" },
+        { title: "Open native explorer", value: "native", description: "standalone TUI - own dialog size + picker", help: "Runs the Subagent Explorer exactly like the standalone plugin would: its own dialog sizing with the size picker (o), independent of Config Studio's dialog settings." },
+        { title: "Source & channel", value: "source", description: `${moduleOption<"embedded" | "standalone">(studioSettings, "subagent-explorer", "source", "embedded")} - ${seOrigin()}`, help: "Use the standalone subagent-explorer install (any channel) or the studio's bundled copy, and pin the standalone channel (@latest/@dev/exact)." },
+        { title: "< Back", value: "__back__", description: "Return to modules" },
+      ],
+    })
+    if (!choice || choice === "__back__") return modulesScreen(api, state)
+    if (choice === "source") return subagentExplorerSourceScreen(api, state)
+    if (choice === "native") {
+      await refreshSubagentExplorerSource(api, state)
+      await runExplorer(moduleContext(api, state), "standalone")
+      return modulesScreen(api, state)
+    }
+    if (choice === "enabled") {
+      const nowEnabled = studioSettings.modules.enabled[module.id] !== false || studioSettings.modules.enabled[module.id] === undefined
+      setModuleEnabledInSettings(api, dataDir, module.id, !nowEnabled)
+    }
+    return modulesScreen(api, state)
+  }
   const nowEnabled = studioSettings.modules.enabled[module.id] !== false || studioSettings.modules.enabled[module.id] === undefined
   setModuleEnabledInSettings(api, dataDir, module.id, !nowEnabled)
   return modulesScreen(api, state)
@@ -2734,8 +2809,21 @@ async function refreshAgentVariantsSource(api: TuiPluginApi, state: StudioState)
   }
 }
 
+/** Re-resolves the Subagent Explorer implementation (embedded vs standalone). */
+async function refreshSubagentExplorerSource(api: TuiPluginApi, state: StudioState): Promise<void> {
+  const source = moduleOption<"embedded" | "standalone">(studioSettings, "subagent-explorer", "source", "embedded")
+  const result = await refreshSeSource(source, allPluginSpecs(state))
+  if (!result.ok) {
+    api.ui.toast({ variant: "warning", title: "Subagent Explorer source", message: result.error ?? "Falling back to the embedded copy." })
+  }
+}
+
 /** Standalone agent-variants entries across files, with file + array index. */
 function standalonePluginEntries(state: StudioState): Array<{ file: string; index: number; spec: string; tuple: boolean }> {
+  return pluginEntriesMatching(state, isStandaloneAgentVariantsSpec)
+}
+
+function pluginEntriesMatching(state: StudioState, matcher: (spec: unknown) => boolean): Array<{ file: string; index: number; spec: string; tuple: boolean }> {
   const hits: Array<{ file: string; index: number; spec: string; tuple: boolean }> = []
   for (const file of state.files) {
     for (const key of ["plugin", "plugins"] as const) {
@@ -2744,7 +2832,7 @@ function standalonePluginEntries(state: StudioState): Array<{ file: string; inde
       plugin.forEach((entry, index) => {
         const tuple = Array.isArray(entry)
         const spec = String(tuple ? entry[0] : entry)
-        if (spec !== "" && isStandaloneAgentVariantsSpec(spec)) hits.push({ file: file.path, index, spec, tuple })
+        if (spec !== "" && matcher(spec)) hits.push({ file: file.path, index, spec, tuple })
       })
     }
   }
@@ -2857,6 +2945,102 @@ async function agentVariantsSourceScreen(api: TuiPluginApi, state: StudioState):
 // ---------------------------------------------------------------------------
 // Module session state (per studio command run)
 // ---------------------------------------------------------------------------
+
+/**
+ * Subagent Explorer source + channel picker: embedded vs standalone, and
+ * (when standalone) which pinned channel the standalone spec uses.
+ */
+async function subagentExplorerSourceScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
+  const dataDir = studioDataDir(api)
+  while (true) {
+    const source = moduleOption<"embedded" | "standalone">(studioSettings, "subagent-explorer", "source", "embedded")
+    const hits = pluginEntriesMatching(state, isStandaloneSubagentExplorerSpec)
+    const options: WizardSelectOption<string>[] = [
+      {
+        title: source === "standalone" ? "* Use standalone install" : "Use standalone install",
+        value: "standalone",
+        description: hits.length > 0 ? hits.map((hit) => `${hit.spec} (${fileLabel(state, hit.file)})`).join(", ") : "no standalone entry found yet",
+        help: "Loads the wizard from your standalone subagent-explorer plugin install instead of the studio's bundled copy - the studio then drives exactly the version you pinned. Requires a standalone plugin entry (added below or by installing the plugin).",
+      },
+      {
+        title: source === "embedded" ? "* Use embedded copy" : "Use embedded copy",
+        value: "embedded",
+        description: seOrigin(),
+        help: "Uses the subagent-explorer version bundled with this studio build (declared in package.json). Always available.",
+      },
+      { title: "Set standalone channel/version", value: "channel", description: hits.length > 0 ? `current: ${hits.map((hit) => avChannelOf(hit.spec)).join(", ")}` : "no standalone entry yet", help: "Pins the standalone plugin spec to @latest, @dev, or an exact version. Stages a plugin-array edit; takes effect after Save & exit + restart." },
+      { title: "Add standalone plugin entry", value: "add", description: "adds @mirrowel/opencode-subagent-explorer@dev", help: "Adds the standalone plugin to the strongest config file's plugin array so its channel can be managed here. Staged like any other edit." },
+      { title: "< Back", value: "__back__", description: "" },
+    ]
+    const picked = await showMenu(api, { title: "Subagent Explorer source", options })
+    if (!picked || picked === "__back__") return modulesScreen(api, state)
+    if (picked === "standalone" || picked === "embedded") {
+      setModuleOption(dataDir, studioSettings, "subagent-explorer", "source", picked)
+      await refreshSubagentExplorerSource(api, state)
+      api.ui.toast({
+        variant: "info",
+        title: "Subagent Explorer source",
+        message: picked === "standalone" ? `Now using the standalone install (${seOrigin()}).` : "Now using the embedded copy.",
+      })
+      continue
+    }
+    if (picked === "channel") {
+      if (hits.length === 0) {
+        await showAlert(api.ui, { title: "No standalone entry", message: "Add the standalone plugin entry first (option below), then pick its channel." })
+        continue
+      }
+      const target = hits.length === 1 ? hits[0]! : await showMenu(api, {
+        title: "Which entry?",
+        options: [...hits.map((hit) => ({ title: hit.spec, value: String(hit.index), description: fileLabel(state, hit.file) })), { title: "< Cancel", value: "__cancel__", description: "" }],
+      })
+      if (!target || target === "__cancel__") continue
+      const hit = typeof target === "object" ? target : hits.find((item) => String(item.index) === target)
+      if (!hit) continue
+      const isLocalSpec = hit.spec.startsWith("file:") || /^([a-zA-Z]:[\\/]|\/)/.test(hit.spec)
+      const channel = await showMenu(api, {
+        title: `Channel for ${hit.spec}`,
+        options: [
+          { title: "latest (stable)", value: "latest", description: avChannelOf(hit.spec) === "latest" ? "current" : "" },
+          { title: "dev (prerelease)", value: "dev", description: avChannelOf(hit.spec) === "dev" ? "current" : "" },
+          { title: "Exact version...", value: "__exact__", description: "type e.g. 0.1.0-dev.1" },
+          ...(isLocalSpec
+            ? [{ title: "Note: this is a local checkout", value: "__cancel__", description: "picking a channel replaces the file:// spec with the npm install form" } as WizardSelectOption<string>]
+            : []),
+          { title: "< Cancel", value: "__cancel__", description: "" },
+        ],
+      })
+      if (!channel || channel === "__cancel__") continue
+      const nextChannel = channel === "__exact__" ? (await showPrompt(api.ui, { title: "Exact version", placeholder: "e.g. 0.1.0-dev.1" }))?.trim() : channel
+      if (!nextChannel) continue
+      const newSpec = `@mirrowel/opencode-subagent-explorer@${nextChannel}`
+      if (newSpec === hit.spec) continue
+      const write: WriteContext = { api, state }
+      const path: JSONPath = hit.tuple ? ["plugin", hit.index, 0] : ["plugin", hit.index]
+      const ok = await applyEdits(write, [{ op: "set", path, value: newSpec }], `subagent-explorer standalone channel -> @${nextChannel}`)
+      if (ok) {
+        api.ui.toast({ variant: "info", title: "Channel staged", message: `${newSpec} - review and Save & exit, then restart OpenCode to install the new version.` })
+        return modulesScreen(api, state)
+      }
+      continue
+    }
+    if (picked === "add") {
+      const write: WriteContext = { api, state }
+      const target = strongestEditableFile(state)
+      if (!target) {
+        await showAlert(api.ui, { title: "No editable file", message: "No editable config file was discovered." })
+        continue
+      }
+      const pluginArray = getAtPath(target.data, ["plugin"])
+      const ok = await applyEdits(write, [{ op: "set", path: pluginArray ? ["plugin", Array.isArray(pluginArray) ? pluginArray.length : 0] : ["plugin", 0], value: "@mirrowel/opencode-subagent-explorer@dev" }], "add subagent-explorer standalone entry")
+      if (ok) {
+        setModuleOption(dataDir, studioSettings, "subagent-explorer", "source", "standalone")
+        api.ui.toast({ variant: "info", title: "Standalone entry staged", message: `@mirrowel/opencode-subagent-explorer@dev added to ${fileLabel(state, target.path)} - Save & exit, then restart OpenCode.` })
+        return modulesScreen(api, state)
+      }
+      continue
+    }
+  }
+}
 
 let studioSettings: StudioSettings = loadSettingsDefaultPlaceholder()
 let duplicateCheckDone = false

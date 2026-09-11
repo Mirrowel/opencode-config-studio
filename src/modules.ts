@@ -59,6 +59,8 @@ export type StudioModule = {
   mainMenuEntry?: (ctx: ModuleContext) => MenuEntry & { run: (ctx: ModuleContext) => Promise<void> }
   /** Entries at the top of the Agents screen (integrated layout). */
   agentsScreenEntries?: (ctx: ModuleContext) => Array<MenuEntry & { run: (ctx: ModuleContext) => Promise<void> }>
+  /** Entries on the studio Tools screen (integrated layout). */
+  toolsEntries?: (ctx: ModuleContext) => Array<MenuEntry & { run: (ctx: ModuleContext) => Promise<void> }>
   /** Per-agent entries in the agent detail view (integrated layout). */
   agentDetailEntries?: (ctx: ModuleContext, agent: string) => Array<MenuEntry & { run: (ctx: ModuleContext) => Promise<void> }>
   /** Sections merged into the Diagnostics screen. */

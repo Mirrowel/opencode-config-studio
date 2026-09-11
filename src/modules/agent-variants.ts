@@ -248,6 +248,9 @@ async function variantActions(ctx: ModuleContext, agent: string, key: string): P
 type AVApi = Parameters<typeof EmbeddedWizard.pickParentAgent>[0]
 
 function avApi(api: TuiPluginApi): AVApi {
+  // Embedded scope: the wizard adopts Config Studio's dialog sizing and
+  // hides its own size editor (see wizard.tsx isEmbeddedScope).
+  ;(api as TuiPluginApi & { dialogScope?: "standalone" | "embedded" }).dialogScope = "embedded"
   return api as unknown as AVApi
 }
 

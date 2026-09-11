@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { spawnSync } from "node:child_process"
 import { tmpdir } from "node:os"
 import path from "node:path"
@@ -31,18 +31,24 @@ try {
   if (!packed?.filename) throw new Error("npm pack returned an unsupported JSON result")
   const tarball = path.join(temp, packed.filename)
 
-  // Development checkout: the agent-variants dependency may point at the
-  // sibling repo (dev:link). Keep the smoke hermetic by packing the sibling
-  // and pinning it via overrides. On CI the dependency resolves from the
-  // npm registry directly (existsSync guard: no sibling there).
-  const agentVariantsDep = pkg.dependencies?.["@mirrowel/opencode-agent-variants"]
+  // Development checkout: sibling dependencies (agent-variants,
+  // subagent-explorer) may point at sibling repos (dev:link). Keep the smoke
+  // hermetic by packing each sibling and pinning it via overrides. On CI the
+  // dependencies resolve from the npm registry directly (existsSync guard:
+  // no sibling there).
   const manifest = { private: true, type: "module", dependencies: { [pkg.name]: `file:${tarball}` } }
-  if (agentVariantsDep?.startsWith("file:")) {
-    const avRoot = path.resolve(root, "..", "agent-variants")
-    const avPacks = JSON.parse(run("npm", ["pack", "--json", "--pack-destination", temp], { cwd: avRoot }))
-    const avPacked = Array.isArray(avPacks) ? avPacks[0] : Object.values(avPacks)[0]
-    if (!avPacked?.filename) throw new Error("npm pack for agent-variants returned an unsupported JSON result")
-    manifest.overrides = { "@mirrowel/opencode-agent-variants": `file:${path.join(temp, avPacked.filename)}` }
+  for (const sibling of [
+    { dep: "@mirrowel/opencode-agent-variants", dir: "agent-variants" },
+    { dep: "@mirrowel/opencode-subagent-explorer", dir: "subagent-explorer" },
+  ]) {
+    const dep = pkg.dependencies?.[sibling.dep]
+    if (!dep?.startsWith("file:")) continue
+    const siblingRoot = path.resolve(root, "..", sibling.dir)
+    if (!existsSync(siblingRoot)) continue
+    const siblingPacks = JSON.parse(run("npm", ["pack", "--json", "--pack-destination", temp], { cwd: siblingRoot }))
+    const siblingPacked = Array.isArray(siblingPacks) ? siblingPacks[0] : Object.values(siblingPacks)[0]
+    if (!siblingPacked?.filename) throw new Error(`npm pack for ${sibling.dir} returned an unsupported JSON result`)
+    manifest.overrides = { ...(manifest.overrides ?? {}), [sibling.dep]: `file:${path.join(temp, siblingPacked.filename)}` }
   }
   writeFileSync(path.join(temp, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`)
   run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: temp })

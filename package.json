@@ -79,6 +79,7 @@
   },
   "dependencies": {
     "@mirrowel/opencode-agent-variants": "^0.10.0",
+    "@mirrowel/opencode-subagent-explorer": "^0.1.0",
     "@opencode-ai/plugin": ">=1.14.0",
     "@opentui/solid": "^0.4.1",
     "jsonc-parser": "^3.3.1",
