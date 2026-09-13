@@ -60,7 +60,12 @@ export function currentPaletteCategory(): string {
 export function reconcilePaletteCategories(): void {
   const category = joinedCategory()
   for (const entry of registry().entries) {
-    for (const command of entry.commands) command.category = category
+    // v1 command objects group via `category`; v2 keymap commands use `group`.
+    // Stamping both keeps one registry meaningful on both hosts.
+    for (const command of entry.commands as Array<{ category?: string; group?: string }>) {
+      command.category = category
+      command.group = category
+    }
   }
 }
 

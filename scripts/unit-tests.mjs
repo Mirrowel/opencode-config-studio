@@ -19,7 +19,10 @@ const { isOwnSpec, ensureTuiRegistration, ourRootDir, PLUGIN_NPM_NAME } = await 
 const { fuzzyScore, rankOptions } = await import(dist("search"))
 const { loadSettings, saveSettings, settingsPath, moduleEnabled, setModuleEnabled, setModuleOption, moduleOption, DEFAULT_HIDDEN_SECTIONS } = await import(dist("settings"))
 const { applyOpsToData, getAtPath } = await import(dist("jsonc"))
-const { isStandaloneAgentVariantsSpec, findStandaloneAgentVariants, removeStandaloneHits } = await import(dist("standalone"))
+const { isStandaloneAgentVariantsSpec, findStandaloneAgentVariants, removeStandaloneHits, pluginEntrySpec } = await import(dist("standalone"))
+const { resolveStandaloneDirV2In } = await import(dist("av-source"))
+const { resolveOpencodeBinary } = await import(dist("sink"))
+const serverEntry = await import(dist("server"))
 const cache = await import(dist("providercache"))
 const { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } = await import(dist("migration"))
 const palette = await import(dist("palette-category"))
@@ -491,6 +494,29 @@ function section(name) {
 }
 
 {
+  section("selfwire: local checkout wins over npm when both are registered")
+  const dir = mkdtempSync(path.join(tmpdir(), "config-studio-test-"))
+  const globalDir = path.join(dir, "global")
+  const pluginRoot = path.join(dir, "plugins", "opencode-config-studio")
+  mkdirSync(globalDir, { recursive: true })
+  mkdirSync(pluginRoot, { recursive: true })
+  try {
+    const localSpec = pathToFileURL(pluginRoot).href
+    writeFileSync(path.join(globalDir, "opencode.json"), JSON.stringify({ plugin: [`${PLUGIN_NPM_NAME}@latest`, localSpec] }), "utf8")
+    writeFileSync(path.join(globalDir, "tui.json"), JSON.stringify({ plugin: [localSpec, `${PLUGIN_NPM_NAME}@latest`, "@cortexkit/other"] }), "utf8")
+    const result = ensureTuiRegistration({ globalConfigDir: globalDir, ourRoot: pluginRoot })
+    if (result.status !== "corrected") throw new Error(`expected corrected, got ${result.status}`)
+    if (result.spec !== localSpec) throw new Error(`local must win, got ${result.spec}`)
+    const tui = JSON.parse(readFileSync(path.join(globalDir, "tui.json"), "utf8"))
+    const own = tui.plugin.filter((entry) => entry.includes("opencode-config-studio"))
+    if (own.length !== 1 || own[0] !== localSpec) throw new Error(`expected exactly the local spec, got ${JSON.stringify(tui.plugin)}`)
+    if (!tui.plugin.includes("@cortexkit/other")) throw new Error("foreign entries must survive the dedup")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+{
   section("selfwire: project-level registration mirrors to project tui.json")
   const dir = mkdtempSync(path.join(tmpdir(), "config-studio-test-"))
   const globalDir = path.join(dir, "global")
@@ -510,29 +536,6 @@ function section(name) {
     const projectTui = readFileSync(path.join(project, "tui.json"), "utf8")
     if (!projectTui.includes(decodeURIComponent(localSpec))) throw new Error(`project tui.json must carry the spec: ${projectTui}`)
     if (existsSync(path.join(globalDir, "tui.json"))) throw new Error("global tui.json must stay absent for a project-level registration")
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
-}
-
-{
-  section("selfwire: local checkout wins over npm when both are registered")
-  const dir = mkdtempSync(path.join(tmpdir(), "config-studio-test-"))
-  const globalDir = path.join(dir, "global")
-  const pluginRoot = path.join(dir, "plugins", "opencode-config-studio")
-  mkdirSync(globalDir, { recursive: true })
-  mkdirSync(pluginRoot, { recursive: true })
-  try {
-    const localSpec = pathToFileURL(pluginRoot).href
-    writeFileSync(path.join(globalDir, "opencode.json"), JSON.stringify({ plugin: [`${PLUGIN_NPM_NAME}@latest`, localSpec] }), "utf8")
-    writeFileSync(path.join(globalDir, "tui.json"), JSON.stringify({ plugin: [localSpec, `${PLUGIN_NPM_NAME}@latest`, "@cortexkit/other"] }), "utf8")
-    const result = ensureTuiRegistration({ globalConfigDir: globalDir, ourRoot: pluginRoot })
-    if (result.status !== "corrected") throw new Error(`expected corrected, got ${result.status}`)
-    if (result.spec !== localSpec) throw new Error(`local must win, got ${result.spec}`)
-    const tui = JSON.parse(readFileSync(path.join(globalDir, "tui.json"), "utf8"))
-    const own = tui.plugin.filter((entry) => entry.includes("opencode-config-studio"))
-    if (own.length !== 1 || own[0] !== localSpec) throw new Error(`expected exactly the local spec, got ${JSON.stringify(tui.plugin)}`)
-    if (!tui.plugin.includes("@cortexkit/other")) throw new Error("foreign entries must survive the dedup")
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -1401,5 +1404,119 @@ async function testSuggestionsAndMetrics() {
   }
 }
 testSuggestionsAndMetrics()
+
+// ---------------------------------------------------------------------------
+// OpenCode v2 dual-target surface
+// ---------------------------------------------------------------------------
+
+function testDualServerEntry() {
+  const mod = serverEntry.default
+  assert(mod?.id === "config-studio", "server entry carries the plugin id")
+  assert(typeof mod?.server === "function", "server entry exposes the v1 server factory")
+  assert(typeof mod?.setup === "function", "server entry exposes a v2 setup function")
+  assert(mod?.tui === undefined, "server entry must not advertise a tui export (v1 both-present rejection)")
+}
+
+function testPluginEntrySpecForms() {
+  assert(pluginEntrySpec("@mirrowel/opencode-agent-variants") === "@mirrowel/opencode-agent-variants", "string spec passes through")
+  assert(pluginEntrySpec(["@mirrowel/opencode-agent-variants", { a: 1 }]) === "@mirrowel/opencode-agent-variants", "v1 tuple spec extracts the spec")
+  assert(pluginEntrySpec({ package: "@mirrowel/opencode-agent-variants", options: {} }) === "@mirrowel/opencode-agent-variants", "v2 object spec extracts package")
+  assert(pluginEntrySpec({ options: {} }) === undefined, "object without package yields no spec")
+  assert(pluginEntrySpec(undefined) === undefined, "undefined entry yields no spec")
+}
+
+function testStandaloneV2Scanning() {
+  const dir = mkdtempSync(path.join(tmpdir(), "studio-standalone-"))
+  try {
+    const project = path.join(dir, "project")
+    mkdirSync(project, { recursive: true })
+    const opencode = path.join(project, "opencode.json")
+    writeFileSync(opencode, JSON.stringify({
+      plugin: [["file:///c:/x/agent-variants", {}]],
+      plugins: [
+        "some-other-plugin",
+        { package: "@mirrowel/opencode-agent-variants", options: { x: 1 } },
+      ],
+    }))
+    const cli = path.join(dir, "cli.json")
+    writeFileSync(cli, JSON.stringify({ plugins: ["@mirrowel/opencode-agent-variants@dev"] }))
+    const tui = path.join(dir, "tui.json")
+    writeFileSync(tui, JSON.stringify({ plugin: ["@mirrowel/opencode-agent-variants"] }))
+
+    const hits = findStandaloneAgentVariants({ globalConfigDir: dir, directory: project, worktree: project, env: {} })
+    assert(hits.length === 4, `all four registrations found (got ${hits.length})`)
+    assert(hits.some((hit) => hit.file === opencode && hit.key === "plugin" && hit.spec.startsWith("file:")), "v1 tuple entry found under plugin key")
+    assert(hits.some((hit) => hit.file === opencode && hit.key === "plugins" && hit.spec === "@mirrowel/opencode-agent-variants"), "v2 object entry found under plugins key")
+    assert(hits.some((hit) => hit.file === cli && hit.key === "plugins" && hit.spec === "@mirrowel/opencode-agent-variants@dev"), "cli.json scanned")
+
+    // Removal deletes by the correct key+index; unrelated entries survive.
+    const results = removeStandaloneHits(hits, path.join(dir, "state"))
+    assert(results.every((result) => !result.error), "removal succeeds")
+    const afterOpencode = JSON.parse(readFileSync(opencode, "utf8"))
+    assert(afterOpencode.plugin.length === 0, "v1 plugin entries removed")
+    assert(afterOpencode.plugins.length === 1 && afterOpencode.plugins[0] === "some-other-plugin", "v2 sibling entry survives")
+    const afterTui = JSON.parse(readFileSync(tui, "utf8"))
+    assert(afterTui.plugin.length === 0, "tui.json entry removed")
+    const afterCli = JSON.parse(readFileSync(cli, "utf8"))
+    assert(afterCli.plugins.length === 0, "cli.json entry removed")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+function testStandaloneV2CacheScan() {
+  const base = mkdtempSync(path.join(tmpdir(), "studio-avcache-"))
+  try {
+    const pkgName = "@mirrowel/opencode-agent-variants"
+    const install = (gen) => {
+      const dir = path.join(base, `${pkgName}@dev`, String(gen), "node_modules", ...pkgName.split("/"))
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: pkgName, version: `0.9.${gen}` }))
+      return dir
+    }
+    install(1)
+    const newest = install(3)
+    const resolved = resolveStandaloneDirV2In(base, `${pkgName}@dev`)
+    assert(resolved === newest, `v2 cache picks the newest generation (got ${resolved}, want ${newest})`)
+    assert(resolveStandaloneDirV2In(base, "@mirrowel/unrelated") === undefined, "unknown specs resolve to nothing")
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+}
+
+function testResolveOpencodeBinaryV2() {
+  const dir = mkdtempSync(path.join(tmpdir(), "studio-bin-"))
+  try {
+    if (process.platform === "win32") {
+      writeFileSync(path.join(dir, "opencode2.cmd"), "@echo off\r\n")
+      writeFileSync(path.join(dir, "opencode2.exe"), "")
+      writeFileSync(path.join(dir, "opencode.exe"), "")
+    } else {
+      writeFileSync(path.join(dir, "opencode2"), "#!/bin/sh\n")
+      writeFileSync(path.join(dir, "opencode"), "#!/bin/sh\n")
+    }
+    const previous = process.env.PATH
+    process.env.PATH = `${dir}${path.delimiter}${previous ?? ""}`
+    try {
+      const v2 = resolveOpencodeBinary(2)
+      assert(v2.toLowerCase().includes("opencode2"), `v2 resolution prefers opencode2 binaries (got ${v2})`)
+      // Node >= 18.20 cannot spawn .cmd/.bat shims directly; the .exe must win.
+      assert(!/\.(cmd|bat)$/i.test(v2), `v2 resolution must prefer real executables over shims (got ${v2})`)
+      const v1 = resolveOpencodeBinary(1)
+      assert(!v1.toLowerCase().includes("opencode2"), `v1 resolution ignores opencode2 (got ${v1})`)
+      assert(!/\.(cmd|bat)$/i.test(v1), `v1 resolution must prefer real executables over shims (got ${v1})`)
+    } finally {
+      process.env.PATH = previous
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+testDualServerEntry()
+testPluginEntrySpecForms()
+testStandaloneV2Scanning()
+testStandaloneV2CacheScan()
+testResolveOpencodeBinaryV2()
 
 console.log("all unit tests passed")

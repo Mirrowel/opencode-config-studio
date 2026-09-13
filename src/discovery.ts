@@ -156,6 +156,8 @@ export function discoverTuiFiles(input: DiscoveryInput): ConfigFileEntry[] {
   for (const name of ["tui.json", "tui.jsonc"]) {
     entries.push(makeEntry("tui", `global ${name}`, join(input.globalConfigDir, name), precedence++))
   }
+  // OpenCode v2's one global terminal-client config (migrated from tui.json).
+  entries.push(makeEntry("tui", "global cli.json (v2)", join(input.globalConfigDir, "cli.json"), precedence++))
   if (input.envTuiFile) {
     entries.push(makeEntry("tui", "OPENCODE_TUI_CONFIG", input.envTuiFile, precedence++))
   }

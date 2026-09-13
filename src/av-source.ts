@@ -96,8 +96,74 @@ function unwrapCacheDir(dir: string): string {
   return dir
 }
 
+/** v2 cache layout: ~/.cache/opencode/npm/<sanitized name@spec>/<generation>/… */
+function probeV2KeyDir(keyDir: string): string | undefined {
+  try {
+    if (!existsSync(keyDir)) return undefined
+    // Numbered generation directories; the highest number is the newest.
+    // A generation is an install root (node_modules/ inside, sometimes with
+    // a wrapper package.json) — unwrapCacheDir descends to the real package.
+    let generations: number[] = []
+    try {
+      generations = readdirSync(keyDir)
+        .map((entry) => Number.parseInt(entry, 10))
+        .filter((value) => Number.isFinite(value) && existsSync(join(keyDir, String(value))))
+    } catch {
+      generations = []
+    }
+    if (generations.length > 0) {
+      const dir = join(keyDir, String(Math.max(...generations)))
+      if (packageJsonExists(dir) || existsSync(join(dir, "node_modules"))) return unwrapCacheDir(dir)
+    }
+    if (packageJsonExists(keyDir)) return unwrapCacheDir(keyDir)
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
+function resolveV2CacheDir(base: string, sanitizedSpec: string): string | undefined {
+  try {
+    for (const key of [sanitizedSpec, `${sanitizedSpec}@latest`]) {
+      const found = probeV2KeyDir(join(base, ...key.split("/")))
+      if (found) return found
+    }
+    // Unresolved spec form: scan for any key containing the package name.
+    const name = (sanitizedSpec.split("/").pop() ?? sanitizedSpec).split("@")[0] ?? sanitizedSpec
+    let entries: string[] = []
+    try {
+      entries = readdirSync(base).filter((entry) => entry.includes(name))
+    } catch {
+      return undefined
+    }
+    for (const entry of entries) {
+      const found = probeV2KeyDir(join(base, entry))
+      if (found) return found
+    }
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** v2 cache root honors the same env/XDG resolution as the v2 host. */
+function v2CacheRoot(): string {
+  if (process.env["OPENCODE_CACHE_DIR"]) return process.env["OPENCODE_CACHE_DIR"]
+  if (process.env["XDG_CACHE_HOME"]) return join(process.env["XDG_CACHE_HOME"], "opencode")
+  return join(homedir(), ".cache", "opencode")
+}
+
 export function resolveStandaloneDir(spec: string): string | undefined {
-  return resolveStandaloneDirIn(join(homedir(), ".cache", "opencode", "packages"), spec)
+  const v1 = resolveStandaloneDirIn(join(homedir(), ".cache", "opencode", "packages"), spec)
+  if (v1) return v1
+  const normalized = spec.startsWith("@mirrowel") && !spec.includes("@", 1) ? `${spec}@latest` : spec
+  return resolveV2CacheDir(join(v2CacheRoot(), "npm"), sanitizeSpec(normalized))
+}
+
+/** Tests: v2 cache scan against an explicit base directory. */
+export function resolveStandaloneDirV2In(base: string, spec: string): string | undefined {
+  const normalized = spec.startsWith("@mirrowel") && !spec.includes("@", 1) ? `${spec}@latest` : spec
+  return resolveV2CacheDir(base, sanitizeSpec(normalized))
 }
 
 export function resolveStandaloneDirIn(base: string, spec: string): string | undefined {

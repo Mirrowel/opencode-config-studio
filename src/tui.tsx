@@ -35,6 +35,7 @@ import {
 } from "./catalog.js"
 import { runCapture, diffBodies, type CaptureRunResult } from "./sink.js"
 import { ensureTuiRegistration, ourRootDir } from "./selfwire.js"
+import { createStudioTuiSetup } from "./v2-tui.js"
 import { agentMode as avAgentMode, showFieldList as avShowFieldList, type FieldListOption as AVFieldListOption, type FieldListChoice as AVFieldListChoice } from "@mirrowel/opencode-agent-variants/wizard"
 import { FIELD_DOCS } from "./docs.js"
 import { rankOptions } from "./search.js"
@@ -47,14 +48,14 @@ import { providerCacheKey, getCachedProviders, setCachedProviders, providerCache
 import { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } from "./migration.js"
 import { DEFAULT_HIDDEN_SECTIONS, loadSettings, moduleOption, saveSettings, setModuleOption, settingsPath, PINNABLE_SCREENS, screenTitle, type StudioSettings } from "./settings.js"
 import { avOrigin, refreshAvSource } from "./av-source.js"
+import { isStandaloneSubagentExplorerSpec, refreshSeSource, seOrigin } from "./se-source.js"
+import { runExplorer } from "./modules/subagent-explorer.js"
 import { getToolBundle, fetchMcpStatus, mergeMcpSources, maskSecretHeaders, clearToolCache, type McpSourceRow } from "./toollist.js"
 import { autoProbeEnabledServers, getMcpProbe, mcpProbeSnapshot, probeInflightCount, waitForProbes } from "./mcpprobe.js"
 import { beginStudioFlow, cancelPendingReload, endStudioFlow, fetchActiveSessions, fetchRunningSessions, pendingReload, reloadNow, requestReload, __testSetPending as setReloadPendingForTest, type RunningSession } from "./reload.js"
 import { enabledModules, moduleUsesOwnMenu, getModules, type ModuleContext, type MenuEntry as MenuEntryShape } from "./modules.js"
 import { agentVariantsModuleId, agentVariantsHiddenAliases, resetAgentVariantsLens, setModuleAlertImplementation, setModulePickImplementation, __testTouchDraft } from "./modules/agent-variants.js"
 import "./modules/subagent-explorer.js"
-import { isStandaloneSubagentExplorerSpec, refreshSeSource, seOrigin } from "./se-source.js"
-import { runExplorer } from "./modules/subagent-explorer.js"
 import { findStandaloneAgentVariants, isStandaloneAgentVariantsSpec, removeStandaloneHits } from "./standalone.js"
 
 // ---------------------------------------------------------------------------
@@ -2682,6 +2683,7 @@ async function toolsScreen(api: TuiPluginApi, state: StudioState): Promise<void>
   }
 }
 
+
 async function modulesScreen(api: TuiPluginApi, state: StudioState): Promise<void> {
   const dataDir = studioDataDir(api)
   const options: WizardSelectOption<string>[] = getModules().map((module) => {
@@ -3972,6 +3974,7 @@ function captureTargetFor(analysis: ModelAnalysis, provider: RuntimeProviderLike
     runtimeModel: analysis.runtime,
     providerNpm: npm,
     variant,
+    hostVersion: (activeApi as { hostVersion?: 1 | 2 } | undefined)?.hostVersion === 2 ? (2 as const) : (1 as const),
   }
 }
 
@@ -4958,28 +4961,33 @@ function registerStudioCommand(api: TuiPluginApi, run: () => Promise<void>) {
   ])
 }
 
-const tui: TuiPlugin = async (api) => {
+/**
+ * Shared TUI activation for both hosts. The v1 entry delegates here directly;
+ * the v2 setup (v2-tui.ts) builds a v1-shaped adapter over the v2 context and
+ * calls this with it. Self-wiring is v1-only: the v2 TUI discovers TUI
+ * plugins from server-declared registrations automatically.
+ */
+export const studioTuiActivation = async (api: TuiPluginApi): Promise<void> => {
   activeApi = api
-  // Belt-and-braces: if this plugin got registered in opencode.json but not in
-  // any tui.json layer, mirror the registration (normally done by the server
-  // entry; no-op when the TUI part is already properly wired).
-  try {
-    const wired = ensureTuiRegistration({
-      globalConfigDir: api.state.path.config,
-      ourRoot: ourRootDir(),
-      directory: api.state.path.directory,
-      worktree: api.state.path.worktree,
-      env: process.env,
-    })
-    if (wired.status === "wired") {
-      api.ui.toast({
-        variant: "info",
-        title: "Config Studio",
-        message: `Added ${wired.spec} to tui.json - restart OpenCode to load the TUI part.`,
+  if ((api as { hostVersion?: number }).hostVersion !== 2) {
+    try {
+      const wired = ensureTuiRegistration({
+        globalConfigDir: api.state.path.config,
+        ourRoot: ourRootDir(),
+        directory: api.state.path.directory,
+        worktree: api.state.path.worktree,
+        env: process.env,
       })
+      if (wired.status === "wired") {
+        api.ui.toast({
+          variant: "info",
+          title: "Config Studio",
+          message: `Added ${wired.spec} to tui.json - restart OpenCode to load the TUI part.`,
+        })
+      }
+    } catch {
+      // never block activation on self-wiring
     }
-  } catch {
-    // never block activation on self-wiring
   }
 
   // Module system: register the picker used by module menus and load settings.
@@ -5017,6 +5025,18 @@ const tui: TuiPlugin = async (api) => {
     try {
       studioSettings = loadSettings(studioDataDir(api))
       duplicateCheckDone = false
+      if ((api as { hostVersion?: number }).hostVersion === 2) {
+        // Honest limitation notice: v2 reads cli.json, not the layered
+        // tui.json files this studio still edits (full v2 editor to come).
+        api.ui.toast({
+          variant: "info",
+          title: "Config Studio",
+          message: "OpenCode v2 detected: terminal settings live in cli.json; tui.json edits only apply to OpenCode v1.",
+        })
+        // v2 adapter: refresh plugin entries / default agent / MCP overlay
+        // from config docs on every studio open.
+        void (api as { __studioV2RefreshConfigDocs?: () => Promise<void> }).__studioV2RefreshConfigDocs?.()
+      }
       let state: StudioState | undefined
       // Deferred busy indicator: warm caches skip the dialog entirely; only a
       // genuinely slow load (cold start) flashes it after 150ms. The busy
@@ -5060,7 +5080,15 @@ const tui: TuiPlugin = async (api) => {
   })
 }
 
-export default { id: "config-studio", tui }
+const tui: TuiPlugin = studioTuiActivation
+
+/**
+ * Dual-target TUI entry: v1 (strict loader) requires `default.tui` to be a
+ * function and ignores excess keys; v2 requires `default` to be
+ * `{ id, setup }` and only inspects id+setup — the legacy `tui` factory rides
+ * along harmlessly.
+ */
+export default { id: "config-studio", tui, setup: createStudioTuiSetup(studioTuiActivation) }
 
 // Test hooks for the menu-tree smoke test (scripts/menu-tree-smoke.mjs).
 export const __testInternals = {

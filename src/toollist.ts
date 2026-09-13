@@ -149,6 +149,8 @@ export function mcpStatusLabel(state: McpStatusLike | undefined): { label: strin
   if (status === "failed") return { label: "failed", error: typeof state?.error === "string" ? state.error : undefined, kind: "failed" }
   if (status === "needs_auth") return { label: "needs auth", kind: "auth" }
   if (status === "needs_client_registration") return { label: "needs client registration", error: typeof state?.error === "string" ? state.error : undefined, kind: "auth" }
+  // v2 reports "pending" while a server is still connecting.
+  if (status === "pending") return { label: "connecting", kind: "unknown" }
   return { label: "unknown", kind: "unknown" }
 }
 

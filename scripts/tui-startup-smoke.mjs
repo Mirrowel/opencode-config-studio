@@ -15,6 +15,10 @@ if (caseName !== "silent" && caseName !== "duplicate") {
 const root = path.resolve(import.meta.dir, "..")
 const { default: mod } = await import(pathToFileURL(path.join(root, "dist", "tui.js")).href)
 if (mod?.id !== "config-studio" || typeof mod?.tui !== "function") throw new Error("bad tui export")
+// Dual-target contract: v1 strict loader needs the `tui` factory; the v2
+// loader needs { id, setup } and ignores excess keys.
+if (typeof mod?.setup !== "function") throw new Error("bad v2 setup export")
+if (mod?.server !== undefined) throw new Error("tui entry must not carry a server export")
 
 function makeMockApi(globalDir) {
   let confirmProps = undefined

@@ -30,6 +30,8 @@ export interface SinkCaptureTarget {
   providerNpm?: string
   variant?: string
   agentOverrides?: { temperature?: number; top_p?: number; options?: Record<string, unknown> }
+  /** Host major version: picks the spawned binary, auth, and HTTP routes. */
+  hostVersion?: 1 | 2
 }
 
 export interface CapturedRequest {
@@ -267,14 +269,25 @@ async function startSink(): Promise<SinkState> {
 // OpenCode binary resolution
 // ---------------------------------------------------------------------------
 
-export function resolveOpencodeBinary(): string {
+const SINK_PASSWORD = "config-studio-sink"
+
+export function resolveOpencodeBinary(hostVersion: 1 | 2 = 1): string {
   const execPath = process.execPath.replace(/\.exe$/i, "")
   const base = execPath.split(/[\\/]/).pop() ?? ""
-  if (/opencode/i.test(base)) return process.execPath
+  if (hostVersion === 2 && /opencode2/i.test(base)) return process.execPath
+  if (hostVersion === 1 && /opencode/i.test(base) && !/opencode2/i.test(base)) return process.execPath
+  const names =
+    hostVersion === 2
+      ? process.platform === "win32"
+        ? ["opencode2.exe", "opencode2.cmd", "opencode2"]
+        : ["opencode2"]
+      : process.platform === "win32"
+        ? ["opencode.exe", "opencode.cmd", "opencode"]
+        : ["opencode"]
   const pathVar = process.env["PATH"] ?? ""
   for (const dir of pathVar.split(process.platform === "win32" ? ";" : ":")) {
     if (!dir) continue
-    for (const name of process.platform === "win32" ? ["opencode.exe", "opencode.cmd", "opencode"] : ["opencode"]) {
+    for (const name of names) {
       const candidate = join(dir, name)
       try {
         accessSync(candidate, fsConstants.X_OK)
@@ -284,7 +297,7 @@ export function resolveOpencodeBinary(): string {
       }
     }
   }
-  return "opencode"
+  return hostVersion === 2 ? "opencode2" : "opencode"
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +355,7 @@ function killTree(child: ChildProcess): void {
 }
 
 export async function runCapture(target: SinkCaptureTarget): Promise<CaptureRunResult> {
+  const hostVersion = target.hostVersion === 2 ? 2 : 1
   const started = Date.now()
   const logs: string[] = []
   let sink: SinkState | undefined
@@ -358,15 +372,22 @@ export async function runCapture(target: SinkCaptureTarget): Promise<CaptureRunR
     tempDir = await mkdtemp(join(tmpdir(), "config-studio-"))
     const inlineConfig = buildInlineConfig(target, `http://127.0.0.1:${sink.port}`)
 
-    const binary = resolveOpencodeBinary()
-    pushLog(`binary: ${binary}`)
-    child = spawn(binary, ["serve", "--port", "0", "--hostname", "127.0.0.1"], {
+    const binary = resolveOpencodeBinary(hostVersion)
+    pushLog(`binary: ${binary} (v${hostVersion})`)
+    // npm .cmd/.bat shims cannot be spawned directly on Node >= 18.20
+    // (CVE-2024-27980): route them through cmd.exe explicitly.
+    const isWindowsShellShim = process.platform === "win32" && /\.(cmd|bat)$/i.test(binary)
+    const spawnCommand = isWindowsShellShim ? "cmd.exe" : binary
+    const spawnArgs = isWindowsShellShim ? ["/c", binary, "serve", "--port", "0", "--hostname", "127.0.0.1"] : ["serve", "--port", "0", "--hostname", "127.0.0.1"]
+    child = spawn(spawnCommand, spawnArgs, {
       cwd: tempDir,
       env: {
         ...process.env,
         OPENCODE_CONFIG_CONTENT: JSON.stringify(inlineConfig),
         OPENCODE_DISABLE_AUTOUPDATE: "1",
         OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+        // v2 servers require basic auth; a fixed password keeps the flow headless.
+        ...(hostVersion === 2 ? { OPENCODE_PASSWORD: SINK_PASSWORD } : {}),
       },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
@@ -394,32 +415,75 @@ export async function runCapture(target: SinkCaptureTarget): Promise<CaptureRunR
     )
     pushLog(`temp server: ${baseUrl}`)
 
+    // v1 routes live at /session..., v2 at /api/session... with basic auth.
+    const api = (path: string) => (hostVersion === 2 ? `${baseUrl}/api${path}` : `${baseUrl}${path}`)
+    const authHeaders: Record<string, string> = { "content-type": "application/json" }
+    if (hostVersion === 2) {
+      authHeaders["authorization"] = `Basic ${Buffer.from(`opencode:${SINK_PASSWORD}`).toString("base64")}`
+    }
+
+    const createBody: Record<string, unknown> =
+      hostVersion === 2
+        ? {
+            agent: "config-studio-sim",
+            // v2 wire Model.Ref: {id, providerID, variant?} — `modelID` would
+            // be silently dropped and `variant` lives INSIDE the ref.
+            model: {
+              id: target.modelID,
+              providerID: target.providerID,
+              ...(target.variant ? { variant: target.variant } : {}),
+            },
+          }
+        : {}
     const created = (await fetchJSON(
-      `${baseUrl}/session`,
-      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}) },
+      api("/session"),
+      { method: "POST", headers: authHeaders, body: JSON.stringify(createBody) },
       15_000,
       logs,
     )) as Record<string, unknown> | undefined
-    const sessionID = created?.["sessionID"] ?? created?.["id"]
+    const createdData = created?.["data"] as Record<string, unknown> | undefined
+    const sessionID =
+      created?.["sessionID"] ?? created?.["id"] ?? createdData?.["sessionID"] ?? createdData?.["id"]
     if (typeof sessionID !== "string") throw new Error("failed to create temp session")
     pushLog(`session: ${sessionID}`)
 
-    const promptPayload: Record<string, unknown> = {
-      agent: "config-studio-sim",
-      model: { providerID: target.providerID, modelID: target.modelID },
-      parts: [{ type: "text", text: "Say ok" }],
-    }
-    if (target.variant) promptPayload["variant"] = target.variant
+    if (hostVersion === 2) {
+      // v2 prompts are durable admissions: admit, long-poll until idle, then
+      // let the grace window collect background (title) calls.
+      const promptPayload = { text: "Say ok" }
+      try {
+        await fetchJSON(
+          api(`/session/${sessionID}/prompt`),
+          { method: "POST", headers: authHeaders, body: JSON.stringify(promptPayload) },
+          PROMPT_TIMEOUT_MS,
+          logs,
+        )
+      } catch (error) {
+        pushLog(`prompt error (continuing): ${error instanceof Error ? error.message : String(error)}`)
+      }
+      try {
+        await fetchJSON(api(`/session/${sessionID}/wait`), { method: "POST", headers: authHeaders }, PROMPT_TIMEOUT_MS, logs)
+      } catch (error) {
+        pushLog(`wait error (continuing): ${error instanceof Error ? error.message : String(error)}`)
+      }
+    } else {
+      const promptPayload: Record<string, unknown> = {
+        agent: "config-studio-sim",
+        model: { providerID: target.providerID, modelID: target.modelID },
+        parts: [{ type: "text", text: "Say ok" }],
+      }
+      if (target.variant) promptPayload["variant"] = target.variant
 
-    try {
-      await fetchJSON(
-        `${baseUrl}/session/${sessionID}/message`,
-        { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(promptPayload) },
-        PROMPT_TIMEOUT_MS,
-        logs,
-      )
-    } catch (error) {
-      pushLog(`prompt error (continuing): ${error instanceof Error ? error.message : String(error)}`)
+      try {
+        await fetchJSON(
+          api(`/session/${sessionID}/message`),
+          { method: "POST", headers: authHeaders, body: JSON.stringify(promptPayload) },
+          PROMPT_TIMEOUT_MS,
+          logs,
+        )
+      } catch (error) {
+        pushLog(`prompt error (continuing): ${error instanceof Error ? error.message : String(error)}`)
+      }
     }
 
     // Grace period so background small-model calls (titles) also land.
@@ -427,8 +491,8 @@ export async function runCapture(target: SinkCaptureTarget): Promise<CaptureRunR
 
     try {
       await fetchJSON(
-        `${baseUrl}/session/${sessionID}`,
-        { method: "DELETE" },
+        api(`/session/${sessionID}`),
+        { method: "DELETE", headers: authHeaders },
         10_000,
         logs,
       )

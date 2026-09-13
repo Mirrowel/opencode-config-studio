@@ -21,6 +21,8 @@ export type StandaloneHit = {
   file: string
   spec: string
   index: number
+  /** Config array key the entry lives in: v1 `plugin`, v2 `plugins`. */
+  key: "plugin" | "plugins"
 }
 
 function normalizePath(value: string): string {
@@ -46,15 +48,28 @@ export function isStandaloneAgentVariantsSpec(spec: unknown): spec is string {
   return false
 }
 
+/** Extracts the spec string from v1 (string | [spec, options]) and v2 ({package}) entry forms. */
+export function pluginEntrySpec(entry: unknown): string | undefined {
+  if (typeof entry === "string") return entry
+  if (Array.isArray(entry) && typeof entry[0] === "string") return entry[0] as string
+  if (entry && typeof entry === "object" && typeof (entry as { package?: unknown }).package === "string") {
+    return (entry as { package: string }).package
+  }
+  return undefined
+}
+
 function scanFile(file: { path: string; data: unknown }): StandaloneHit[] {
   if (!isPlainObject(file.data)) return []
-  const plugin = file.data["plugin"]
-  if (!Array.isArray(plugin)) return []
   const hits: StandaloneHit[] = []
-  plugin.forEach((entry, index) => {
-    const spec = typeof entry === "string" ? entry : Array.isArray(entry) && typeof entry[0] === "string" ? (entry[0] as string) : undefined
-    if (spec !== undefined && isStandaloneAgentVariantsSpec(spec)) hits.push({ file: file.path, spec, index })
-  })
+  // v1 opencode.json/tui.json use `plugin`; v2 opencode.json/cli.json use `plugins`.
+  for (const key of ["plugin", "plugins"] as const) {
+    const array = file.data[key]
+    if (!Array.isArray(array)) continue
+    array.forEach((entry, index) => {
+      const spec = pluginEntrySpec(entry)
+      if (spec !== undefined && isStandaloneAgentVariantsSpec(spec)) hits.push({ file: file.path, spec, index, key })
+    })
+  }
   return hits
 }
 
@@ -83,7 +98,8 @@ export function findStandaloneAgentVariants(input: {
     hits.push(...scanFile(layer))
   }
 
-  const tuiCandidates = [join(input.globalConfigDir, "tui.json")]
+  // Terminal-client config files: v1 tui.json layers, v2 one global cli.json.
+  const tuiCandidates = [join(input.globalConfigDir, "tui.json"), join(input.globalConfigDir, "cli.json")]
   const envTui = input.env?.["OPENCODE_TUI_CONFIG"]
   if (envTui) tuiCandidates.push(envTui)
   for (const path of tuiCandidates) {
@@ -92,7 +108,7 @@ export function findStandaloneAgentVariants(input: {
   return hits
 }
 
-/** Removes every standalone hit (descending indices per file, backups kept). */
+/** Removes every standalone hit (descending indices per file+key, backups kept). */
 export function removeStandaloneHits(hits: StandaloneHit[], stateDir: string): Array<{ file: string; error?: string }> {
   const byFile = new Map<string, StandaloneHit[]>()
   for (const hit of hits) {
@@ -102,9 +118,19 @@ export function removeStandaloneHits(hits: StandaloneHit[], stateDir: string): A
   }
   const results: Array<{ file: string; error?: string }> = []
   for (const [file, fileHits] of byFile) {
-    const ops: EditOp[] = [...fileHits]
-      .sort((a, b) => b.index - a.index)
-      .map((hit) => ({ op: "delete" as const, path: ["plugin", hit.index] }))
+    // Delete per key so v1 (`plugin`) and v2 (`plugins`) indices stay correct.
+    const byKey = new Map<"plugin" | "plugins", StandaloneHit[]>()
+    for (const hit of fileHits) {
+      const list = byKey.get(hit.key) ?? []
+      list.push(hit)
+      byKey.set(hit.key, list)
+    }
+    const ops: EditOp[] = []
+    for (const list of byKey.values()) {
+      for (const hit of [...list].sort((a, b) => b.index - a.index)) {
+        ops.push({ op: "delete" as const, path: [hit.key, hit.index] })
+      }
+    }
     const result = editConfigFile(file, ops, { stateDir, reason: "remove standalone agent-variants (embedded in config studio)" })
     results.push({ file, error: result.ok ? undefined : result.error })
   }

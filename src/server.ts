@@ -4,6 +4,7 @@ import { join } from "node:path"
 import { ensureTuiRegistration, ourRootDir } from "./selfwire.js"
 import { findStandaloneAgentVariants } from "./standalone.js"
 import { loadSettings, moduleEnabled } from "./settings.js"
+import { createStudioV2Setup } from "./v2-server.js"
 
 /**
  * Server entry.
@@ -61,4 +62,17 @@ const plugin: Plugin = async (input) => {
   return {}
 }
 
-export default { id: "config-studio", server: plugin }
+/**
+ * Dual-target server entry.
+ *
+ * - OpenCode v1 resolves `exports["./server"]`, reads `mod.default`, and
+ *   invokes the `server` factory (excess keys are never validated).
+ * - OpenCode v2 imports the same module, validates `mod.default` as
+ *   `{ id, setup }`, and ignores the legacy `server` key — so one default
+ *   export satisfies both loaders.
+ */
+export default {
+  id: "config-studio",
+  server: plugin,
+  setup: createStudioV2Setup(),
+}
