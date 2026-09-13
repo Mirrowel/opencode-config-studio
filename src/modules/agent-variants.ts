@@ -159,10 +159,12 @@ async function variantsSubmenu(ctx: ModuleContext, agent: string): Promise<void>
         danger: true,
       },
       {
-        title: `Parent patches: ${parentDisabled ? "disabled" : "active"} - toggle sidecar`,
-        value: "__parent_toggle__",
-        description: parentDisabled ? "no parent patches applied" : "parent patches applied to variants",
-        help: "Disables only the sidecar parent patches. NOTE: agent-variants currently also hides the variants when the parent patch entry is disabled (parent-only disable is not implemented yet) - recommended: full disable until it is.",
+        title: `Base-only disable: ${!parentDisabled && (entry as { disable_base?: boolean } | undefined)?.disable_base === true ? "ON - variants must be used" : "off"}`,
+        value: "__base_toggle__",
+        description: !parentDisabled && (entry as { disable_base?: boolean } | undefined)?.disable_base === true ? "parent hidden, fresh direct calls rejected" : "hide the parent, keep variants callable",
+        help:
+          "Hides the parent from the task list and rejects fresh direct calls with the enabled-variant list, so the model has to use a variant. Variants stay fully callable; task_id resumes of old base tasks keep working. Requires restart after Save & exit.",
+        danger: !parentDisabled && (entry as { disable_base?: boolean } | undefined)?.disable_base !== true && Object.values(entry?.variants ?? {}).every((variant) => (variant as { disable?: boolean }).disable === true),
       },
       {
         title: "Add variant",
@@ -207,9 +209,15 @@ async function variantsSubmenu(ctx: ModuleContext, agent: string): Promise<void>
       }
       continue
     }
-    if (picked === "__parent_toggle__") {
+    if (picked === "__base_toggle__") {
       if (await guardStructural(ctx)) continue
-      assign(await av().wizard.toggleEntryFor(avApi(ctx.api), config, settingsOf(), { agent }))
+      // Base-only disable lives in the sidecar: parent hidden + fresh direct
+      // calls rejected with the variant list; variants stay callable.
+      const draftConfig = ensureDraft()
+      const entry = ((draftConfig.agents[agent] ??= { parent: {}, variants: {} }) as { disable?: boolean; disable_base?: boolean; parent: Record<string, unknown>; variants: Record<string, unknown> })
+      entry.disable_base = entry.disable_base !== true
+      if (entry.disable_base) entry.disable = false
+      settingsOf().restartReasons.push(`${agent}: base ${entry.disable_base ? "disabled (variants only)" : "enabled"} requires restart.`)
       continue
     }
     if (picked === "__add__") {
