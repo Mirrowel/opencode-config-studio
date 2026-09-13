@@ -78,13 +78,12 @@
     "prepublishOnly": "npm run typecheck && npm run build"
   },
   "dependencies": {
-    "@mirrowel/opencode-agent-variants": "^0.11.0",
+    "@mirrowel/opencode-agent-variants": "file:../agent-variants",
     "@mirrowel/opencode-subagent-explorer": "^0.1.0",
     "@opencode-ai/plugin": ">=1.14.0",
     "@opentui/solid": "^0.4.1",
     "jsonc-parser": "^3.3.1",
-    "solid-js": "1.9.12",
-    "@mirrowel/opencode-subagent-explorer": "file:../subagent-explorer"
+    "solid-js": "1.9.12"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
