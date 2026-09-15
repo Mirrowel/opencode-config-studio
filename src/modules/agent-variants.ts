@@ -52,6 +52,7 @@ type LensWizard = {
   warnStructuralInProfile?: (api: AVApi, lens: string | undefined) => Promise<boolean>
   lensTitle?: (base: string, lens: string | undefined) => string
   manageProfiles?: (api: AVApi, config: SidecarConfig, settings: WizardSettings) => Promise<SidecarConfig>
+  taskValidationScreen?: (api: AVApi, config: SidecarConfig) => Promise<SidecarConfig>
   editVariantFor: (api: AVApi, config: SidecarConfig, settings: WizardSettings, agent: string, key: string, lens?: string) => Promise<SidecarConfig>
   editParentFields: (api: AVApi, config: SidecarConfig, agent: string, settings: WizardSettings, fieldFilter?: ReadonlySet<string>, lens?: string) => Promise<SidecarConfig>
 }
@@ -466,6 +467,27 @@ const agentVariantsModule: StudioModule = {
       await ownMenuSubmenu(context)
     },
   }),
+  toolsEntries: () => {
+    // The embedded (pre-0.12-dev) sidecar type lacks taskValidation; read loosely.
+    const loose = ensureDraft() as unknown as { taskValidation?: { typoDistance?: number; suggestLimit?: number } }
+    const typoDistance = loose.taskValidation?.typoDistance ?? 3
+    const suggestLimit = loose.taskValidation?.suggestLimit ?? 10
+    return [
+      {
+        title: `Task id suggestions (typo ${typoDistance}, list ${suggestLimit})`,
+        description: "Agent Variants: unknown-task-id rejection tuning",
+        help: "When a resumed task id does not exist, agent-variants proposes the typo-corrected id (confident within 2 edits, fuzzy within the configured distance) and lists the session's recent subagent sessions so the model can self-correct. 0 disables either feature.",
+        run: async (context: ModuleContext) => {
+          const screen = lensWizard().taskValidationScreen
+          if (!screen) {
+            await ctxAlert(context, "Task id suggestions unavailable", "The embedded agent-variants copy predates this screen. Switch the module source to the standalone install (Modules > Agent Variants > Source & channel), or update the studio so the embedded dependency resolves a newer agent-variants.")
+            return
+          }
+          assign(await screen(avApi(context.api), ensureDraft()))
+        },
+      },
+    ]
+  },
   agentsScreenEntries: (ctx) => {
     const config = ensureDraft()
     // The embedded (0.8.x) sidecar type lacks `profiles`; read it loosely.
