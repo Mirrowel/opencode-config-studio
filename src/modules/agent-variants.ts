@@ -160,11 +160,16 @@ async function variantsSubmenu(ctx: ModuleContext, agent: string): Promise<void>
         danger: true,
       },
       {
-        title: `Base-only disable: ${!parentDisabled && (entry as { disable_base?: boolean } | undefined)?.disable_base === true ? "ON - variants must be used" : "off"}`,
+        title: `Base-only disable: ${!parentDisabled && (entry as { disable_base?: boolean; default_variant?: string } | undefined)?.disable_base === true ? `ON - variants must be used${typeof (entry as { default_variant?: string } | undefined)?.default_variant === "string" ? ` - reroutes to ${(entry as { default_variant?: string } | undefined)?.default_variant}` : ""}` : "off"}`,
         value: "__base_toggle__",
-        description: !parentDisabled && (entry as { disable_base?: boolean } | undefined)?.disable_base === true ? "parent hidden, fresh direct calls rejected" : "hide the parent, keep variants callable",
+        description:
+          !parentDisabled && (entry as { disable_base?: boolean; default_variant?: string } | undefined)?.disable_base === true
+            ? typeof (entry as { default_variant?: string } | undefined)?.default_variant === "string"
+              ? `parent hidden, direct calls rerouted to "${(entry as { default_variant?: string } | undefined)?.default_variant}"`
+              : "parent hidden, fresh direct calls rejected"
+            : "hide the parent, keep variants callable",
         help:
-          "Hides the parent from the task list and rejects fresh direct calls with the enabled-variant list, so the model has to use a variant. Variants stay fully callable; task_id resumes of old base tasks keep working. Requires restart after Save & exit.",
+          "Hides the parent from the task list; fresh direct calls are either rejected with the enabled-variant list or rewritten to a default variant (the fallback, picked when enabling). Variants stay fully callable; task_id resumes of old base tasks keep working. Requires restart after Save & exit.",
         danger: !parentDisabled && (entry as { disable_base?: boolean } | undefined)?.disable_base !== true && Object.values(entry?.variants ?? {}).every((variant) => (variant as { disable?: boolean }).disable === true),
       },
       {
@@ -213,12 +218,60 @@ async function variantsSubmenu(ctx: ModuleContext, agent: string): Promise<void>
     if (picked === "__base_toggle__") {
       if (await guardStructural(ctx)) continue
       // Base-only disable lives in the sidecar: parent hidden + fresh direct
-      // calls rejected with the variant list; variants stay callable.
+      // calls either rejected with the variant list or REWRITTEN to a
+      // default variant (the fallback); variants stay callable.
       const draftConfig = ensureDraft()
-      const entry = ((draftConfig.agents[agent] ??= { parent: {}, variants: {} }) as { disable?: boolean; disable_base?: boolean; parent: Record<string, unknown>; variants: Record<string, unknown> })
-      entry.disable_base = entry.disable_base !== true
-      if (entry.disable_base) entry.disable = false
-      settingsOf().restartReasons.push(`${agent}: base ${entry.disable_base ? "disabled (variants only)" : "enabled"} requires restart.`)
+      const entry = ((draftConfig.agents[agent] ??= { parent: {}, variants: {} }) as { disable?: boolean; disable_base?: boolean; default_variant?: string; parent: Record<string, unknown>; variants: Record<string, unknown> })
+      if (entry.disable_base === true && entry.disable !== true) {
+        // Already base-disabled: pick toggles it back off (clears the fallback).
+        entry.disable_base = false
+        entry.default_variant = undefined
+        settingsOf().restartReasons.push(`${agent}: base enabled requires restart.`)
+        continue
+      }
+      // Turning base-disable ON: the fallback choice, then the variant.
+      const enabledVariants = Object.entries(entry.variants).filter(([, variant]) => (variant as { disable?: boolean }).disable !== true)
+      const fallbackChoice = await ctxPick(ctx, {
+        title: lensSuffix(`Direct calls to ${agent} (base disabled)`),
+        options: [
+          {
+            title: "No fallback - reject with the variant list",
+            value: "reject",
+            description: "fresh direct calls fail with the enabled-variant list; the model has to pick a variant",
+            help: "The default behavior of base-disable: direct calls are rejected with an error listing the enabled variants.",
+          },
+          {
+            title: "Fallback - reroute to a variant",
+            value: "fallback",
+            description: "direct calls are rewritten to a default variant, as if it was called directly",
+            help: "Bugfix fallback: when the model calls the hidden base anyway (from memory), the call is rewritten to the default variant - persisted input, replay, routing, and annotation all read as the variant call.",
+          },
+          { title: "< Back", value: "__back__", description: "" },
+        ],
+      })
+      if (!fallbackChoice || fallbackChoice === "__back__") continue
+      entry.disable = false
+      entry.disable_base = true
+      entry.default_variant = undefined
+      if (fallbackChoice === "fallback") {
+        if (enabledVariants.length === 0) {
+          await ctxAlert(ctx, "No enabled variants", `Add or enable a variant of ${agent} first - the fallback needs a target. Base-disable stays with the reject behavior.`)
+        } else {
+          const variantPick = await ctxPick(ctx, {
+            title: lensSuffix(`Reroute direct ${agent} calls to`),
+            options: [
+              ...enabledVariants.map(([key, variant]) => ({
+                title: typeof (variant as { name?: string }).name === "string" ? (variant as { name: string }).name : key,
+                value: key,
+                description: "fresh direct calls are rewritten to this variant",
+              })),
+              { title: "< Back", value: "__back__", description: "" },
+            ],
+          })
+          if (variantPick && variantPick !== "__back__") entry.default_variant = variantPick
+        }
+      }
+      settingsOf().restartReasons.push(`${agent}: base disabled${entry.default_variant !== undefined ? ` (fallback -> ${entry.default_variant})` : " (reject)"} requires restart.`)
       continue
     }
     if (picked === "__add__") {
