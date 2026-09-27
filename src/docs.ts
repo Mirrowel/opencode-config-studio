@@ -361,9 +361,20 @@ export const FIELD_DOCS: Record<string, FieldDoc> = {
     summary: "Fully disables the agent: hidden from task list and selection.",
     lines: [
       "True disable written to opencode.json; removes the agent everywhere (variants included).",
-      "Agent Variants parent-patch disable (sidecar) is a softer variant-machinery switch; see the Variants submenu.",
+      "Agent Variants parent-patch disable (sidecar) is deprecated - this flag is the canonical full disable (the unified picker's 'Fully disabled' mode).",
     ],
     source: "Source: agent.ts:268-271",
+  },
+  "agent.hidden": {
+    id: "agent.hidden",
+    title: "agent.<name>.hidden",
+    summary: "Hides the agent from the model's task list; still callable when named directly.",
+    lines: [
+      "Visibility only: hidden agents are NOT offered to the model, but a direct call still resolves and runs.",
+      "With Agent Variants, hidden + base-disable rejects direct calls ('use a variant'), and hidden + fallback reroutes them to the default variant - one picker edits both (Task-list & calling).",
+      "RESTART REQUIRED: the task list is built at startup.",
+    ],
+    source: "Source: session/prompt.ts:315 + tool/task.ts:131",
   },
 
   "concept.precedence": {

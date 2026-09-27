@@ -31,9 +31,9 @@ export type StudioSettings = {
 
 /**
  * Fixed Quick access entries: always present, never pinnable/unpinnable -
- * they are already one click away (the whole main menu is).
+ * they are already one click away (the whole main menu is). Rendered via
+ * `quick:` actions (runQuickAccess), not menu switch cases.
  */
-export const DEFAULT_QUICK_ACCESS = ["browse", "agents"]
 
 /**
  * Pinnable screens: real option-menus at Menu depth 2+ (children of a
@@ -82,7 +82,7 @@ export function defaultSettings(): StudioSettings {
   return {
     capture: { hiddenSections: [...DEFAULT_HIDDEN_SECTIONS] },
     modules: { enabled: {}, options: {} },
-    // Deep pins only; the fixed defaults (DEFAULT_QUICK_ACCESS) are always
+    // Deep pins only; the fixed defaults (explorer + Agents) are always
     // rendered and never stored here.
     quickAccess: [],
   }

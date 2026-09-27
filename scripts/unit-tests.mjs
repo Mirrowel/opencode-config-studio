@@ -1372,6 +1372,19 @@ function testVariantAliases() {
 }
 testVariantAliases()
 
+async function testParentModeDescription() {
+  const mod = await import(dist("modules/agent-variants"))
+  const { parentModeDescription } = mod
+  assert(parentModeDescription({}, undefined) === "normal", "no flags = normal")
+  assert(parentModeDescription({ hidden: true }, undefined) === "hidden & disabled, variants only", "legacy hidden = hide & disable")
+  assert(parentModeDescription({ hidden: true }, { disable_base: false }) === "just hidden, still callable", "explicit false = just hide")
+  assert(parentModeDescription({}, { disable_base: true }) === "hidden & disabled, variants only", "explicit base disable")
+  assert(parentModeDescription({ hidden: true }, { disable_base: true, default_variant: "seek" }) === "hidden & disabled, reroutes to seek", "fallback mode")
+  assert(parentModeDescription({ disable: true }, { disable_base: true }) === "fully disabled", "full disable wins")
+  assert(parentModeDescription({ hidden: true }, { disable_base: false, default_variant: "seek" }) === "just hidden, still callable", "fallback key inert without base-disable")
+}
+testParentModeDescription()
+
 async function testSuggestionsAndMetrics() {
   const { SDK_PACKAGES, PROVIDER_FIELDS, MODEL_FIELDS } = keymeta
   assert(SDK_PACKAGES.length >= 25, `SDK package table is exhaustive (got ${SDK_PACKAGES.length})`)

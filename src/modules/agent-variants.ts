@@ -53,6 +53,17 @@ type LensWizard = {
   lensTitle?: (base: string, lens: string | undefined) => string
   manageProfiles?: (api: AVApi, config: SidecarConfig, settings: WizardSettings) => Promise<SidecarConfig>
   taskValidationScreen?: (api: AVApi, config: SidecarConfig) => Promise<SidecarConfig>
+  parentModePicker?: (
+    api: AVApi,
+    config: SidecarConfig,
+    settings: WizardSettings,
+    agent: string,
+    opts?: {
+      currentFlags?: { hidden?: boolean; disable?: boolean }
+      writeConfigFlags?: (agent: string, flags: { hidden?: boolean; disable?: boolean }) => Promise<string | undefined>
+      lens?: string
+    },
+  ) => Promise<SidecarConfig>
   editVariantFor: (api: AVApi, config: SidecarConfig, settings: WizardSettings, agent: string, key: string, lens?: string) => Promise<SidecarConfig>
   editParentFields: (api: AVApi, config: SidecarConfig, agent: string, settings: WizardSettings, fieldFilter?: ReadonlySet<string>, lens?: string) => Promise<SidecarConfig>
 }
@@ -144,33 +155,65 @@ function variantPickerTitle(agent: string): string {
   return `Agent Variants (${count})`
 }
 
+/** Reads one agent's visibility flags from the studio's merged config view. */
+function agentConfigFlagsOf(ctx: ModuleContext, agent: string): { hidden?: boolean; disable?: boolean } {
+  const agentRoot = (ctx.state.merge.merged as Record<string, unknown>)["agent"] as Record<string, Record<string, unknown>> | undefined
+  const entry = agentRoot?.[agent]
+  return { hidden: entry?.hidden === true, disable: entry?.disable === true }
+}
+
+/** Human label of the current unified mode (mirrors the wizard's rules).
+ * Exported for unit tests. */
+export function parentModeDescription(flags: { hidden?: boolean; disable?: boolean }, entry: { disable?: unknown; disable_base?: unknown; default_variant?: unknown } | undefined): string {
+  if (flags.disable || entry?.disable === true) return "fully disabled"
+  const baseDisabled = entry?.disable_base === true || (entry?.disable_base === undefined && flags.hidden)
+  if (baseDisabled) return entry?.default_variant !== undefined ? `hidden & disabled, reroutes to ${String(entry.default_variant)}` : "hidden & disabled, variants only"
+  if (flags.hidden) return "just hidden, still callable"
+  return "normal"
+}
+
+/** The unified task-list & calling picker (wizard-provided): one control for
+ * the OpenCode hidden/disable flags (staged through the studio config queue)
+ * plus the sidecar base-disable/fallback (staged module save). */
+async function openParentModePicker(ctx: ModuleContext, agent: string): Promise<void> {
+  const picker = lensWizard().parentModePicker
+  if (!picker) {
+    await ctxAlert(ctx, "Picker unavailable", "The embedded agent-variants copy lacks the unified task-list & calling picker. Switch the module source to the standalone install (Modules > Agent Variants > Source & channel), or update agent-variants.")
+    return
+  }
+  const writeConfigFlags = async (name: string, flagWrites: { hidden?: boolean; disable?: boolean }): Promise<string | undefined> => {
+    const current = agentConfigFlagsOf(ctx, name)
+    const edits: Array<import("../jsonc.js").EditOp> = []
+    for (const key of ["hidden", "disable"] as const) {
+      const want = flagWrites[key]
+      if (want === undefined || current[key] === want) continue
+      edits.push(want ? { op: "set", path: ["agent", name, key], value: true } : { op: "delete", path: ["agent", name, key] })
+    }
+    if (edits.length === 0) return undefined
+    const staged = await ctx.stageConfigEdits(edits, `${name}: task-list & calling flags (config)`)
+    return staged ? undefined : "could not stage the config edits - see the Review screen"
+  }
+  assign(
+    await picker(avApi(ctx.api), ensureDraft(), settingsOf(), agent, {
+      currentFlags: agentConfigFlagsOf(ctx, agent),
+      writeConfigFlags,
+      lens: avLens,
+    }),
+  )
+}
+
 async function variantsSubmenu(ctx: ModuleContext, agent: string): Promise<void> {
   const config = ensureDraft()
   while (true) {
     const entry = config.agents[agent]
-    const parentDisabled = entry?.disable === true
     const variants = Object.entries(entry?.variants ?? {})
     const options = [
       profileContextRow(),
       {
-        title: `Full disable: ${parentDisabled ? "currently sidecar-disabled" : "off"} - write to config`,
-        value: "__config_disable__",
-        description: "agent.<name>.disable = true in opencode.json",
-        help: "Writes a full disable to the OpenCode config: the agent (and all its variants) disappear everywhere. RESTART REQUIRED after Save & exit.",
-        danger: true,
-      },
-      {
-        title: `Base-only disable: ${!parentDisabled && (entry as { disable_base?: boolean; default_variant?: string } | undefined)?.disable_base === true ? `ON - variants must be used${typeof (entry as { default_variant?: string } | undefined)?.default_variant === "string" ? ` - reroutes to ${(entry as { default_variant?: string } | undefined)?.default_variant}` : ""}` : "off"}`,
-        value: "__base_toggle__",
-        description:
-          !parentDisabled && (entry as { disable_base?: boolean; default_variant?: string } | undefined)?.disable_base === true
-            ? typeof (entry as { default_variant?: string } | undefined)?.default_variant === "string"
-              ? `parent hidden, direct calls rerouted to "${(entry as { default_variant?: string } | undefined)?.default_variant}"`
-              : "parent hidden, fresh direct calls rejected"
-            : "hide the parent, keep variants callable",
-        help:
-          "Hides the parent from the task list; fresh direct calls are either rejected with the enabled-variant list or rewritten to a default variant (the fallback, picked when enabling). Variants stay fully callable; task_id resumes of old base tasks keep working. Requires restart after Save & exit.",
-        danger: !parentDisabled && (entry as { disable_base?: boolean } | undefined)?.disable_base !== true && Object.values(entry?.variants ?? {}).every((variant) => (variant as { disable?: boolean }).disable === true),
+        title: `Task-list & calling: ${parentModeDescription(agentConfigFlagsOf(ctx, agent), entry)}`,
+        value: "__mode__",
+        description: "hidden / disabled / base-disable / fallback in one picker",
+        help: "Unified picker over the flags in their native homes: the OpenCode hidden/disable flags (staged config edits) and the Agent Variants base-disable + reroute fallback (staged sidecar). The same picker the agent detail row opens. Restart required after Save & exit.",
       },
       {
         title: "Add variant",
@@ -199,79 +242,9 @@ async function variantsSubmenu(ctx: ModuleContext, agent: string): Promise<void>
       await openProfileSwitcher(ctx)
       continue
     }
-    if (picked === "__config_disable__") {
+    if (picked === "__mode__") {
       if (await guardStructural(ctx)) continue
-      // Full disable lives in opencode.json: stage through the studio queue.
-      const agentEntry = (ctx.state.merge.merged as Record<string, unknown>)["agent"] as Record<string, unknown> | undefined
-      const currentlyDisabled = (agentEntry?.[agent] as Record<string, unknown> | undefined)?.["disable"] === true
-      const staged = await ctx.stageConfigEdits(
-        currentlyDisabled
-          ? [{ op: "delete", path: ["agent", agent, "disable"] }]
-          : [{ op: "set", path: ["agent", agent, "disable"], value: true }],
-        `${currentlyDisabled ? "enable" : "full-disable"} agent ${agent} (config)`,
-      )
-      if (staged) {
-        settingsOf().restartReasons.push(`${agent}: full ${currentlyDisabled ? "enable" : "disable"} (config) requires restart.`)
-      }
-      continue
-    }
-    if (picked === "__base_toggle__") {
-      if (await guardStructural(ctx)) continue
-      // Base-only disable lives in the sidecar: parent hidden + fresh direct
-      // calls either rejected with the variant list or REWRITTEN to a
-      // default variant (the fallback); variants stay callable.
-      const draftConfig = ensureDraft()
-      const entry = ((draftConfig.agents[agent] ??= { parent: {}, variants: {} }) as { disable?: boolean; disable_base?: boolean; default_variant?: string; parent: Record<string, unknown>; variants: Record<string, unknown> })
-      if (entry.disable_base === true && entry.disable !== true) {
-        // Already base-disabled: pick toggles it back off (clears the fallback).
-        entry.disable_base = false
-        entry.default_variant = undefined
-        settingsOf().restartReasons.push(`${agent}: base enabled requires restart.`)
-        continue
-      }
-      // Turning base-disable ON: the fallback choice, then the variant.
-      const enabledVariants = Object.entries(entry.variants).filter(([, variant]) => (variant as { disable?: boolean }).disable !== true)
-      const fallbackChoice = await ctxPick(ctx, {
-        title: lensSuffix(`Direct calls to ${agent} (base disabled)`),
-        options: [
-          {
-            title: "No fallback - reject with the variant list",
-            value: "reject",
-            description: "fresh direct calls fail with the enabled-variant list; the model has to pick a variant",
-            help: "The default behavior of base-disable: direct calls are rejected with an error listing the enabled variants.",
-          },
-          {
-            title: "Fallback - reroute to a variant",
-            value: "fallback",
-            description: "direct calls are rewritten to a default variant, as if it was called directly",
-            help: "Bugfix fallback: when the model calls the hidden base anyway (from memory), the call is rewritten to the default variant - persisted input, replay, routing, and annotation all read as the variant call.",
-          },
-          { title: "< Back", value: "__back__", description: "" },
-        ],
-      })
-      if (!fallbackChoice || fallbackChoice === "__back__") continue
-      entry.disable = false
-      entry.disable_base = true
-      entry.default_variant = undefined
-      if (fallbackChoice === "fallback") {
-        if (enabledVariants.length === 0) {
-          await ctxAlert(ctx, "No enabled variants", `Add or enable a variant of ${agent} first - the fallback needs a target. Base-disable stays with the reject behavior.`)
-        } else {
-          const variantPick = await ctxPick(ctx, {
-            title: lensSuffix(`Reroute direct ${agent} calls to`),
-            options: [
-              ...enabledVariants.map(([key, variant]) => ({
-                title: typeof (variant as { name?: string }).name === "string" ? (variant as { name: string }).name : key,
-                value: key,
-                description: "fresh direct calls are rewritten to this variant",
-              })),
-              { title: "< Back", value: "__back__", description: "" },
-            ],
-          })
-          if (variantPick && variantPick !== "__back__") entry.default_variant = variantPick
-        }
-      }
-      settingsOf().restartReasons.push(`${agent}: base disabled${entry.default_variant !== undefined ? ` (fallback -> ${entry.default_variant})` : " (reject)"} requires restart.`)
+      await openParentModePicker(ctx, agent)
       continue
     }
     if (picked === "__add__") {
@@ -571,12 +544,20 @@ const agentVariantsModule: StudioModule = {
     ]
   },
   agentDetailEntries: (ctx, agent) => {
-    void ctx
     const config = ensureDraft()
     const entry = config.agents[agent]
     const parentOverrides = Object.keys(entry?.parent ?? {}).length
     const savable = savableParentFields(config, agent)
     const entries = []
+    entries.push({
+      title: `Task-list & calling: ${parentModeDescription(agentConfigFlagsOf(ctx, agent), entry)}`,
+      description: "hidden / disabled / base-disable / fallback in one picker",
+      help: "Unified picker over the flags in their native homes: the OpenCode hidden/disable flags (staged config edits) and the Agent Variants base-disable + reroute fallback (staged sidecar). One control replaces the old separate Hidden field and disable rows. Restart required after Save & exit.",
+      run: async (context: ModuleContext) => {
+        if (await guardStructural(context)) return
+        await openParentModePicker(context, agent)
+      },
+    })
     entries.push({
       title: variantPickerTitle(agent),
       description: entry && Object.keys(entry.variants).length > 0 ? `${Object.keys(entry.variants).length} variant(s)` : "none yet",
@@ -604,6 +585,14 @@ const agentVariantsModule: StudioModule = {
       },
     })
     return entries
+  },
+  /** The unified task-list & calling picker REPLACES the plain Hidden and
+   * Disabled field rows for AV-managed parents (integrated layout only -
+   * with the module disabled or in own-menu layout the plain rows return
+   * and the picker lives in Agent Variants' own TUI). */
+  agentDetailReplacedFields: (_ctx, agent) => {
+    void _ctx
+    return ensureDraft().agents[agent] ? new Set(["hidden", "disable"]) : new Set<string>()
   },
   diagnosticsSections: async (ctx) => {
     const config = ensureDraft()

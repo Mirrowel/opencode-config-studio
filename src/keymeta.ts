@@ -623,7 +623,7 @@ export const TUI_KEYS: TuiKeyMeta[] = [
     key: "keybinds",
     title: "Keybinds",
     kind: "json",
-    doc: "Key binding overrides for 184 named commands. Bindings are combo strings (\"ctrl+x,ctrl+d\"), \"none\"/false to unbind, or key-stroke objects. Unknown names are dropped. See the Keybinds browser.",
+    doc: "Key binding overrides for named commands (see the Keybinds browser for the full catalog). Bindings are combo strings (\"ctrl+x,ctrl+d\"), \"none\"/false to unbind, or key-stroke objects. Unknown names are dropped.",
   },
   {
     key: "plugin_enabled",

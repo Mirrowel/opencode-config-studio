@@ -63,6 +63,12 @@ export type StudioModule = {
   toolsEntries?: (ctx: ModuleContext) => Array<MenuEntry & { run: (ctx: ModuleContext) => Promise<void> }>
   /** Per-agent entries in the agent detail view (integrated layout). */
   agentDetailEntries?: (ctx: ModuleContext, agent: string) => Array<MenuEntry & { run: (ctx: ModuleContext) => Promise<void> }>
+  /** Agent config field keys (AGENT_CONFIG_FIELDS.key) the module REPLACES
+   * with its own rows in the integrated agent detail - the plain studio rows
+   * are suppressed so one control owns the setting (e.g. Agent Variants
+   * replaces the plain Hidden/Disabled booleans with the unified
+   * task-list & calling picker). */
+  agentDetailReplacedFields?: (ctx: ModuleContext, agent: string) => Set<string>
   /** Sections merged into the Diagnostics screen. */
   diagnosticsSections?: (ctx: ModuleContext) => Promise<PagedSection[]>
   /** Sections merged into How it works. */

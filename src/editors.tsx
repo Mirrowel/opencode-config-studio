@@ -29,6 +29,7 @@ import {
 import type { EditOp, JSONPath } from "./jsonc.js"
 import type { StudioState, WizardSelectOption } from "./tui.js"
 import { toolInfoText, mcpStatusLabel, maskSecretHeaders } from "./toollist.js"
+import { PINNABLE_SCREENS } from "./settings.js"
 
 export interface EditorKit {
   state: StudioState
@@ -187,7 +188,10 @@ async function numberFieldEditor(kit: EditorKit, spec: { key: string; title: str
 }
 
 export async function stringListEditor(kit: EditorKit, title: string, pointer: JSONPath, doc: string, suggestions?: FieldSuggestion[], suggestionsFrom?: "providersNotEnabled" | "providersNotDisabled"): Promise<void> {
-  const pinId = pointer.length === 1 && (pointer[0] === "disabled_providers" || pointer[0] === "enabled_providers") ? `settings:Providers:${String(pointer[0])}` : undefined
+  // Any root-key editor whose key has a pinnable deep screen gets its pinId
+  // (instructions, skills, references, formatter, lsp, provider lists...).
+  const rootKey = pointer.length === 1 ? String(pointer[0]) : undefined
+  const pinId = rootKey !== undefined ? PINNABLE_SCREENS.find((screen) => screen.id.endsWith(`:${rootKey}`))?.id : undefined
   // Dynamic provider suggestions: full universe minus the inverse list so a
   // provider can never be both disabled and enabled.
   if (!suggestions && suggestionsFrom && kit.providerUniverse) {
@@ -1552,7 +1556,7 @@ export async function providerModelsScreen(kit: EditorKit, providerID: string): 
     options.push({ title: "+ Add model", value: "add", description: "custom model or catalog override" })
     options.push({ title: "< Back", value: "__back__", description: Object.keys(map).length === 0 ? "(no model entries)" : "" })
 
-    const picked = await kit.showMenu({ title: `Models - ${providerID}`, options })
+    const picked = await kit.showMenu({ title: `Model entries (config) - ${providerID}`, options })
     if (!picked || picked === "__back__") return
     if (picked === "add") {
       const id = await kit.showPrompt({ title: "Model id", placeholder: "e.g. my-model-v1 (lowercase)" })

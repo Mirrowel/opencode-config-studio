@@ -42,7 +42,7 @@ import { rankOptions } from "./search.js"
 import { computeDialogRows } from "./size.js"
 import { currentPaletteCategory, declarePaletteCategory, schedulePaletteReconcile } from "./palette-category.js"
 import { discoverMarkdownAgents, discoverTuiFiles, type MarkdownAgent } from "./discovery.js"
-import { CLEANUP_RULES, TUI_KEYS, keybindGroupsMatching, toolsToPermission, type ObjectFieldSpec } from "./keymeta.js"
+import { ALL_KEYBIND_NAMES, CLEANUP_RULES, TUI_KEYS, keybindGroupsMatching, toolsToPermission, type ObjectFieldSpec } from "./keymeta.js"
 import { fieldEditor as kitFieldEditor, permissionEditor as kitPermissionEditor, providerEntryScreen, providerModelsScreen, settingsGroupDirect as kitDrillSettingsGroup, settingsFieldDirect as kitDrillSettings, settingsScreen as kitSettingsScreen, type EditorKit } from "./editors.js"
 import { providerCacheKey, getCachedProviders, setCachedProviders, providerCacheState, detectOutsideChanges, type OutsideChange } from "./providercache.js"
 import { buildMigrationPlan, savableParentFields, CONFIG_SAVABLE_PARENT_FIELDS } from "./migration.js"
@@ -2491,7 +2491,7 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
       title: "TUI settings",
       value: "tui-settings",
       description: "tui.json - theme, keybinds, cursor, sounds",
-      help: "Everything editable in tui.json: theme, keybind browser (184 commands), diff style, cursor, mouse, scroll, attention sounds, prompt sizing, plugin enable toggles. TUI changes always need a restart.",
+      help: `Everything editable in tui.json: theme, keybind browser (${ALL_KEYBIND_NAMES.length} commands), diff style, cursor, mouse, scroll, attention sounds, prompt sizing, plugin enable toggles. TUI changes always need a restart.`,
     },
     {
       title: "Plugins",
@@ -2584,8 +2584,6 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
   switch (action) {
     case "__reload_pending__":
       return reloadPendingMenu(api, state)
-    case "browse":
-      return providerBrowser(api, state)
     case "settings":
       await kitSettingsScreen(makeEditorKit(api, state))
       return mainMenu(api, state)
@@ -2597,8 +2595,6 @@ async function mainMenu(api: TuiPluginApi, state: StudioState): Promise<void> {
       return toolsScreen(api, state)
     case "cleanup":
       return cleanupScreen(api, state)
-    case "agents":
-      return agentsScreen(api, state)
     case "files":
       return configFilesScreen(api, state)
     case "diagnostics":
@@ -3524,7 +3520,7 @@ async function modelBrowser(api: TuiPluginApi, state: StudioState, providerID: s
   options.push({ title: "+ Model entries (config)...", value: "__model_entries__", description: "custom models and overrides", help: "Manage provider.<id>.models entries directly: add custom models, edit limits, cost, modalities, status, default options." })
   options.push({ title: "< Back", value: "__back__", description: "Return to provider list" })
 
-  const picked = await showMenu(api, { title: `Models - ${providerID}`, options })
+  const picked = await showMenu(api, { title: `Models (catalog) - ${providerID}`, options })
   if (!picked || picked === "__back__") return providerBrowser(api, state)
   if (picked === "__provider_settings__") {
     await providerEntryScreen(makeEditorKit(api, state), providerID)
@@ -4315,6 +4311,7 @@ const AGENT_CONFIG_FIELDS: Array<{ key: string; label: string; type: "model" | "
   { key: "options", label: "Options", type: "json", doc: "agent.options" },
   { key: "mode", label: "Mode", type: "enum", options: ["subagent", "primary", "all"], doc: "agent.mode", restart: true },
   { key: "hidden", label: "Hidden", type: "boolean", doc: "agent.hidden", restart: true },
+  { key: "disable", label: "Disabled", type: "boolean", doc: "agent.disable", restart: true },
   { key: "steps", label: "Max steps", type: "number", doc: "agent.steps" },
   { key: "description", label: "Description", type: "string", doc: "agent.description", restart: true },
   { key: "color", label: "Color", type: "color", doc: "agent.color", restart: true },
@@ -4363,7 +4360,17 @@ async function agentDetail(api: TuiPluginApi, state: StudioState, agent: string)
       options.push({ title: "! Primary-only agent", value: "__primary_info__", description: "task tool cannot call it", kind: "action" })
     }
 
+    // Modules may REPLACE plain agent-field rows with their own unified
+    // control (Agent Variants replaces Hidden/Disabled with the task-list &
+    // calling picker) - suppressed here so exactly one control owns it.
+    const replacedFields = new Set<string>()
+    for (const module of enabledModuleList()) {
+      if (moduleUsesOwnMenu(studioSettings, module)) continue
+      for (const key of module.agentDetailReplacedFields?.(moduleContext(api, state), agent) ?? []) replacedFields.add(key)
+    }
+
     for (const field of AGENT_CONFIG_FIELDS) {
+      if (replacedFields.has(field.key)) continue
       const pointer: JSONPath = ["agent", agent, field.key]
       options.push({
         title: field.label,
