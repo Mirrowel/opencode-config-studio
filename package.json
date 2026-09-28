@@ -80,8 +80,8 @@
     "prepublishOnly": "npm run typecheck && npm run build"
   },
   "dependencies": {
-    "@mirrowel/opencode-agent-variants": "file:../agent-variants",
-    "@mirrowel/opencode-subagent-explorer": "file:../subagent-explorer",
+    "@mirrowel/opencode-agent-variants": "^0.12.0-dev.9",
+    "@mirrowel/opencode-subagent-explorer": "^0.2.0-dev.2",
     "@opencode-ai/plugin": ">=1.14.0",
     "@opentui/solid": "^0.4.1",
     "jsonc-parser": "^3.3.1",
